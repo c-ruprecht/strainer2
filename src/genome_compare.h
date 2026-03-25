@@ -46,10 +46,10 @@ void GEN_hash_all_metagenome_track(const char *A_file, const char *b_file, const
 void GEN_hash_background_subtract_all(const char *B_file, BIO_hash seqHash, const int seed, unsigned int *removed_Nmers);
 
 /* use this function to take an original hash and see if other fast files have similar kmers (and count them) */
-void GEN_all_kmer_counts(const char *B_file, const int seed, BIO_hash seqHash, unsigned int vec_column, FILE *progress);
+void GEN_all_kmer_counts(const char *B_file, const int seed, BIO_hash seqHash, unsigned int vec_column, FILE *progress, int num_threads);
 
 /* similar to above function but allows you to specify a file to skip */
-void GEN_all_kmer_counts_skip_file(const char *B_file, const char *skip_file, const int seed, BIO_hash seqHash, unsigned int vec_column, FILE *progress);
+void GEN_all_kmer_counts_skip_file(const char *B_file, const char *skip_file, const int seed, BIO_hash seqHash, unsigned int vec_column, FILE *progress, int num_threads);
 
 
 

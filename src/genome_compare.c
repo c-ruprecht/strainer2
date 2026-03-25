@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include "kseq.h"
 #include "BIO_sequence.h"
 #include "BIO_hash.h"
@@ -112,7 +113,104 @@ void eliminate_nonunique_keys(BIO_hash h, unsigned int *non_unique_count, unsign
 
 }
 
-void GEN_all_kmer_counts_skip_file(const char *B_file, const char *skip_file, const int seed, BIO_hash seqHash, unsigned int vec_column, FILE *progress) {
+/* --- Thread pool for parallel genome file processing --- */
+
+typedef struct {
+	char *filename;
+	const char *skip_file; /* NULL means don't skip */
+	int seed;
+	BIO_hash h;
+	unsigned int vec_column;
+} kmer_job;
+
+typedef struct {
+	kmer_job **queue;
+	int head, tail, size, capacity;
+	int active;
+	int shutdown;
+	pthread_mutex_t mutex;
+	pthread_cond_t has_work;
+	pthread_cond_t all_done;
+} kmer_pool;
+
+static void *kmer_worker(void *arg) {
+	kmer_pool *pool = (kmer_pool *)arg;
+	for (;;) {
+		pthread_mutex_lock(&pool->mutex);
+		while (pool->size == 0 && !pool->shutdown)
+			pthread_cond_wait(&pool->has_work, &pool->mutex);
+		if (pool->shutdown && pool->size == 0) {
+			pthread_mutex_unlock(&pool->mutex);
+			break;
+		}
+		kmer_job *job = pool->queue[pool->head];
+		pool->head = (pool->head + 1) % pool->capacity;
+		pool->size--;
+		pool->active++;
+		pthread_mutex_unlock(&pool->mutex);
+
+		if (job->skip_file == NULL || strcmp(job->skip_file, job->filename) != 0)
+			GEN_calculate_kmer_count(job->filename, job->seed, job->h, job->vec_column);
+		else
+			fprintf(stderr, "skipping %s (identical match)\n", job->filename);
+		free(job->filename);
+		free(job);
+
+		pthread_mutex_lock(&pool->mutex);
+		pool->active--;
+		if (pool->size == 0 && pool->active == 0)
+			pthread_cond_signal(&pool->all_done);
+		pthread_mutex_unlock(&pool->mutex);
+	}
+	return NULL;
+}
+
+static kmer_pool *pool_create(int num_threads, int capacity) {
+	kmer_pool *pool = (kmer_pool *)malloc(sizeof(kmer_pool));
+	pool->queue = (kmer_job **)malloc(sizeof(kmer_job *) * capacity);
+	pool->head = pool->tail = pool->size = pool->active = pool->shutdown = 0;
+	pool->capacity = capacity;
+	pthread_mutex_init(&pool->mutex, NULL);
+	pthread_cond_init(&pool->has_work, NULL);
+	pthread_cond_init(&pool->all_done, NULL);
+	pthread_t *threads = (pthread_t *)malloc(sizeof(pthread_t) * num_threads);
+	for (int i = 0; i < num_threads; i++)
+		pthread_create(&threads[i], NULL, kmer_worker, pool);
+	/* store thread count for join; reuse head field after shutdown */
+	pool->head = 0; /* reset after threads started */
+	free(threads); /* detach — we'll signal shutdown and join via all_done */
+	return pool;
+}
+
+static void pool_submit(kmer_pool *pool, kmer_job *job) {
+	pthread_mutex_lock(&pool->mutex);
+	pool->queue[pool->tail] = job;
+	pool->tail = (pool->tail + 1) % pool->capacity;
+	pool->size++;
+	pthread_cond_signal(&pool->has_work);
+	pthread_mutex_unlock(&pool->mutex);
+}
+
+static void pool_wait_and_destroy(kmer_pool *pool) {
+	pthread_mutex_lock(&pool->mutex);
+	while (pool->size > 0 || pool->active > 0)
+		pthread_cond_wait(&pool->all_done, &pool->mutex);
+	pool->shutdown = 1;
+	pthread_cond_broadcast(&pool->has_work);
+	pthread_mutex_unlock(&pool->mutex);
+	/* small sleep to let workers exit cleanly */
+	struct timespec ts = {0, 10000000}; /* 10ms */
+	nanosleep(&ts, NULL);
+	pthread_mutex_destroy(&pool->mutex);
+	pthread_cond_destroy(&pool->has_work);
+	pthread_cond_destroy(&pool->all_done);
+	free(pool->queue);
+	free(pool);
+}
+
+/* --- End thread pool --- */
+
+void GEN_all_kmer_counts_skip_file(const char *B_file, const char *skip_file, const int seed, BIO_hash seqHash, unsigned int vec_column, FILE *progress, int num_threads) {
         FILE *fp;
         char *line = NULL;
         size_t len = 0;
@@ -126,27 +224,38 @@ void GEN_all_kmer_counts_skip_file(const char *B_file, const char *skip_file, co
                 exit(EXIT_FAILURE);
         }
 
+	/* count lines first to size the queue */
+	int nlines = 0;
+	while ((readL = getline(&line, &len, fp)) != -1) nlines++;
+	rewind(fp);
+
+	kmer_pool *pool = pool_create(num_threads, nlines + 1);
+
         while ((readL = getline(&line, &len, fp)) != -1) {
                 if ((pos=strchr(line, '\n')) != NULL)
                         *pos = '\0';
 
 		if (progress != NULL) {
-			ltime = time(NULL); // current time
+			ltime = time(NULL);
 			fprintf(progress, "%s\t%s", line, asctime(localtime(&ltime)));
 		}
 
-		if (strcmp(skip_file, line) != 0)  // don't hash if it is the genome itself
-	                GEN_calculate_kmer_count(line, seed, seqHash, vec_column);
-		else 
-			fprintf(stderr, "skipping %s (identical match)\n", line);
+		kmer_job *job = (kmer_job *)malloc(sizeof(kmer_job));
+		job->filename = strdup(line);
+		job->skip_file = skip_file;
+		job->seed = seed;
+		job->h = seqHash;
+		job->vec_column = vec_column;
+		pool_submit(pool, job);
         }
 
+	pool_wait_and_destroy(pool);
         fclose(fp);
         free(line);
 }
 
 
-void GEN_all_kmer_counts(const char *B_file, const int seed, BIO_hash seqHash, unsigned int vec_column, FILE *progress) {
+void GEN_all_kmer_counts(const char *B_file, const int seed, BIO_hash seqHash, unsigned int vec_column, FILE *progress, int num_threads) {
         FILE *fp;
         char *line = NULL;
         size_t len = 0;
@@ -160,18 +269,32 @@ void GEN_all_kmer_counts(const char *B_file, const int seed, BIO_hash seqHash, u
                 exit(EXIT_FAILURE);
         }
 
+	/* count lines first to size the queue */
+	int nlines = 0;
+	while ((readL = getline(&line, &len, fp)) != -1) nlines++;
+	rewind(fp);
+
+	kmer_pool *pool = pool_create(num_threads, nlines + 1);
+
         while ((readL = getline(&line, &len, fp)) != -1) {
                 if ((pos=strchr(line, '\n')) != NULL)
                         *pos = '\0';
 
 		if (progress != NULL) {
-			ltime = time(NULL); // current time
+			ltime = time(NULL);
 			fprintf(progress, "%s\t%s", line, asctime(localtime(&ltime)));
 		}
 
-                GEN_calculate_kmer_count(line, seed, seqHash, vec_column);
+		kmer_job *job = (kmer_job *)malloc(sizeof(kmer_job));
+		job->filename = strdup(line);
+		job->skip_file = NULL;
+		job->seed = seed;
+		job->h = seqHash;
+		job->vec_column = vec_column;
+		pool_submit(pool, job);
         }
 
+	pool_wait_and_destroy(pool);
         fclose(fp);
         free(line);
 }
@@ -219,7 +342,7 @@ void GEN_calculate_kmer_count(const char *file, const int seed, BIO_hash h, unsi
 				if (!has_N || !contains_N(orientStr)) {
 					count = (unsigned int*)BIO_searchHash(h,orientStr);
 					if (count != NULL) {
-						count[vec_column]+=1; // increment the n-mer
+						__sync_fetch_and_add(&count[vec_column], 1); // atomic increment
 					}
 	
 				} 

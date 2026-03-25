@@ -1,6 +1,6 @@
 CFLAGS = -O2 -Wall -Wextra -Wshadow -Wcast-qual -g
 
-LDFLAGS = -lz -lm
+LDFLAGS = -lz -lm -lpthread
 
 src = $(wildcard *.c)
 obj = $(src:.c=.o)

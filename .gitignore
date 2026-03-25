@@ -1,0 +1,5 @@
+/test/strainer2_parallel/output
+/src/*.o
+/src/kmer_scrub_count
+/src/strain_detect
+/src/genome_compare

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <pthread.h>
 #include "kseq.h"
 #include "BIO_sequence.h"
 #include "BIO_hash.h"
@@ -51,9 +52,9 @@ KSEQ_INIT(gzFile, gzread)
 
 void usage();
 unsigned int hash_scrubbed_kmers(const char *filename, BIO_hash h, const int seed);
-void quantify_hits_all_files(const char *file_of_filenames, const char *file_PE1, const char *file_PE2, BIO_hash h, const int seed, const char *outfile, int is_paired_end);
-void quantify_hits_PE(const char *PE1, const char *PE2, BIO_hash h, const int seed, FILE *out, gzFile *gzout, int hash_size, const int is_paired_end, const unsigned int genome_kmers, const unsigned int genome_informative_kmers);
-void background_filter(const char *background_file, const double fraction_to_remove, const unsigned int num_inform_kmer, BIO_hash h, const int seed);
+void quantify_hits_all_files(const char *file_of_filenames, const char *file_PE1, const char *file_PE2, BIO_hash h, const int seed, const char *outfile, int is_paired_end, int num_threads);
+void quantify_hits_PE(const char *PE1, const char *PE2, BIO_hash h, const int seed, FILE *out, gzFile *gzout, pthread_mutex_t *out_mutex, int hash_size, const int is_paired_end, const unsigned int genome_kmers, const unsigned int genome_informative_kmers);
+void background_filter(const char *background_file, const double fraction_to_remove, const unsigned int num_inform_kmer, BIO_hash h, const int seed, int num_threads);
 unsigned int get_file_type(const char *filetype);
 int compare (const void *a, const void *b);
 int kmer_removed(int max_kmer_to_keep, unsigned int *informative_kmer_background_counts, int vec_size);
@@ -79,9 +80,10 @@ int main(int argc, char *argv[])
 	int c;
 	FILE *fout;
 	int initial_size = 1000000;
+	int num_threads = 4; // default thread count
 	double fraction_background_to_remove = 0.5; // default to removing 1/2 of the background signal
 
-        while ((c = getopt(argc, argv, "g:r:a:A:b:c:B:S:M:o:t:Hhuspn")) != EOF)
+        while ((c = getopt(argc, argv, "g:r:a:A:b:c:B:S:M:o:t:j:Hhuspn")) != EOF)
                 switch (c)
                 {
                         case 'a': a_file    = strdup(optarg); break;
@@ -94,6 +96,7 @@ int main(int argc, char *argv[])
                         case 'o': kmer_outfile = strdup(optarg); break;
                         case 'n': is_paired_end = NOT_PAIRED_END; break;
                         case 't': seq_file_type = strdup(optarg); break;
+                        case 'j': num_threads = atoi(optarg); break;
                         case 'u': usage(); break;
                         case 'h': usage(); break;
                         default: usage(); break;
@@ -139,11 +142,10 @@ int main(int argc, char *argv[])
         GEN_hash_sequences_set_count_vec(r_file, seed, seqHash, NON_INFORMATIVE_KMER, 0, 0, HASH_VECTOR_SIZE);
 	num_informative_kmers = hash_scrubbed_kmers(a_file, seqHash, seed);
 
-	if (background_file) 
-        	background_filter(background_file, fraction_background_to_remove, num_informative_kmers, seqHash, seed);
+	if (background_file)
+        	background_filter(background_file, fraction_background_to_remove, num_informative_kmers, seqHash, seed, num_threads);
 
-
-	quantify_hits_all_files(B_file, b_file, b_file2, seqHash, seed, kmer_outfile, is_paired_end);
+	quantify_hits_all_files(B_file, b_file, b_file2, seqHash, seed, kmer_outfile, is_paired_end, num_threads);
 
 
 	BIO_destroyHashD(seqHash);
@@ -157,7 +159,7 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
-void background_filter(const char *background_file, const double fraction_to_remove, const unsigned int num_inform_kmer, BIO_hash h, const int seed) {
+void background_filter(const char *background_file, const double fraction_to_remove, const unsigned int num_inform_kmer, BIO_hash h, const int seed, int num_threads) {
 	unsigned int kmer_to_keep = (int) (num_inform_kmer * fraction_to_remove);
 	unsigned int *informative_kmer_background_counts = (unsigned int*)calloc(num_inform_kmer, sizeof(unsigned int));
 	char **allKeys = BIO_getHashKeys(h);
@@ -174,7 +176,7 @@ void background_filter(const char *background_file, const double fraction_to_rem
 
 
 //	printf("reading bkgnd kmer\n");	
-	GEN_all_kmer_counts(background_file, seed, h, BACKGROUND_KMER_COUNT, NULL); // store this pangenome result in the second column 
+	GEN_all_kmer_counts(background_file, seed, h, BACKGROUND_KMER_COUNT, NULL, num_threads); // store this pangenome result in the second column
 //	printf("finished bkgd kmer read\n");
 	for (i=0; i<hash_size; i++) {
 		count = (unsigned int*)BIO_searchHash(h,allKeys[i]);
@@ -260,7 +262,107 @@ int compare (const void *a, const void *b) {
 	return (*(unsigned int *)b - *(unsigned int*)a);
 }
 
-void quantify_hits_all_files(const char *file_of_filenames, const char *file_PE1, const char *file_PE2, BIO_hash h, const int seed, const char *outfile, int is_PE) {
+/* --- Thread pool for parallel metagenome processing --- */
+
+typedef struct {
+	char *file1;
+	char *file2;
+	BIO_hash h;
+	int seed;
+	FILE *out;
+	gzFile *gzout;
+	pthread_mutex_t *out_mutex;
+	int hash_size;
+	int is_PE;
+	unsigned int genome_kmers;
+	unsigned int genome_informative_kmers;
+} sd_job;
+
+typedef struct {
+	sd_job **queue;
+	int head, tail, size, capacity;
+	int active, shutdown;
+	pthread_mutex_t mutex;
+	pthread_cond_t has_work;
+	pthread_cond_t all_done;
+} sd_pool;
+
+static void *sd_worker(void *arg) {
+	sd_pool *pool = (sd_pool *)arg;
+	for (;;) {
+		pthread_mutex_lock(&pool->mutex);
+		while (pool->size == 0 && !pool->shutdown)
+			pthread_cond_wait(&pool->has_work, &pool->mutex);
+		if (pool->shutdown && pool->size == 0) {
+			pthread_mutex_unlock(&pool->mutex);
+			break;
+		}
+		sd_job *job = pool->queue[pool->head];
+		pool->head = (pool->head + 1) % pool->capacity;
+		pool->size--;
+		pool->active++;
+		pthread_mutex_unlock(&pool->mutex);
+
+		quantify_hits_PE(job->file1, job->file2, job->h, job->seed,
+		                 job->out, job->gzout, job->out_mutex,
+		                 job->hash_size, job->is_PE,
+		                 job->genome_kmers, job->genome_informative_kmers);
+		free(job->file1);
+		free(job->file2);
+		free(job);
+
+		pthread_mutex_lock(&pool->mutex);
+		pool->active--;
+		if (pool->size == 0 && pool->active == 0)
+			pthread_cond_signal(&pool->all_done);
+		pthread_mutex_unlock(&pool->mutex);
+	}
+	return NULL;
+}
+
+static sd_pool *sd_pool_create(int num_threads, int capacity) {
+	sd_pool *pool = (sd_pool *)malloc(sizeof(sd_pool));
+	pool->queue = (sd_job **)malloc(sizeof(sd_job *) * capacity);
+	pool->head = pool->tail = pool->size = pool->active = pool->shutdown = 0;
+	pool->capacity = capacity;
+	pthread_mutex_init(&pool->mutex, NULL);
+	pthread_cond_init(&pool->has_work, NULL);
+	pthread_cond_init(&pool->all_done, NULL);
+	pthread_t *threads = (pthread_t *)malloc(sizeof(pthread_t) * num_threads);
+	for (int i = 0; i < num_threads; i++)
+		pthread_create(&threads[i], NULL, sd_worker, pool);
+	free(threads);
+	return pool;
+}
+
+static void sd_pool_submit(sd_pool *pool, sd_job *job) {
+	pthread_mutex_lock(&pool->mutex);
+	pool->queue[pool->tail] = job;
+	pool->tail = (pool->tail + 1) % pool->capacity;
+	pool->size++;
+	pthread_cond_signal(&pool->has_work);
+	pthread_mutex_unlock(&pool->mutex);
+}
+
+static void sd_pool_wait_and_destroy(sd_pool *pool) {
+	pthread_mutex_lock(&pool->mutex);
+	while (pool->size > 0 || pool->active > 0)
+		pthread_cond_wait(&pool->all_done, &pool->mutex);
+	pool->shutdown = 1;
+	pthread_cond_broadcast(&pool->has_work);
+	pthread_mutex_unlock(&pool->mutex);
+	struct timespec ts = {0, 10000000};
+	nanosleep(&ts, NULL);
+	pthread_mutex_destroy(&pool->mutex);
+	pthread_cond_destroy(&pool->has_work);
+	pthread_cond_destroy(&pool->all_done);
+	free(pool->queue);
+	free(pool);
+}
+
+/* --- End thread pool --- */
+
+void quantify_hits_all_files(const char *file_of_filenames, const char *file_PE1, const char *file_PE2, BIO_hash h, const int seed, const char *outfile, int is_PE, int num_threads) {
 	FILE *fp;
 	char *line1 = NULL;
 	size_t len1 = 0;
@@ -280,7 +382,8 @@ void quantify_hits_all_files(const char *file_of_filenames, const char *file_PE1
         unsigned int *count = NULL;
 	gzFile *gzout = NULL;
 	FILE *out = NULL;
-
+	pthread_mutex_t out_mutex;
+	pthread_mutex_init(&out_mutex, NULL);
 
 	for (i=0; i<hash_size; i++) {
 		count = (unsigned int*)BIO_searchHash(h,allKeys[i]);
@@ -310,18 +413,21 @@ void quantify_hits_all_files(const char *file_of_filenames, const char *file_PE1
 			exit(EXIT_FAILURE);
 		}
 
+		/* count lines to size pool queue */
+		int nlines = 0;
+		while ((read_s1 = getline(&line1, &len1, fp)) != -1) nlines++;
+		rewind(fp);
+
+		sd_pool *pool = sd_pool_create(num_threads, nlines + 1);
+
 		while ((read_s1 = getline(&line1, &len1, fp)) != -1) {
 			is_PE = -1;
 
 			if ((pos=strchr(line1, '\n')) != NULL)
 				*pos = '\0';
 
-//			printf("here with read_s1\n");
-	
 			token = strtok(line1, "\t");
-//			printf("file type is %d\n", is_PE);
 			is_PE = get_file_type(token);
-//			printf("file type is %d\n", is_PE);
 
 			if (is_PE == UNKNOWN_FILE_TYPE) {
 				printf("unknown file type skipping line (%s)\n", token);
@@ -332,45 +438,39 @@ void quantify_hits_all_files(const char *file_of_filenames, const char *file_PE1
 					printf("ERROR: no first file specified for %s\n", line1);
 				}
 				else {
-					if (is_PE == NOT_PAIRED_END) {
-//						printf("running SE with %s\t%s\n", file1, line1);
-						quantify_hits_PE(file1, NULL, h, seed, out, gzout, hash_size, is_PE, total_genome_kmers, total_genome_informative_kmers);
-					}
-					else if (is_PE == IS_PAIRED_END_INTERLEAVE) {
-//						printf("running PEI with %s\t%s\n", file1, line1);
-						quantify_hits_PE(file1, NULL, h, seed, out, gzout, hash_size, is_PE, total_genome_kmers, total_genome_informative_kmers);
+					sd_job *job = (sd_job *)malloc(sizeof(sd_job));
+					job->h = h; job->seed = seed;
+					job->out = out; job->gzout = gzout;
+					job->out_mutex = &out_mutex;
+					job->hash_size = hash_size; job->is_PE = is_PE;
+					job->genome_kmers = total_genome_kmers;
+					job->genome_informative_kmers = total_genome_informative_kmers;
+
+					if (is_PE == NOT_PAIRED_END || is_PE == IS_PAIRED_END_INTERLEAVE) {
+						job->file1 = strdup(file1);
+						job->file2 = NULL;
+						sd_pool_submit(pool, job);
 					}
 					else if (is_PE == IS_PAIRED_END) {
 						file2 = strtok(NULL, "\t");
 						if (file2 == NULL) {
 							printf("ERROR: no second file specified for PE: %s\n", line1);
+							free(job);
 						}
 						else {
-//							printf("running PE with %s\t%s\t%s\n", file1, file2, line1);
-							quantify_hits_PE(file1, file2, h, seed, out, gzout, hash_size, is_PE, total_genome_kmers, total_genome_informative_kmers);
+							job->file1 = strdup(file1);
+							job->file2 = strdup(file2);
+							sd_pool_submit(pool, job);
 						}
 					}
 				}
 			}
-/*
-			if (is_PE) {
-				read_s2 = getline(&line2, &len2, fp);
-				if (read_s2 == -1)  {
-					printf("ERROR: must be an even number of files one for each end of the paired-end read\n");
-				}
-				if ((pos=strchr(line2, '\n')) != NULL) {
-					*pos = '\0';
-				}
-			}
-*/
-
-//			printf("%s\t%s\n", line1, line2);
-//			quantify_hits_PE(line1, line2, h, seed, out, allKeys, hash_size, is_PE);
 		}
+		sd_pool_wait_and_destroy(pool);
 		fclose(fp);
 	}
 	else {
-		quantify_hits_PE(file_PE1, file_PE2, h, seed, out, gzout, hash_size, is_PE, total_genome_kmers, total_genome_informative_kmers);
+		quantify_hits_PE(file_PE1, file_PE2, h, seed, out, gzout, &out_mutex, hash_size, is_PE, total_genome_kmers, total_genome_informative_kmers);
 	}
 
 	#ifdef NO_GZIP_OUTPUT
@@ -384,7 +484,7 @@ void quantify_hits_all_files(const char *file_of_filenames, const char *file_PE1
 }
 
 /* this is where we spend most of the CPU time; have done quite a lot of optimization to speed up; major bottleneck is the hash; trying to improve that next... */
-void quantify_hits_PE(const char *PE1_file, const char *PE2_file, BIO_hash h, const int seed, FILE *out, gzFile *gzout, int hash_size, const int is_PE, const unsigned int genome_kmers, const unsigned int genome_informative_kmers) {
+void quantify_hits_PE(const char *PE1_file, const char *PE2_file, BIO_hash h, const int seed, FILE *out, gzFile *gzout, pthread_mutex_t *out_mutex, int hash_size, const int is_PE, const unsigned int genome_kmers, const unsigned int genome_informative_kmers) {
 	gzFile fp;
 	gzFile fp2 = NULL;
 	kseq_t *seq, *seq2;
@@ -562,9 +662,13 @@ void quantify_hits_PE(const char *PE1_file, const char *PE2_file, BIO_hash h, co
 						count = (unsigned int*)BIO_searchHash(h,orientStr);
 						if (count != NULL && count[KMER_TYPE] == INFORMATIVE_KMER) { // only track the stats on the informative kmers
 							#ifdef NO_GZIP_OUTPUT
+							pthread_mutex_lock(out_mutex);
 							fprintf(out, "%s\t%d\t%d\t%d\t%d\t%s\n", PE1_file, read_kmer_hits, read_informative_kmer_hits, read_kmer_hits_pe2, read_informative_kmer_hits_pe2, orientStr);
+							pthread_mutex_unlock(out_mutex);
 							#else
+							pthread_mutex_lock(out_mutex);
 							gzprintf(gzout, "%s\t%d\t%d\t%d\t%d\t%s\n", PE1_file, read_kmer_hits, read_informative_kmer_hits, read_kmer_hits_pe2, read_informative_kmer_hits_pe2, orientStr);
+							pthread_mutex_unlock(out_mutex);
 							#endif
 							// TO DO: print individual kmers here in addition to the old way of printing the kmers as a group (so can calculate depth and not just coverage)
 							// print it out in same format as below but I think we should print the kmer itself on the end for debugging purposes
@@ -603,9 +707,13 @@ void quantify_hits_PE(const char *PE1_file, const char *PE2_file, BIO_hash h, co
 							count = (unsigned int*)BIO_searchHash(h,orientStr);
 							if (count != NULL && count[KMER_TYPE] == INFORMATIVE_KMER) { // only track the stats on the informative kmers
 								#ifdef NO_GZIP_OUTPUT
+								pthread_mutex_lock(out_mutex);
 								fprintf(out, "%s\t%d\t%d\t%d\t%d\t%s\n", PE1_file, read_kmer_hits, read_informative_kmer_hits, read_kmer_hits_pe2, read_informative_kmer_hits_pe2, orientStr);
+								pthread_mutex_unlock(out_mutex);
 								#else
+								pthread_mutex_lock(out_mutex);
 								gzprintf(gzout, "%s\t%d\t%d\t%d\t%d\t%s\n", PE1_file, read_kmer_hits, read_informative_kmer_hits, read_kmer_hits_pe2, read_informative_kmer_hits_pe2, orientStr);
+								pthread_mutex_unlock(out_mutex);
 								#endif
 								// TO DO: same as above for PE1 can remove below and just print out the kmer
 								//if (count[TOTAL_KMER_MATCH_PE1] + count[TOTAL_KMER_MATCH_PE2] < total_read_kmer_hits) // want to keep the max total kmer hit of each kmer, but now doing the read as a unit so one metric cannot creep up while the other stays low; we are optimizing on the total kmer because min informative == 1 performs very well but perhaps optimizing on the sum of PE1 and PE2 will remove junk reads; worse case we go back to the old independent way
@@ -625,15 +733,19 @@ void quantify_hits_PE(const char *PE1_file, const char *PE2_file, BIO_hash h, co
 	}
 
 	#ifdef NO_GZIP_OUTPUT
+	pthread_mutex_lock(out_mutex);
 	fprintf(out, "#%s\ttotal_kmer_evaluated\t%lld\n", PE1_file, total_kmers_evaluated);
 	fprintf(out, "#%s\ttotal_reads_evaluated\t%lld\n", PE1_file, total_reads_evaluated);
 	fprintf(out, "#%s\ttotal_genome_kmers\t%lld\n", PE1_file, genome_kmers);
 	fprintf(out, "#%s\ttotal_genome_informative_kmers\t%lld\n", PE1_file, genome_informative_kmers);
+	pthread_mutex_unlock(out_mutex);
 	#else
+	pthread_mutex_lock(out_mutex);
 	gzprintf(gzout, "#%s\ttotal_kmer_evaluated\t%lld\n", PE1_file, total_kmers_evaluated);
 	gzprintf(gzout, "#%s\ttotal_reads_evaluated\t%lld\n", PE1_file, total_reads_evaluated);
 	gzprintf(gzout, "#%s\ttotal_genome_kmers\t%lld\n", PE1_file, genome_kmers);
 	gzprintf(gzout, "#%s\ttotal_genome_informative_kmers\t%lld\n", PE1_file, genome_informative_kmers);
+	pthread_mutex_unlock(out_mutex);
 	#endif
 
 	// TO DO : with the new format can remove this piece of code and just calculate the coverage in python later 

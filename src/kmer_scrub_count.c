@@ -44,12 +44,13 @@ int main(int argc, char *argv[])
 	int hash_index = 0; // to switch from original count, pangenome count, metagenome count
 //	const int seed = 64;
 //	const int seed = 96;
+	int num_threads = 4; // default thread count
 	int c;
 	FILE *fout;
 	FILE *progress = NULL;
 	int write_dist = 0;
 
-        while ((c = getopt(argc, argv, "A:B:C:r:p:Hhud")) != EOF)
+        while ((c = getopt(argc, argv, "A:B:C:r:p:t:Hhud")) != EOF)
                 switch (c)
                 {
               //          case 'a': a_file    = strdup(optarg); break;
@@ -58,6 +59,7 @@ int main(int argc, char *argv[])
                         case 'C': C_file    = strdup(optarg); break;
                         case 'r': r_file    = strdup(optarg); break;
                         case 'p': p_file    = strdup(optarg); break;
+                        case 't': num_threads = atoi(optarg); break;
                //         case 'b': b_file    = strdup(optarg); break;
                 //        case 'B': B_file    = strdup(optarg); break;
                         case 'd': write_dist = 1; break;
@@ -87,11 +89,11 @@ int main(int argc, char *argv[])
         seqHash = BIO_initHash(DEFAULT_GENOME_HASH_SIZE);
 
 	GEN_hash_sequences_set_count_vec(r_file, seed, seqHash, default_hash_val, default_hash_increment, 0, size_of_hash_vec);
-	GEN_all_kmer_counts(A_file, seed, seqHash, 1, progress); // store this pangenome result in the second column 
-	GEN_all_kmer_counts(B_file, seed, seqHash, 2, progress); // store this metagenome result in the third column 
+	GEN_all_kmer_counts(A_file, seed, seqHash, 1, progress, num_threads); // store this pangenome result in the second column
+	GEN_all_kmer_counts(B_file, seed, seqHash, 2, progress, num_threads); // store this metagenome result in the third column
 
-	if (C_file) 
-		GEN_all_kmer_counts_skip_file(C_file, r_file, seed, seqHash, 3, progress); // skip the hashing of the reference file
+	if (C_file)
+		GEN_all_kmer_counts_skip_file(C_file, r_file, seed, seqHash, 3, progress, num_threads); // skip the hashing of the reference file
 
 
 
@@ -124,7 +126,7 @@ int main(int argc, char *argv[])
 }
 
 void usage() {
-	fprintf(stderr, "Usage: kmer_scrub_count -r <reference genome>  -A <file with multiple genome filenames> -B <file with multiple metagenome filenames> -C <(optional) file with multiple genome filenames of drug strains> -p [progress output file, optional]\n");
+	fprintf(stderr, "Usage: kmer_scrub_count -r <reference genome>  -A <file with multiple genome filenames> -B <file with multiple metagenome filenames> -C <(optional) file with multiple genome filenames of drug strains> -p [progress output file, optional] -t [number of threads, default 4]\n");
 //	fprintf(stderr, "                         -r [reference genome; if not provided writes pangenome for all genomes in -A]\n");
 //	fprintf(stderr, "                         -d [print all hash counts (e.g., to plot distribution across entire pangenome]\n");
 //	fprintf(stderr, "(alternative)         -a <in1.fasta> -B <file with multiple filenames>\n");
