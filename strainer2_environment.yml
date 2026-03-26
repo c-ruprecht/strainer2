@@ -1,0 +1,13 @@
+name: strainer2_env
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python
+  - biopython>1.8
+  - plotly
+  - pip
+  - pyrodigal
+  - pandas
+  - nbformat

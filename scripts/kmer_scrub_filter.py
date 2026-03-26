@@ -227,9 +227,9 @@ def main():
 
     print("#post scrub kmers " + str(len(strain_hash_scrubbed)) + " out of " + str(all_kmers))
 
+    # print scrubbbed kmers that can be redirected to file
     for key in strain_hash_scrubbed:
         print(key)
-            
 
 if __name__ == "__main__":
         main()
