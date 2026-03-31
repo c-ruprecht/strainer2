@@ -11,3 +11,5 @@ dependencies:
   - pyrodigal
   - pandas
   - nbformat
+  - zlib
+  - make
