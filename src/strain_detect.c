@@ -594,14 +594,14 @@ void quantify_hits_PE(const char *PE1_file, const char *PE2_file, BIO_hash h, co
 		/* do PE2 */
 		if (is_PE) {
 			l2 = kseq_read(seq2);
+			if (l2 < 0) {
+				fprintf(stderr, "reached end of PE2 (%s) before end of PE1 (%s), check that file names are correct\n", PE2_file, PE1_file);
+				exit(EXIT_FAILURE);
+			}
 			if (seq2->seq.l >= seed) { // skip if a read has been trimmed shorter than the seed length
 
 				read_kmer_hits_pe2 = 0;
 				read_informative_kmer_hits_pe2 = 0;
-				if (l2 < 0) {
-					fprintf(stderr, "reached end of PE2 (%s) before end of PE1 (%s), check that file names are correct\n", PE2_file, PE1_file);
-					exit(EXIT_FAILURE);
-				}
 				BIO_stringToUpper(seq2->seq.s); // keep same case
 				seed_seq = seq2->seq.s;
 				has_N = contains_N(seed_seq);

@@ -14,5 +14,7 @@ dependencies:
   - zlib
   - make
   - pyahocorasick
-  - pip:
-    - kaleido
+  - python-kaleido=0.2.1
+  #- pip:
+  #  - kaleido
+
