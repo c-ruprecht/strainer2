@@ -13,3 +13,6 @@ dependencies:
   - nbformat
   - zlib
   - make
+  - pyahocorasick
+  - pip:
+    - kaleido
