@@ -39,7 +39,7 @@ def get_lowest_percentile(df, percentile=0.05, drug_scrub='percentile'):
     if df['drug_count'].isna().all():
         print('No drug counts found, continuing without drugscrub')
         df['drug_count'] = 0
-
+        
     if drug_scrub == 'percentile':
         lowest = df[
             (df['reference_count'] <= df['reference_count'].quantile(percentile)) &
