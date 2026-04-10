@@ -14,7 +14,6 @@ import ahocorasick
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from Bio import SeqIO
 from Bio.Seq import Seq
 
@@ -147,43 +146,52 @@ def smooth_downsample(df, target_count, bin_size):
 
     return result.sort_values(['contig_id', 'kmer_position'])
 
-def plot_genome_bins(df, basename, bin_size):
+def plot_genome_bins(df, df_smooth, basename, bin_size, output_dir):
+    df = df.copy()
     df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
     df['kmer_count'] = 1
+    df['bin'] = (df['kmer_position'] // bin_size) * bin_size
+
+    df_smooth = df_smooth.copy()
+    df_smooth['kmer_count'] = 1
+    df_smooth['bin'] = (df_smooth['kmer_position'] // bin_size) * bin_size
 
     contigs = df['contig_id'].unique()
-    n_contigs = len(contigs)
-    vertical_spacing = min(0.02, 1.0 / n_contigs) if n_contigs > 1 else 0
-    row_height = max(20, min(55, 5000 // n_contigs))
+    plot_dir = os.path.join(output_dir, 'contig_plots')
+    os.makedirs(plot_dir, exist_ok=True)
 
-    fig = make_subplots(rows=n_contigs, cols=1,
-                        shared_xaxes=True,
-                        shared_yaxes=True,
-                        vertical_spacing=vertical_spacing)
+    for contig in contigs:
+        df_contig = df.loc[df['contig_id'] == contig]
+        binned_all = df_contig.groupby('bin')['kmer_count'].sum().reset_index()
+        binned_all = binned_all[binned_all['kmer_count'] > 0]
 
-    df['bin'] = (df['kmer_position'] // bin_size) * bin_size
-    y_max = df.groupby(['contig_id', 'bin'])['kmer_count'].sum().max()
+        df_contig_smooth = df_smooth.loc[df_smooth['contig_id'] == contig]
+        binned_smooth = df_contig_smooth.groupby('bin')['kmer_count'].sum().reset_index()
+        binned_smooth = binned_smooth[binned_smooth['kmer_count'] > 0]
 
-    for i, contig in enumerate(contigs, 1):
-        df_contig = df.loc[df['contig_id'] == contig].copy()
-        binned = df_contig.groupby('bin')['kmer_count'].sum().reset_index()
-        binned = binned[binned['kmer_count'] > 0]
+        y_max = binned_all['kmer_count'].max() if len(binned_all) else 1
 
-        fig.add_trace(go.Scatter(x=binned['bin'], y=binned['kmer_count'],
-                                 mode='markers',
-                                 name=contig, showlegend=False,
-                                 marker=dict(color=px.colors.qualitative.D3[0], size=3)), row=i, col=1)
-
-    fig.update_xaxes(title_text='position (bp)', row=n_contigs, col=1)
-    fig.update_yaxes(showline=True, showticklabels=True, title_text="",
-                     title_font=dict(size=9), range=[0, y_max * 1.05])
-    fig.update_layout(
-        title_text=basename,
-        height=row_height * n_contigs,
-        width=800,
-        template='simple_white',
-    )
-    return fig
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=binned_all['bin'], y=binned_all['kmer_count'],
+            mode='markers', name='all rare kmers',
+            marker=dict(color=px.colors.qualitative.D3[0], size=3),
+        ))
+        fig.add_trace(go.Scatter(
+            x=binned_smooth['bin'], y=binned_smooth['kmer_count'],
+            mode='markers', name='selected kmers',
+            marker=dict(color=px.colors.qualitative.D3[1], size=3),
+        ))
+        fig.update_xaxes(title_text='position (bp)')
+        fig.update_yaxes(showline=True, showticklabels=True, range=[0, y_max * 1.05])
+        fig.update_layout(
+            title_text=f'{basename} — {contig}',
+            height=400,
+            width=800,
+            template='simple_white',
+        )
+        safe_contig = contig.replace('/', '_').replace(' ', '_')
+        fig.write_image(os.path.join(plot_dir, f'{basename}.{safe_contig}.svg'))
 
 def plot_kmer_counts(lowest_pct):
     df_plot = lowest_pct.sort_values(['pangenome_count', 'metagenome_count'], ascending=True).reset_index(drop=True).reset_index()
@@ -272,8 +280,7 @@ def main():
     print(f'  {len(df_smooth)} kmers after smoothing')
 
     if args.figures:
-        fig_bins = plot_genome_bins(df, basename, bin_size=args.bin_size)
-        fig_bins.write_image(os.path.join(args.output_dir, f'{basename}.genome_bins.svg'))
+        plot_genome_bins(df, df_smooth, basename, bin_size=args.bin_size, output_dir=args.output_dir)
         
         fig_bins2 = plot_box_coverage(df, df_smooth, basename, bin_size=args.bin_size)
         fig_bins2.write_image(os.path.join(args.output_dir, f'{basename}.box_genome_bins.svg'))

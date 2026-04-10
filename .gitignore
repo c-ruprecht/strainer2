@@ -1,3 +1,4 @@
+/test/invitro_mixes/output
 /test/strainer2_parallel/output
 /test/strainer2_filter
 /src/*.o
@@ -5,3 +6,5 @@
 /src/strain_detect
 /src/genome_compare
 .snakemake/
+/scripts/dev
+/test

@@ -10,7 +10,7 @@ shared_obj = BIO_sequence.o BIO_hash.o genome_compare.o up2bit.o
 
 #all: genome_compare up2bit_test strain_track
 #all: genome_compare strain_track pangenome_compare kmer_matrix kmer_scrub_count strain_detect
-all: genome_compare kmer_scrub_count strain_detect
+all: genome_compare kmer_scrub_count strain_detect kmer_strain_detect
 
 #genome_compare: $(obj)
 genome_compare: main.o $(shared_obj)
@@ -23,6 +23,9 @@ kmer_scrub_count: kmer_scrub_count.o $(shared_obj)
 #	$(CC) -o $@ $^ $(LDFLAGS)
 
 strain_detect: strain_detect.o $(shared_obj)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+kmer_strain_detect: kmer_strain_detect.o $(shared_obj)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 
