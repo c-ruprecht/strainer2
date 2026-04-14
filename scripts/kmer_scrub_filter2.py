@@ -244,7 +244,7 @@ def main():
                         help='Save figures as SVG (default: False)')
     parser.add_argument('--percentile', type=float, default=0.01,
                         help='Percentile threshold for rare kmer selection (default: 0.05)')
-    parser.add_argument('--percentile_union', type = int, default = 0.05, help = 'percentile passed for union of different kmer scrubs')
+    parser.add_argument('--percentile_union', type = float, default = 0.05, help = 'percentile passed for union of different kmer scrubs')
     parser.add_argument('--bin-size', type=int, default=1000,
                         help='Bin size in bp for kmer density smoothing (default: 1000)')
     parser.add_argument('--terminal-dist', type=int, default=300,
