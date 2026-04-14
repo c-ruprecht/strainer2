@@ -142,12 +142,9 @@ def _sort_key(r):
     return (LEVEL_PRIORITY.get(level, 4), -n50, n_contigs)
 
 
-def get_ncbi_family(ncbi_species):
-    """
-    Query NCBI taxonomy to return the family name for a species.
-    Returns the family name string, or None on failure / not found.
-    """
-    cmd = ["datasets", "summary", "taxonomy", "taxon", ncbi_species]
+def _query_ncbi_family(taxon):
+    """Return the family name for a taxon string, or None."""
+    cmd = ["datasets", "summary", "taxonomy", "taxon", taxon]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return None
@@ -157,10 +154,22 @@ def get_ncbi_family(ncbi_species):
         if not reports:
             return None
         classification = reports[0].get("taxonomy", {}).get("classification", {})
-        name = classification.get("family", {}).get("name")
-        return name or None
+        return classification.get("family", {}).get("name") or None
     except (json.JSONDecodeError, AttributeError, KeyError, IndexError):
         return None
+
+
+def get_ncbi_family(ncbi_species):
+    """
+    Query NCBI taxonomy to return the family name for a species.
+    Falls back to querying by genus if the species name is not found.
+    Returns the family name string, or None on failure / not found.
+    """
+    family = _query_ncbi_family(ncbi_species)
+    if family:
+        return family
+    genus = genus_from_species(ncbi_species)
+    return _query_ncbi_family(genus)
 
 
 def fetch_family_metadata(family, exclude_genus, assembly_levels, limit=0):
@@ -891,37 +900,62 @@ def process_lineage(lineage, args):
     print(f"[info] tmp dir      : {tmp_dir}", file=sys.stderr)
 
     try:
-        # --- fetch metadata & rank assemblies ---
-        metadata = fetch_assembly_metadata(ncbi_species, args.assembly_levels, limit=args.max_download)
-
-        if metadata:
-            accessions = [r["accession"] for r in metadata if "accession" in r]
-            zip_path = download_by_accession(accessions, tmp_dir)
-            extract_dir = os.path.join(tmp_dir, "extracted")
-            genome_files = extract_genome_files(zip_path, extract_dir)
+        if args.genome_dir:
+            # Use pre-downloaded genomes; still fetch metadata for quality ordering
+            genome_files = sorted(set(
+                str(p) for ext in ("*.fna", "*.fasta", "*.fa")
+                for p in Path(args.genome_dir).rglob(ext)
+                if p.stat().st_size > 0
+            ))
+            print(f"[info] {len(genome_files)} genome file(s) found in {args.genome_dir}.", file=sys.stderr)
+            metadata = fetch_assembly_metadata(ncbi_species, args.assembly_levels, limit=args.max_download)
+            if metadata and genome_files:
+                genome_files = order_by_metadata(genome_files, metadata)
+            genus_supplement = {}
         else:
-            try:
-                zip_path = download_by_taxon(ncbi_species, tmp_dir, args.assembly_levels)
+            # --- fetch metadata & rank assemblies ---
+            metadata = fetch_assembly_metadata(ncbi_species, args.assembly_levels, limit=args.max_download)
+
+            if metadata:
+                accessions = [r["accession"] for r in metadata if "accession" in r]
+                zip_path = download_by_accession(accessions, tmp_dir)
                 extract_dir = os.path.join(tmp_dir, "extracted")
                 genome_files = extract_genome_files(zip_path, extract_dir)
-            except RuntimeError as exc:
+            else:
+                try:
+                    zip_path = download_by_taxon(ncbi_species, tmp_dir, args.assembly_levels)
+                    extract_dir = os.path.join(tmp_dir, "extracted")
+                    genome_files = extract_genome_files(zip_path, extract_dir)
+                except RuntimeError as exc:
+                    print(
+                        f"[warn] species-level download failed for {species!r}: {exc}\n"
+                        f"[warn] no species genomes available; will attempt genus/family fallback.",
+                        file=sys.stderr,
+                    )
+                    genome_files = []
+
+            if genome_files:
+                print(f"[info] {len(genome_files)} genome file(s) extracted.", file=sys.stderr)
+
+            if metadata and genome_files:
+                genome_files = order_by_metadata(genome_files, metadata)
+
+            # --- pre-dereplication genus supplement (if species downloads < max_download) ---
+            genome_files, genus_supplement = supplement_with_genus(
+                genome_files, ncbi_species, args, tmp_dir
+            )
+
+            if args.download_only:
+                manifest_path = os.path.join(species_dir, "genome_manifest.txt")
+                with open(manifest_path, "w") as fh:
+                    fh.write("\n".join(genome_files) + "\n")
                 print(
-                    f"[warn] species-level download failed for {species!r}: {exc}\n"
-                    f"[warn] no species genomes available; will attempt genus/family fallback.",
+                    f"[download_only] {len(genome_files)} genome(s) downloaded.\n"
+                    f"[download_only] Manifest : {manifest_path}\n"
+                    f"[download_only] Genome dir: {tmp_dir}",
                     file=sys.stderr,
                 )
-                genome_files = []
-
-        if genome_files:
-            print(f"[info] {len(genome_files)} genome file(s) extracted.", file=sys.stderr)
-
-        if metadata and genome_files:
-            genome_files = order_by_metadata(genome_files, metadata)
-
-        # --- pre-dereplication genus supplement (if species downloads < max_download) ---
-        genome_files, genus_supplement = supplement_with_genus(
-            genome_files, ncbi_species, args, tmp_dir
-        )
+                return
 
         # --- reference-identity filter (optional, applied only to species-source genomes) ---
         ref_identities = {}
@@ -1114,19 +1148,83 @@ def process_lineage(lineage, args):
         )
 
     finally:
-        if args.keep_tmp:
+        if args.keep_tmp or (getattr(args, 'download_only', False) and not args.genome_dir):
             print(f"[info] kept tmp dir: {tmp_dir}", file=sys.stderr)
         else:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def cmd_similarity_matrix(args):
+    """Subcommand: compute all-vs-all similarity matrix for a list of local genome files."""
+    genome_files = [line.strip() for line in open(args.genome_list) if line.strip()]
+    missing = [f for f in genome_files if not os.path.isfile(f)]
+    if missing:
+        print(f"[error] {len(missing)} file(s) not found:", file=sys.stderr)
+        for f in missing:
+            print(f"  {f}", file=sys.stderr)
+        sys.exit(1)
+
+    strain_mode = not args.no_strain_mode
+    sim = compute_similarity_matrix(genome_files, args.genome_compare, strain_mode, args.threads)
+
+    labels = [os.path.basename(f) for f in genome_files]
+    with open(args.output, 'w') as fh:
+        fh.write('\t' + '\t'.join(labels) + '\n')
+        for f, label in zip(genome_files, labels):
+            row = [f"{sim[f].get(g, 0.0):.4f}" for g in genome_files]
+            fh.write(label + '\t' + '\t'.join(row) + '\n')
+
+    print(f"[info] matrix written to {args.output}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Download and dereplicate NCBI GenBank genomes for sourmash s__ lineage entries. "
-            "Provide --sourmash_summary to process all unique lineages found in that file, "
-            "or --lineage to process a single lineage."
+            "build_scrub_db: download/dereplicate NCBI genomes, or compute a local similarity matrix."
         )
+    )
+    subparsers = parser.add_subparsers(dest='subcommand')
+
+    # --- similarity subcommand ---
+    sim_parser = subparsers.add_parser(
+        'similarity',
+        help='Compute all-vs-all kmer similarity matrix for a list of local genome files.'
+    )
+    sim_parser.add_argument(
+        '--genome_list', '-i', required=True,
+        help='Text file with one genome file path per line.'
+    )
+    sim_parser.add_argument(
+        '--output', '-o', required=True,
+        help='Output TSV file for the similarity matrix.'
+    )
+    sim_parser.add_argument(
+        '--genome_compare', '-g', default='genome_compare',
+        help='Path to the genome_compare binary (default: genome_compare in PATH).'
+    )
+    sim_parser.add_argument(
+        '--threads', '-p', type=int, default=4,
+        help='Parallel genome_compare processes (default: 4).'
+    )
+    sim_parser.add_argument(
+        '--no_strain_mode', action='store_true',
+        help='Disable strain mode (-S) in genome_compare.'
+    )
+
+    # --- build subcommand (existing behaviour) ---
+    build_parser = subparsers.add_parser(
+        'build',
+        help='Download and dereplicate NCBI GenBank genomes for sourmash s__ lineage entries.'
+    )
+    build_parser.add_argument(
+        "--lineage", "-l", default=None,
+        help="Sourmash lineage string with an s__ entry "
+             "(e.g. 's__Faecalibacterium prausnitzii'). "
+             "Not required when --sourmash_summary is given.",
+    )
+    build_parser.add_argument(
+        "--target_dir", "-o", required=True,
+        help="Root output directory. Genomes are stored in <target_dir>/<species>/.",
     )
     parser.add_argument(
         "--lineage", "-l", default=None,
@@ -1134,65 +1232,82 @@ def main():
              "(e.g. 's__Faecalibacterium prausnitzii'). "
              "Not required when --sourmash_summary is given.",
     )
-    parser.add_argument(
-        "--target_dir", "-o", required=True,
-        help="Root output directory. Genomes are stored in <target_dir>/<species>/.",
-    )
-    parser.add_argument(
+    build_parser.add_argument(
         "--genome_compare", "-g", default="genome_compare",
         help="Path to the genome_compare binary (default: genome_compare in PATH).",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--threshold", "-t", type=float, default=0.95,
         help="Kmer containment threshold for dereplication (default: 0.95).",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--assembly_levels", "-a", default="complete,scaffold,contig",
         help="Comma-separated NCBI assembly levels to consider (default: complete,scaffold,contig).",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--max_download", "-n", type=int, default=0,
         help="Maximum assemblies to download per species, ranked by quality. 0 = no limit.",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--max_reps", "-r", type=int, default=0,
         help="Stop dereplication once this many representatives are collected. 0 = no limit.",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--threads", "-p", type=int, default=4,
         help="Parallel genome_compare processes for the similarity matrix (default: 4).",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--sourmash_summary", "-s", default=None,
         help="Sourmash classification summary CSV (columns: lineage, query_filename, …). "
              "All unique lineages are processed; matching genomes are used as references "
              "for --min_ref_identity filtering.",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--min_ref_identity", type=float, default=0.0,
         help="Minimum kmer identity to any reference genome from --sourmash_summary "
              "required to keep a downloaded assembly (default: 0.0 = no filter).",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--no_strain_mode", action="store_true",
         help="Disable strain mode (-S) in genome_compare.",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--force", "-f", action="store_true",
         help="Rebuild database even if it already exists.",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--keep_tmp", action="store_true",
         help="Keep temporary download directory (useful for debugging).",
     )
-    parser.add_argument(
+    build_parser.add_argument(
         "--tmp_dir", default=None,
         help="Parent directory for the temporary download folder (default: system temp dir).",
     )
+    build_parser.add_argument(
+        "--download_only", action="store_true",
+        help="Download and extract genomes then exit without running dereplication. "
+             "Genome paths are written to <target_dir>/<species>/genome_manifest.txt and "
+             "the tmp dir is preserved. Pass --tmp_dir to control its location so the cluster "
+             "job can find it.",
+    )
+    build_parser.add_argument(
+        "--genome_dir", default=None,
+        help="Path to a directory of pre-downloaded genome FASTA files (.fna/.fasta/.fa). "
+             "Skips the download step entirely and runs dereplication on the files found there. "
+             "Intended for cluster jobs that receive genomes downloaded via --download_only.",
+    )
     args = parser.parse_args()
 
+    if args.subcommand == 'similarity':
+        cmd_similarity_matrix(args)
+        return
+
+    if args.subcommand != 'build':
+        parser.print_help()
+        sys.exit(1)
+
     if not args.lineage and not args.sourmash_summary:
-        parser.error("provide --lineage or --sourmash_summary (or both)")
+        build_parser.error("provide --lineage or --sourmash_summary (or both)")
 
     if args.sourmash_summary and not args.lineage:
         lineages = lineages_from_sourmash(args.sourmash_summary)

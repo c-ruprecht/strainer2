@@ -244,6 +244,7 @@ def main():
                         help='Save figures as SVG (default: False)')
     parser.add_argument('--percentile', type=float, default=0.01,
                         help='Percentile threshold for rare kmer selection (default: 0.05)')
+    parser.add_argument('--percentile_union', type = int, default = 0.05, help = 'percentile passed for union of different kmer scrubs')
     parser.add_argument('--bin-size', type=int, default=1000,
                         help='Bin size in bp for kmer density smoothing (default: 1000)')
     parser.add_argument('--terminal-dist', type=int, default=300,
@@ -255,7 +256,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     df_counts = pd.read_csv(args.scrubbed_kmers, sep='\t')
-    lowest_pct = get_lowest_percentile(df_counts, percentile=0.05, drug_scrub='percentile')
+    lowest_pct = get_lowest_percentile(df_counts, percentile=argparse.percentile_union, drug_scrub='percentile')
     target = int(round(args.percentile * len(df_counts), 0))
 
     print(f'Total kmers: {len(df_counts)}')
