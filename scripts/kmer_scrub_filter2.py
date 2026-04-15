@@ -106,44 +106,42 @@ def assign_mapping_bin(df, bin_size):
     return pd.concat(li_dfs)
 
 
-def smooth_downsample(df, target_count, bin_size):
-    """Downsample df to target_count by capping high-coverage bins."""
+def smooth_downsample(df, target_count, bin_size, target_percentile):
+    """Downsample df so each contig has at most target_count kmers.
+    Per-bin counts are capped at the target_percentile quantile of that contig's
+    own bin distribution, then the contig is further sampled down to target_count
+    if needed. Removes terminal kmers to avoid bad assembly regions.
+    """
+
     df = assign_mapping_bin(df.loc[df['terminal_kmer'] == False], bin_size)
 
-    n_remove = len(df) - target_count
-    if n_remove <= 0:
-        return df
+    contig_results = []
+    for contig_id, contig_df in df.groupby('contig_id'):
+        bin_counts = contig_df.groupby('bin')['#kmer'].count()
+        bin_cap = max(1, int(bin_counts.quantile(target_percentile)))
+        contig_keep = []
+        for _, group in contig_df.groupby('bin'):
+            n_in_bin = len(group)
+            n_keep = min(n_in_bin, bin_cap)
+            if n_keep < n_in_bin:
+                contig_keep.append(
+                    group.sort_values('kmer_position').iloc[
+                        np.linspace(0, n_in_bin - 1, n_keep, dtype=int)
+                    ]
+                )
+            else:
+                contig_keep.append(group)
 
-    bin_counts = df.groupby(['contig_id', 'bin'])['#kmer'].count()
-    median_count = bin_counts.median()
-    print(f'  Bin median: {median_count:.1f}, removing {n_remove} kmers to reach target {target_count}')
+        contig_result = pd.concat(contig_keep)
 
-    bin_excess = (bin_counts - median_count).clip(lower=0)
+        if len(contig_result) > target_count:
+            contig_result = contig_result.sample(n=target_count)
 
-    if bin_excess.sum() == 0:
-        return df.sample(n=target_count)
+        contig_results.append(contig_result)
+        print(f'  {contig_id}: {len(contig_df)} -> {len(contig_result)} kmers (bin cap: {bin_cap})')
 
-    remove_per_bin = (bin_excess / bin_excess.sum() * n_remove).round().astype(int)
-    remove_per_bin = remove_per_bin.clip(upper=bin_counts - 1)
-
-    keep_indices = []
-    for (contig_id, bin_val), group in df.groupby(['contig_id', 'bin']):
-        n_drop = remove_per_bin.get((contig_id, bin_val), 0)
-        if n_drop > 0:
-            n_keep = len(group) - n_drop
-            keep_indices.append(
-                group.sort_values('kmer_position').iloc[
-                    np.linspace(0, len(group) - 1, n_keep, dtype=int)
-                ]
-            )
-        else:
-            keep_indices.append(group)
-
-    result = pd.concat(keep_indices)
-
-    if len(result) > target_count:
-        result = result.sample(n=target_count)
-
+    result = pd.concat(contig_results)
+    print(f'  Total: {len(df)} -> {len(result)} kmers after smooth downsampling')
     return result.sort_values(['contig_id', 'kmer_position'])
 
 def plot_genome_bins(df, df_smooth, basename, bin_size, output_dir):
@@ -260,7 +258,7 @@ def main():
     target = int(round(args.percentile * len(df_counts), 0))
 
     print(f'Total kmers: {len(df_counts)}')
-    print(f'Rare kmers (5th pct): {len(lowest_pct)} ({len(lowest_pct)/len(df_counts)*100:.1f}%)')
+    print(f'Rare kmers ({args.union_percentile}th union percentile): {len(lowest_pct)} ({len(lowest_pct)/len(df_counts)*100:.1f}%)')
     print(f'Target after smoothing: {target}')
 
     if args.figures:
@@ -277,7 +275,7 @@ def main():
     else:
         print(f'Mapping {len(kmers)} kmers...')
     df, _ = build_mapped_kmers_ahocorasick(records, kmers, terminal_dist=args.terminal_dist)
-    df_smooth = smooth_downsample(df, target_count=target, bin_size=args.bin_size)
+    df_smooth = smooth_downsample(df, target_count=target, bin_size=args.bin_size, target_percentile = args.percentile)
     print(f'  {len(df_smooth)} kmers after smoothing')
 
     if args.figures:
