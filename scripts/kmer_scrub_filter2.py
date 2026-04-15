@@ -118,17 +118,17 @@ def smooth_downsample(df, total_target, bin_size, bin_percentile):
     df = assign_mapping_bin(df.loc[df['terminal_kmer'] == False], bin_size)
 
     bin_counts = df.groupby(['contig_id', 'bin']).size()
-    global_bin_cap = int(bin_counts.mean())
-    mean_bin_count_genome = bin_counts.groupby('contig_id').mean()
+    #global_bin_cap = int(bin_counts.mean())
+    #mean_bin_count_genome = bin_counts.groupby('contig_id').mean()
 
     bin_counts = bin_counts.reset_index()
     bin_counts = bin_counts.rename(columns = {0: 'size'})
-    bin_counts['to_scrub'] = bin_counts['size'] - global_bin_cap
-    print(bin_counts.sort_values(['to_scrub'],ascending = False))
+    #bin_counts['to_scrub'] = bin_counts['size'] - global_bin_cap
+    #print(bin_counts.sort_values(['to_scrub'],ascending = False))
 
-    print(bin_counts, global_bin_cap,mean_bin_count_genome)
+    #print(bin_counts, global_bin_cap,mean_bin_count_genome)
     
-    print(f'  Global mean bin cap: {global_bin_cap}')
+    #print(f'  Global mean bin cap: {global_bin_cap}')
 
     total_genome_length = df.groupby('contig_id')['contig_length'].first().sum()
 
@@ -137,32 +137,39 @@ def smooth_downsample(df, total_target, bin_size, bin_percentile):
         contig_length = contig_df['contig_length'].iloc[0]
         contig_cap = max(1, int(total_target * contig_length / total_genome_length))
         print(contig_cap)
-        contig_keep = []
-        df_scrub = bin_counts.loc[(bin_counts['contig_id']==contig_id) & 
-                                  (bin_counts['to_scrub']>0)]
+
+        #df_scrub = bin_counts.loc[(bin_counts['contig_id']==contig_id) & 
+        #                          (bin_counts['to_scrub']>0)]
+        #print('counts for kmers not to be scrubbed')
+
+        # HERE YOU NEED TO ACTUALLY ALSO GRAB NOT ONLY FROM THE OVERREPRESENTED ONES!
+        #print(str(bin_counts.loc[(bin_counts['contig_id']==contig_id) & 
+        #                          (bin_counts['to_scrub']<0)]['size'].sum()))
         
         current_total = len(contig_df)
         excess = current_total - contig_cap
+        df_scrub = bin_counts.loc[bin_counts["contig_id"]==contig_id]
+        
+        #df_scrub['n_remove'] = (df_scrub['to_scrub'] / df_scrub['to_scrub'].sum() * excess).astype(int)
+        
+        #proportionally remove the excess from size
+        df_scrub['n_remove'] = (df_scrub['size'] / df_scrub['size'].sum() * excess).astype(int)
 
-
-
-        df_scrub['n_remove'] = (df_scrub['to_scrub'] / df_scrub['to_scrub'].sum() * excess).astype(int)
         # cap so we never remove more than what's scrubable
-        df_scrub['n_remove'] = df_scrub['n_remove'].clip(upper=df_scrub['to_scrub'])
+        #df_scrub['n_remove'] = df_scrub['n_remove'].clip(upper=df_scrub['to_scrub'])
 
         # fix rounding remainder — assign to largest bins first
         remainder = excess - df_scrub['n_remove'].sum()
-        print(remainder)
         if remainder > 0:
             largest = df_scrub.nlargest(remainder, 'size').index
             df_scrub.loc[largest, 'n_remove'] += 1
 
         # what each bin keeps after removal
         df_scrub['n_keep'] = df_scrub['size'] - df_scrub['n_remove']
-        print(df_scrub)
+        print(df_scrub.sort_values(['n_remove'], ascending = False))
         print('current contig kmers:' + str(current_total))
         print('Excess kmers in contig: ' + str(excess))
-        print('potential scrubs: ' + str(df_scrub['to_scrub'].sum()))
+        #print('potential scrubs: ' + str(df_scrub['to_scrub'].sum()))
         print('total kmers that will be filtered: ' + str(df_scrub['n_remove'].sum()))
         # get all contig bins above global_bin_cap
         scrub_map = dict(zip(df_scrub['bin'], df_scrub['n_keep']))
@@ -186,6 +193,7 @@ def smooth_downsample(df, total_target, bin_size, bin_percentile):
         contig_result = pd.concat(contig_keep)
 
         if len(contig_result) > contig_cap:
+            print('random sample')
             contig_result = contig_result.sample(n=contig_cap)
 
         contig_results.append(contig_result)
