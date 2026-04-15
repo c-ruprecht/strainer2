@@ -256,7 +256,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     df_counts = pd.read_csv(args.scrubbed_kmers, sep='\t')
-    lowest_pct = get_lowest_percentile(df_counts, percentile=argparse.percentile_union, drug_scrub='percentile')
+    lowest_pct = get_lowest_percentile(df_counts, percentile=args.percentile_union, drug_scrub='percentile')
     target = int(round(args.percentile * len(df_counts), 0))
 
     print(f'Total kmers: {len(df_counts)}')
