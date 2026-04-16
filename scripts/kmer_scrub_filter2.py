@@ -203,52 +203,87 @@ def smooth_downsample(df, total_target, bin_size, bin_percentile):
     print(f'  Total: {len(df)} -> {len(result)} kmers after smooth downsampling')
     return result.sort_values(['contig_id', 'kmer_position'])
 
-def plot_genome_bins(df, df_smooth, basename, bin_size, output_dir):
-    df = df.copy()
-    df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
-    df['kmer_count'] = 1
-    df['bin'] = (df['kmer_position'] // bin_size) * bin_size
+def plot_genome_bins(df, df_smooth, basename, bin_size, output_dir, map_only = False):
+    if map_only:
+        df=df.copy()
+        df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
+        df['kmer_count'] = 1
+        df['bin'] = (df['kmer_position'] // bin_size) * bin_size
 
-    df_smooth = df_smooth.copy()
-    df_smooth['kmer_count'] = 1
-    df_smooth['bin'] = (df_smooth['kmer_position'] // bin_size) * bin_size
+        contigs = df['contig_id'].unique()
+        plot_dir = os.path.join(output_dir, 'contig_plots')
+        os.makedirs(plot_dir, exist_ok=True)
 
-    contigs = df['contig_id'].unique()
-    plot_dir = os.path.join(output_dir, 'contig_plots')
-    os.makedirs(plot_dir, exist_ok=True)
+        for contig in contigs:
+            df_contig = df.loc[df['contig_id'] == contig]
+            binned_all = df_contig.groupby('bin')['kmer_count'].sum().reset_index()
+            binned_all = binned_all[binned_all['kmer_count'] > 0]
 
-    for contig in contigs:
-        df_contig = df.loc[df['contig_id'] == contig]
-        binned_all = df_contig.groupby('bin')['kmer_count'].sum().reset_index()
-        binned_all = binned_all[binned_all['kmer_count'] > 0]
+            y_max = binned_all['kmer_count'].max() if len(binned_all) else 1
 
-        df_contig_smooth = df_smooth.loc[df_smooth['contig_id'] == contig]
-        binned_smooth = df_contig_smooth.groupby('bin')['kmer_count'].sum().reset_index()
-        binned_smooth = binned_smooth[binned_smooth['kmer_count'] > 0]
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=binned_all['bin'], y=binned_all['kmer_count'],
+                mode='markers', name='all rare kmers',
+                marker=dict(color=px.colors.qualitative.D3[0], size=3),
+            ))
+            
+            fig.update_xaxes(title_text='position (bp)')
+            fig.update_yaxes(showline=True, showticklabels=True, range=[0, y_max * 1.05])
+            fig.update_layout(
+                title_text=f'{basename} — {contig}',
+                height=400,
+                width=800,
+                template='simple_white',
+            )
+            safe_contig = contig.replace('/', '_').replace(' ', '_')
+            fig.write_image(os.path.join(plot_dir, f'{basename}.{safe_contig}.svg'))
+    else:
+        df = df.copy()
+        df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
+        df['kmer_count'] = 1
+        df['bin'] = (df['kmer_position'] // bin_size) * bin_size
 
-        y_max = binned_all['kmer_count'].max() if len(binned_all) else 1
+        df_smooth = df_smooth.copy()
+        df_smooth['kmer_count'] = 1
+        df_smooth['bin'] = (df_smooth['kmer_position'] // bin_size) * bin_size
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=binned_all['bin'], y=binned_all['kmer_count'],
-            mode='markers', name='all rare kmers',
-            marker=dict(color=px.colors.qualitative.D3[0], size=3),
-        ))
-        fig.add_trace(go.Scatter(
-            x=binned_smooth['bin'], y=binned_smooth['kmer_count'],
-            mode='markers', name='selected kmers',
-            marker=dict(color=px.colors.qualitative.D3[1], size=3),
-        ))
-        fig.update_xaxes(title_text='position (bp)')
-        fig.update_yaxes(showline=True, showticklabels=True, range=[0, y_max * 1.05])
-        fig.update_layout(
-            title_text=f'{basename} — {contig}',
-            height=400,
-            width=800,
-            template='simple_white',
-        )
-        safe_contig = contig.replace('/', '_').replace(' ', '_')
-        fig.write_image(os.path.join(plot_dir, f'{basename}.{safe_contig}.svg'))
+        contigs = df['contig_id'].unique()
+        plot_dir = os.path.join(output_dir, 'contig_plots')
+        os.makedirs(plot_dir, exist_ok=True)
+
+        for contig in contigs:
+            df_contig = df.loc[df['contig_id'] == contig]
+            binned_all = df_contig.groupby('bin')['kmer_count'].sum().reset_index()
+            binned_all = binned_all[binned_all['kmer_count'] > 0]
+
+            df_contig_smooth = df_smooth.loc[df_smooth['contig_id'] == contig]
+            binned_smooth = df_contig_smooth.groupby('bin')['kmer_count'].sum().reset_index()
+            binned_smooth = binned_smooth[binned_smooth['kmer_count'] > 0]
+
+            y_max = binned_all['kmer_count'].max() if len(binned_all) else 1
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=binned_all['bin'], y=binned_all['kmer_count'],
+                mode='markers', name='all rare kmers',
+                marker=dict(color=px.colors.qualitative.D3[0], size=3),
+            ))
+            fig.add_trace(go.Scatter(
+                x=binned_smooth['bin'], y=binned_smooth['kmer_count'],
+                mode='markers', name='selected kmers',
+                marker=dict(color=px.colors.qualitative.D3[1], size=3),
+            ))
+            fig.update_xaxes(title_text='position (bp)')
+            fig.update_yaxes(showline=True, showticklabels=True, range=[0, y_max * 1.05])
+            fig.update_layout(
+                title_text=f'{basename} — {contig}',
+                height=400,
+                width=800,
+                template='simple_white',
+            )
+            safe_contig = contig.replace('/', '_').replace(' ', '_')
+            fig.write_image(os.path.join(plot_dir, f'{basename}.{safe_contig}.svg'))
 
 def plot_kmer_counts(lowest_pct):
     df_plot = lowest_pct.sort_values(['pangenome_count', 'metagenome_count'], ascending=True).reset_index(drop=True).reset_index()
@@ -265,36 +300,54 @@ def plot_kmer_counts(lowest_pct):
     fig.update_yaxes(title_text='')
     return fig
 
-def plot_box_coverage(df_lowest, df_smooth, basename, bin_size):
-    df_lowest['stage'] = 'pre_smooth'
-    df_smooth['stage'] = 'post_smooth'
-    print(df_lowest)
-    print(df_smooth)
+def plot_box_coverage(df_lowest, df_smooth, basename, bin_size, map_only = False):
+    if map_only:
+        df = df_lowest
+        df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
+        df['kmer_count'] = 1
 
-    df = pd.concat([df_lowest, df_smooth])
+        df['bin'] = (df['kmer_position'] // bin_size) * bin_size
+        binned = df.groupby(['contig_id','bin'])['kmer_count'].sum().reset_index()
+
+        fig = px.box(binned,
+                    x = 'contig_id',
+                    y = 'kmer_count',
+                    #color = 'stage',
+                    points = 'all',
+                    template = 'simple_white',
+                    title = basename,
+                    width = 800,
+                    height = 600)
+    else:
+        df_lowest['stage'] = 'pre_smooth'
+        df_smooth['stage'] = 'post_smooth'
+        print(df_lowest)
+        print(df_smooth)
+
+        df = pd.concat([df_lowest, df_smooth])
 
 
-    df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
-    df['kmer_count'] = 1
+        df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
+        df['kmer_count'] = 1
 
-    df['bin'] = (df['kmer_position'] // bin_size) * bin_size
-    binned = df.groupby(['stage','contig_id','bin'])['kmer_count'].sum().reset_index()
+        df['bin'] = (df['kmer_position'] // bin_size) * bin_size
+        binned = df.groupby(['stage','contig_id','bin'])['kmer_count'].sum().reset_index()
 
-    fig = px.box(binned,
-                 x = 'contig_id',
-                 y = 'kmer_count',
-                 color = 'stage',
-                 points = 'all',
-                 template = 'simple_white',
-                 title = basename,
-                 width = 800,
-                 height = 600)
+        fig = px.box(binned,
+                    x = 'contig_id',
+                    y = 'kmer_count',
+                    color = 'stage',
+                    points = 'all',
+                    template = 'simple_white',
+                    title = basename,
+                    width = 800,
+                    height = 600)
     return fig
 
 def main():
     parser = argparse.ArgumentParser(description='Map scrubbed kmers onto a genome.')
     parser.add_argument('genome', help='Genome FASTA file (.fna or .fna.gz)')
-    parser.add_argument('scrubbed_kmers', help='Scrubbed kmers file (.gz)')
+    parser.add_argument('kmer_counts', help='Either a kmer counts file or a scrubbed kmers file if map_scrubbed_kmers')
     parser.add_argument('--output-dir', default='.', help='Output directory (default: current directory)')
     parser.add_argument('--basename', default=None, help='Output basename (default: derived from genome filename)')
     parser.add_argument('--figures', action='store_true', default=False,
@@ -306,44 +359,67 @@ def main():
                         help='Bin size in bp for kmer density smoothing (default: 1000)')
     parser.add_argument('--terminal-dist', type=int, default=300,
                         help='Distance from contig ends to flag terminal kmers (default: 300)')
+    parser.add_argument('--map_scrubbed_kmers_only', action='store_true', help = 'Takes a file of rare kmers as a list, one kmer per line that will be mapped to a target genome')
+
     args = parser.parse_args()
+    if args.map_scrubbed_kmers_only:
+        strain = strain_name_from_path(args.genome)
+        basename = args.basename if args.basename else strain
+        os.makedirs(args.output_dir, exist_ok=True)
+        print(f'Loading genome: {args.genome}')
+        records = load_genome(args.genome)
+        print(f'  {len(records)} contigs')
+        df_counts = pd.read_csv(args.kmer_counts, sep='\t', header = None)
+        #print(df_counts)
+        print(f'Total scrubbed kmers to map: {len(df_counts)}')
+        kmers = df_counts[0].to_list()
+        df, _ = build_mapped_kmers_ahocorasick(records, kmers, terminal_dist=args.terminal_dist)
+        print(df)
+        if args.figures:
+            plot_genome_bins(df, df, basename, bin_size=args.bin_size, output_dir=args.output_dir, map_only = True )
+            
+            fig_bins2 = plot_box_coverage(df, df, basename, bin_size=args.bin_size, map_only=True)
+            fig_bins2.write_image(os.path.join(args.output_dir, f'{basename}.box_genome_bins.svg'))
 
-    strain = strain_name_from_path(args.genome)
-    basename = args.basename if args.basename else strain
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    df_counts = pd.read_csv(args.scrubbed_kmers, sep='\t')
-    lowest_pct = get_lowest_percentile(df_counts, percentile=args.percentile_union, drug_scrub='percentile')
-    print(f'Total kmers: {len(df_counts)}')
-    print(f'Rare kmers ({args.percentile_union:.0%} union percentile): {len(lowest_pct)} ({len(lowest_pct)/len(df_counts)*100:.1f}%)')
-    total_target = int(len(df_counts) * args.percentile)
-    print(f'Target rare kmers: {total_target} ({args.percentile:.0%} of {len(df_counts)} total)')
-    if args.figures:
-        fig_counts = plot_kmer_counts(lowest_pct)
-        fig_counts.write_image(os.path.join(args.output_dir, f'{basename}.kmer_counts.svg'))
-
-    print(f'Loading genome: {args.genome}')
-    records = load_genome(args.genome)
-    print(f'  {len(records)} contigs')
-
-    kmers = lowest_pct['#kmer'].to_list()
-    if len(kmers) == 0:
-        print('ERROR: 0 kmers after filter')
+        df.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
+                        sep='\t', index=False, compression='gzip')
     else:
-        print(f'Mapping {len(kmers)} rare kmers...')
-    df, _ = build_mapped_kmers_ahocorasick(records, kmers, terminal_dist=args.terminal_dist)
-    df_smooth = smooth_downsample(df, total_target=total_target, bin_size=args.bin_size, bin_percentile=args.percentile)
-    print(f'  {len(df_smooth)} kmers after smoothing')
+        strain = strain_name_from_path(args.genome)
+        basename = args.basename if args.basename else strain
+        os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.figures:
-        plot_genome_bins(df, df_smooth, basename, bin_size=args.bin_size, output_dir=args.output_dir)
-        
-        fig_bins2 = plot_box_coverage(df, df_smooth, basename, bin_size=args.bin_size)
-        fig_bins2.write_image(os.path.join(args.output_dir, f'{basename}.box_genome_bins.svg'))
-    df_smooth.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
-                     sep='\t', index=False, compression='gzip')
-    df_smooth[['#kmer']].to_csv(os.path.join(args.output_dir, f'{basename}.scrubbed_kmers'),
-                              sep='\t', index=False, header=None)
+        df_counts = pd.read_csv(args.kmer_counts, sep='\t')
+        lowest_pct = get_lowest_percentile(df_counts, percentile=args.percentile_union, drug_scrub='percentile')
+        print(f'Total kmers: {len(df_counts)}')
+        print(f'Rare kmers ({args.percentile_union:.0%} union percentile): {len(lowest_pct)} ({len(lowest_pct)/len(df_counts)*100:.1f}%)')
+        total_target = int(len(df_counts) * args.percentile)
+        print(f'Target rare kmers: {total_target} ({args.percentile:.0%} of {len(df_counts)} total)')
+        if args.figures:
+            fig_counts = plot_kmer_counts(lowest_pct)
+            fig_counts.write_image(os.path.join(args.output_dir, f'{basename}.kmer_counts.svg'))
+
+        print(f'Loading genome: {args.genome}')
+        records = load_genome(args.genome)
+        print(f'  {len(records)} contigs')
+
+        kmers = lowest_pct['#kmer'].to_list()
+        if len(kmers) == 0:
+            print('ERROR: 0 kmers after filter')
+        else:
+            print(f'Mapping {len(kmers)} rare kmers...')
+        df, _ = build_mapped_kmers_ahocorasick(records, kmers, terminal_dist=args.terminal_dist)
+        df_smooth = smooth_downsample(df, total_target=total_target, bin_size=args.bin_size, bin_percentile=args.percentile)
+        print(f'  {len(df_smooth)} kmers after smoothing')
+
+        if args.figures:
+            plot_genome_bins(df, df_smooth, basename, bin_size=args.bin_size, output_dir=args.output_dir)
+            
+            fig_bins2 = plot_box_coverage(df, df_smooth, basename, bin_size=args.bin_size)
+            fig_bins2.write_image(os.path.join(args.output_dir, f'{basename}.box_genome_bins.svg'))
+        df_smooth.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
+                        sep='\t', index=False, compression='gzip')
+        df_smooth[['#kmer']].to_csv(os.path.join(args.output_dir, f'{basename}.scrubbed_kmers'),
+                                sep='\t', index=False, header=None)
 
 if __name__ == '__main__':
     main()
