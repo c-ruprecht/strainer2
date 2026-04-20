@@ -17,6 +17,8 @@ dependencies:
   - python-kaleido=0.2.1
   - ncbi-datasets-cli
   - snakemake
+  - sourmash
+  - sourmash_plugin_branchwater
   #- pip:
   #  - kaleido
 
