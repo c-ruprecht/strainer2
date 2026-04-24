@@ -106,7 +106,7 @@ def assign_mapping_bin(df, bin_size):
     return pd.concat(li_dfs)
 
 
-def smooth_downsample(df, total_target, bin_size, bin_percentile):
+def smooth_downsample(df, total_target, bin_size, mode = None):
     """Downsample df so the total selected kmers equals total_target,
     with each contig's share proportional to its length.
     A global bin cap is computed as the bin_percentile quantile of bin counts across
@@ -114,94 +114,170 @@ def smooth_downsample(df, total_target, bin_size, bin_percentile):
     The contig is further sampled down to its proportional share if still over.
     Removes terminal kmers to avoid bad assembly regions.
     """
-
-    df = assign_mapping_bin(df.loc[df['terminal_kmer'] == False], bin_size)
-
-    bin_counts = df.groupby(['contig_id', 'bin']).size()
-    #global_bin_cap = int(bin_counts.mean())
-    #mean_bin_count_genome = bin_counts.groupby('contig_id').mean()
-
-    bin_counts = bin_counts.reset_index()
-    bin_counts = bin_counts.rename(columns = {0: 'size'})
-    #bin_counts['to_scrub'] = bin_counts['size'] - global_bin_cap
-    #print(bin_counts.sort_values(['to_scrub'],ascending = False))
-
-    #print(bin_counts, global_bin_cap,mean_bin_count_genome)
-    
-    #print(f'  Global mean bin cap: {global_bin_cap}')
-
-    total_genome_length = df.groupby('contig_id')['contig_length'].first().sum()
-
-    contig_results = []
-    for contig_id, contig_df in df.groupby('contig_id'):
-        contig_length = contig_df['contig_length'].iloc[0]
-        contig_cap = max(1, int(total_target * contig_length / total_genome_length))
-        print(contig_cap)
-
-        #df_scrub = bin_counts.loc[(bin_counts['contig_id']==contig_id) & 
-        #                          (bin_counts['to_scrub']>0)]
-        #print('counts for kmers not to be scrubbed')
-
-        # HERE YOU NEED TO ACTUALLY ALSO GRAB NOT ONLY FROM THE OVERREPRESENTED ONES!
-        #print(str(bin_counts.loc[(bin_counts['contig_id']==contig_id) & 
-        #                          (bin_counts['to_scrub']<0)]['size'].sum()))
+    if mode == 'independent':
         
-        current_total = len(contig_df)
-        excess = current_total - contig_cap
-        df_scrub = bin_counts.loc[bin_counts["contig_id"]==contig_id]
+        kmer_gap = 31
+        df = assign_mapping_bin(df.loc[df['terminal_kmer'] == False], bin_size)
+        # drop all non ATCG in kmers
+        df = df.loc[df['#kmer'].str.fullmatch(r'[ACGT]+')].copy()
+        total_genome_length = df.groupby('contig_id')['contig_length'].first().sum()
+
+        contig_results = []
+        for contig_id, contig_df in df.groupby('contig_id'):
+
+            contig_length = contig_df['contig_length'].iloc[0]
+            contig_cap = max(1, int(total_target * contig_length / total_genome_length))
+            print(f'Contig length: {contig_length}, max allowed kmers: {contig_cap}' )
+            current_total = len(contig_df)
+            excess = current_total - contig_cap
+            print(f"Available Kmers on contig: {current_total}")
+            print('Excess kmers on contig: ' + str(excess))
+            
+            #sort dataframe by position and counts
+            sort_df = contig_df.sort_values(['bin','drug_count', 'pangenome_count', 'metagenome_count'])
+            contig_result = sort_df.drop_duplicates('bin', keep = 'first')
+            # need a check to see if kmers overlap anyway
+            li_drop = []
+            for pos_i, (_, row) in enumerate(contig_result.iterrows()):
+                if row['reverse_complement'] == True:
+                    if pos_i == 0:
+                        continue
+                    else:
+                        neighbor = contig_result.iloc[pos_i-1]
+                        distance = row['kmer_position'] - neighbor['kmer_position']
+                        if neighbor['reverse_complement'] == True:
+                            req_distance = 31
+                        if neighbor['reverse_complement'] == False:
+                            req_distance = 62
+                        if distance < req_distance and distance > 0:
+                            print('kmers are too close')
+                            print('drop worse kmer: ')
+                            pair =  contig_result.iloc[pos_i-1:pos_i+1]
+                            drop_position = pair.sort_values(['drug_count', 'pangenome_count', 'metagenome_count'], ascending = False).iloc[0]['kmer_position']
+                            print(drop_position)
+                            li_drop.append(drop_position)
+                if row['reverse_complement'] == False:
+                    if pos_i == len(contig_result)-1:
+                        continue
+                    else:
+                        neighbor = contig_result.iloc[pos_i+1]
+                        distance = neighbor['kmer_position'] - row['kmer_position']
+                        if neighbor['reverse_complement'] == True:
+                            req_distance = 62
+                        if neighbor['reverse_complement'] == False:
+                            req_distance = 31
+                        if distance < req_distance:
+                            print('kmers are too close')
+                            pair = contig_result.iloc[pos_i:pos_i+2]
+                            drop_position = pair.sort_values(['drug_count', 'pangenome_count', 'metagenome_count'],ascending=False).iloc[0]['kmer_position']
+                            print(f'drop worse kmer at position: {drop_position}')
+                            li_drop.append(drop_position)
+
+            print(f'Found too close kmers, dropped: {len(li_drop)}')
+            contig_result = contig_result.loc[contig_result['kmer_position'].isin(li_drop) == False].copy()
+            # if over contig cap, trim more common kmers until its hit
+            if len(contig_result) > contig_cap:
+                print('More rare kmers than contig cap allows')
+                n_remove = len(contig_result) - contig_cap
+                print(f'fremoving additional kmers: {n_remove}')
+                
+                contig_result = (contig_result.sort_values(['drug_count', 'pangenome_count', 'metagenome_count'], ascending = True)
+                                 .iloc[:contig_cap])
+
+            contig_results.append(contig_result)
+        result = pd.concat(contig_results)
+        print(f'  Total: {len(result)} after independent scrub')
+        return result.sort_values(['contig_id', 'kmer_position'])
+
+
+    else:
+        df = assign_mapping_bin(df.loc[df['terminal_kmer'] == False], bin_size)
+
+        bin_counts = df.groupby(['contig_id', 'bin']).size()
+        #global_bin_cap = int(bin_counts.mean())
+        #mean_bin_count_genome = bin_counts.groupby('contig_id').mean()
+
+        bin_counts = bin_counts.reset_index()
+        bin_counts = bin_counts.rename(columns = {0: 'size'})
+        #bin_counts['to_scrub'] = bin_counts['size'] - global_bin_cap
+        #print(bin_counts.sort_values(['to_scrub'],ascending = False))
+
+        #print(bin_counts, global_bin_cap,mean_bin_count_genome)
         
-        #df_scrub['n_remove'] = (df_scrub['to_scrub'] / df_scrub['to_scrub'].sum() * excess).astype(int)
-        
-        #proportionally remove the excess from size
-        df_scrub['n_remove'] = (df_scrub['size'] / df_scrub['size'].sum() * excess).astype(int)
+        #print(f'  Global mean bin cap: {global_bin_cap}')
 
-        # cap so we never remove more than what's scrubable
-        #df_scrub['n_remove'] = df_scrub['n_remove'].clip(upper=df_scrub['to_scrub'])
+        total_genome_length = df.groupby('contig_id')['contig_length'].first().sum()
 
-        # fix rounding remainder — assign to largest bins first
-        remainder = excess - df_scrub['n_remove'].sum()
-        if remainder > 0:
-            largest = df_scrub.nlargest(remainder, 'size').index
-            df_scrub.loc[largest, 'n_remove'] += 1
+        contig_results = []
+        for contig_id, contig_df in df.groupby('contig_id'):
+            contig_length = contig_df['contig_length'].iloc[0]
+            contig_cap = max(1, int(total_target * contig_length / total_genome_length))
+            print(contig_cap)
 
-        # what each bin keeps after removal
-        df_scrub['n_keep'] = df_scrub['size'] - df_scrub['n_remove']
-        print(df_scrub.sort_values(['n_remove'], ascending = False))
-        print('current contig kmers:' + str(current_total))
-        print('Excess kmers in contig: ' + str(excess))
-        #print('potential scrubs: ' + str(df_scrub['to_scrub'].sum()))
-        print('total kmers that will be filtered: ' + str(df_scrub['n_remove'].sum()))
-        # get all contig bins above global_bin_cap
-        scrub_map = dict(zip(df_scrub['bin'], df_scrub['n_keep']))
+            #df_scrub = bin_counts.loc[(bin_counts['contig_id']==contig_id) & 
+            #                          (bin_counts['to_scrub']>0)]
+            #print('counts for kmers not to be scrubbed')
 
-        contig_keep = []
-        for bin_name, group in contig_df.groupby('bin'):
-            if bin_name in scrub_map:
-                n_in_bin = len(group)
-                n_keep = scrub_map[bin_name]
-                if n_keep < n_in_bin:
-                    contig_keep.append(
-                        group.sort_values('kmer_position').iloc[
-                            np.linspace(0, n_in_bin - 1, n_keep, dtype=int)
-                        ]
-                    )
+            # HERE YOU NEED TO ACTUALLY ALSO GRAB NOT ONLY FROM THE OVERREPRESENTED ONES!
+            #print(str(bin_counts.loc[(bin_counts['contig_id']==contig_id) & 
+            #                          (bin_counts['to_scrub']<0)]['size'].sum()))
+            
+            current_total = len(contig_df)
+            excess = current_total - contig_cap
+            df_scrub = bin_counts.loc[bin_counts["contig_id"]==contig_id]
+            
+            #df_scrub['n_remove'] = (df_scrub['to_scrub'] / df_scrub['to_scrub'].sum() * excess).astype(int)
+            
+            #proportionally remove the excess from size
+            df_scrub['n_remove'] = (df_scrub['size'] / df_scrub['size'].sum() * excess).astype(int)
+
+            # cap so we never remove more than what's scrubable
+            #df_scrub['n_remove'] = df_scrub['n_remove'].clip(upper=df_scrub['to_scrub'])
+
+            # fix rounding remainder — assign to largest bins first
+            remainder = excess - df_scrub['n_remove'].sum()
+            if remainder > 0:
+                largest = df_scrub.nlargest(remainder, 'size').index
+                df_scrub.loc[largest, 'n_remove'] += 1
+
+            # what each bin keeps after removal
+            df_scrub['n_keep'] = df_scrub['size'] - df_scrub['n_remove']
+            print(df_scrub.sort_values(['n_remove'], ascending = False))
+            print('current contig kmers:' + str(current_total))
+            print('Excess kmers in contig: ' + str(excess))
+            #print('potential scrubs: ' + str(df_scrub['to_scrub'].sum()))
+            print('total kmers that will be filtered: ' + str(df_scrub['n_remove'].sum()))
+            # get all contig bins above global_bin_cap
+            scrub_map = dict(zip(df_scrub['bin'], df_scrub['n_keep']))
+
+            contig_keep = []
+            for bin_name, group in contig_df.groupby('bin'):
+                if bin_name in scrub_map:
+                    n_in_bin = len(group)
+                    n_keep = scrub_map[bin_name]
+                    if n_keep < n_in_bin:
+                        contig_keep.append(
+                            group.sort_values('kmer_position').iloc[
+                                np.linspace(0, n_in_bin - 1, n_keep, dtype=int)
+                            ]
+                        )
+                    else:
+                        contig_keep.append(group)
                 else:
                     contig_keep.append(group)
-            else:
-                contig_keep.append(group)
 
-        contig_result = pd.concat(contig_keep)
+            contig_result = pd.concat(contig_keep)
 
-        if len(contig_result) > contig_cap:
-            print('random sample')
-            contig_result = contig_result.sample(n=contig_cap)
+            if len(contig_result) > contig_cap:
+                print('random sample')
+                contig_result = contig_result.sample(n=contig_cap)
 
-        contig_results.append(contig_result)
-        print(f'  {contig_id}: {len(contig_df)} -> {len(contig_result)} kmers (contig cap: {contig_cap})')
+            contig_results.append(contig_result)
+            print(f'  {contig_id}: {len(contig_df)} -> {len(contig_result)} kmers (contig cap: {contig_cap})')
 
-    result = pd.concat(contig_results)
-    print(f'  Total: {len(df)} -> {len(result)} kmers after smooth downsampling')
-    return result.sort_values(['contig_id', 'kmer_position'])
+        result = pd.concat(contig_results)
+        print(f'  Total: {len(df)} -> {len(result)} kmers after smooth downsampling')
+        return result.sort_values(['contig_id', 'kmer_position'])
 
 def plot_genome_bins(df, df_smooth, basename, bin_size, output_dir, map_only = False):
     if map_only:
@@ -293,7 +369,7 @@ def plot_kmer_counts(lowest_pct):
     fig = px.line(df_plot_stack,
                   x='index',
                   y='value',
-                  log_y=True,
+                  #log_y=True,
                   template='simple_white',
                   color='scrub_type',
                   title='rare kmers by count')
@@ -355,11 +431,10 @@ def main():
     parser.add_argument('--percentile', type=float, default=0.01,
                         help='Percentile threshold for rare kmer selection (default: 0.05)')
     parser.add_argument('--percentile_union', type = float, default = 0.05, help = 'percentile passed for union of different kmer scrubs')
-    parser.add_argument('--bin-size', type=int, default=1000,
-                        help='Bin size in bp for kmer density smoothing (default: 1000)')
-    parser.add_argument('--terminal-dist', type=int, default=300,
-                        help='Distance from contig ends to flag terminal kmers (default: 300)')
+    parser.add_argument('--bin-size', type=int, default=1000, help='Bin size in bp for kmer density smoothing (default: 1000)')
+    parser.add_argument('--terminal-dist', type=int, default=300,  help='Distance from contig ends to flag terminal kmers (default: 300)')
     parser.add_argument('--map_scrubbed_kmers_only', action='store_true', help = 'Takes a file of rare kmers as a list, one kmer per line that will be mapped to a target genome')
+    parser.add_argument('--independent', action='store_true', help = 'reduces bin size to 31 to and only allows 1 kmer per bin')
 
     args = parser.parse_args()
     if args.map_scrubbed_kmers_only:
@@ -374,7 +449,6 @@ def main():
         print(f'Total scrubbed kmers to map: {len(df_counts)}')
         kmers = df_counts[0].to_list()
         df, _ = build_mapped_kmers_ahocorasick(records, kmers, terminal_dist=args.terminal_dist)
-        print(df)
         if args.figures:
             plot_genome_bins(df, df, basename, bin_size=args.bin_size, output_dir=args.output_dir, map_only = True )
             
@@ -408,14 +482,29 @@ def main():
         else:
             print(f'Mapping {len(kmers)} rare kmers...')
         df, _ = build_mapped_kmers_ahocorasick(records, kmers, terminal_dist=args.terminal_dist)
-        df_smooth = smooth_downsample(df, total_target=total_target, bin_size=args.bin_size, bin_percentile=args.percentile)
-        print(f'  {len(df_smooth)} kmers after smoothing')
+        # remerge the read counts to df
+        df = pd.merge(df, df_counts, on = '#kmer', how = 'left')
+        if args.independent:
+            print('Independent Scrub')
+            bin_size = 31
+            #print('Bin size set to 31, No overlapping kmers allowed')
+            df_smooth = smooth_downsample(df, total_target=total_target, bin_size=bin_size,  mode = 'independent')
+            if args.figures:
+                plot_genome_bins(df, df_smooth, basename, bin_size=bin_size, output_dir=args.output_dir)
+                fig_counts = plot_kmer_counts(df_smooth[['#kmer','reference_count','pangenome_count', 'metagenome_count','drug_count']])
+                fig_counts.write_image(os.path.join(args.output_dir, f'{basename}.selected_kmer_counts.svg'))
+                fig_bins2 = plot_box_coverage(df, df_smooth, basename, bin_size=bin_size)
+                fig_bins2.write_image(os.path.join(args.output_dir, f'{basename}.box_genome_bins.svg'))
 
-        if args.figures:
-            plot_genome_bins(df, df_smooth, basename, bin_size=args.bin_size, output_dir=args.output_dir)
-            
-            fig_bins2 = plot_box_coverage(df, df_smooth, basename, bin_size=args.bin_size)
-            fig_bins2.write_image(os.path.join(args.output_dir, f'{basename}.box_genome_bins.svg'))
+        else:
+            df_smooth = smooth_downsample(df, total_target=total_target, bin_size=args.bin_size)
+            print(f'  {len(df_smooth)} kmers after smoothing')
+
+            if args.figures:
+                plot_genome_bins(df, df_smooth, basename, bin_size=args.bin_size, output_dir=args.output_dir)
+                
+                fig_bins2 = plot_box_coverage(df, df_smooth, basename, bin_size=args.bin_size)
+                fig_bins2.write_image(os.path.join(args.output_dir, f'{basename}.box_genome_bins.svg'))
         df_smooth.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
                         sep='\t', index=False, compression='gzip')
         df_smooth[['#kmer']].to_csv(os.path.join(args.output_dir, f'{basename}.scrubbed_kmers'),

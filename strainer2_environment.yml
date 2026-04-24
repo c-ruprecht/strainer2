@@ -13,12 +13,14 @@ dependencies:
   - nbformat
   - zlib
   - make
+  - pyarrow
   - pyahocorasick
   - python-kaleido=0.2.1
   - ncbi-datasets-cli
   - snakemake
   - sourmash
   - sourmash_plugin_branchwater
+  - polars
   #- pip:
   #  - kaleido
 

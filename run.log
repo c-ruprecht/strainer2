@@ -1,0 +1,266 @@
+Reading /metrica/scratch/strainer_dev/ATCC20_Bacillus_pacificus_ATCC10987.retarget.parquet...
+156/21139
+Using 30 threads
+Building hash -> kmer lookup...
+Built lookup for 53399 kmers
+Shard dir: /tmp/kmer_pairs_f84tdd_s
+[1/156] GCA_041859945.1_ASM4185994v1_genomic: 1 kmers
+[2/156] GCA_900232885.1_PRJEB22828_genomic: 2 kmers
+[3/156] GCA_039532645.1_ASM3953264v1_genomic: 21 kmers
+[4/156] Anaeromassilibacillus_1001302sp1_D41st1_C2_D41t1_190614: 2 kmers
+[5/156] GCA_905207735.1_ERR414419-mag-bin.5_genomic: 54 kmers
+[6/156] GCA_900754345.1_ERS396473_14_genomic: 54 kmers
+[7/156] Anaeromassilibacillus_sp_D41t1_190614_C2_NODE_10_length_116133_cov_386943-3107887-JADMOD0100000101: 2 kmers
+[8/156] Bacillus_coagulans_strain_BC_HY1-3599077-CP0178881: 1 kmers
+[9/156] Bacillus_licheniformis_strain_CCUG_31354_CHCC20344-4157748-NIKN010000271: 34 kmers
+[10/156] Bacillus_coagulans_P38-3374323-JSVI010000011: 1 kmers
+[11/156] Bacillus_paralicheniformis_strain_J1101004_170508_G4_NODE_10_length_19798_cov_502329-4515245-JADNPI0100000101: 9 kmers
+[12/156] Bacillus_licheniformis_strain_DSM_30615_CHCC20341-4095430-NIKQ010000061: 34 kmers
+[13/156] Bacillus_licheniformis_strain_TCCC_11148-4341076-CP0332181: 19 kmers
+[14/156] Bacillus_licheniformis_strain_7709-4255506-NPCR010000011: 467 kmers
+[15/156] Bacillus_paralicheniformis_J1101004st3_G4_J1101004_170508: 9 kmers
+[16/156] Clostridium_botulinum_strain_IFR_18026-3831714-SWPW010000011: 1 kmers
+[17/156] Bacillus_licheniformis_strain_B4090_201601_NODE_1-4296935-LQYL010000011: 154 kmers
+[18/156] Bacillus_coagulans_strain_CICC_20138-3386433-JAABON0100000011: 614 kmers
+[19/156] Bacillus_licheniformis_strain_BAC_15139_CHCC15139-4202992-NILT010000051: 34 kmers
+[20/156] Clostridium_cuniculi_strain_BSD2780120875_150330_B8_NODE_100_length_12898_cov_337719-3550747-JADPFD0100001001: 3 kmers
+[21/156] Clostridium_sp_IBUN125C_ClosIBUN125C-4596888-JZWF010000011: 12 kmers
+[22/156] Bacillus_coagulans_2_6-3073079-CP0024721: 436 kmers
+[23/156] Clostridium_cuniculi_BSD2780120875st1_B8_BSD2780120875_150330: 3 kmers
+[24/156] Bacillus_licheniformis_strain_BAC_14816_CHCC14816-4149201-NIMD010000151: 459 kmers
+[25/156] Clostridium_perfringens_WAL_14572_genomic-3466039-JH5945331: 2 kmers
+[26/156] Clostridium_sp_IBUN22A_ClosIBUN22A-4607385-JZWE010000011: 12 kmers
+[27/156] Bacillus_licheniformis_strain_M_46_CHCC20342-4410515-NIKP010000261: 978 kmers
+[28/156] Clostridium_sporogenes_strain_Colworth_BL172-4013029-SWNP010000011: 1 kmers
+[29/156] Clostridium_sporogenes_strain_CLS_DGF_0088_06_CLSDGF008806_1-4142075-MWJJ010000011: 55 kmers
+[30/156] Clostridium_sporogenes_strain_IFR_18123-4131587-SXBO010000011: 401 kmers
+[31/156] Clostridium_sp_IBUN62F_ClosIBUN62F-3836807-JZWH010000011: 12 kmers
+[32/156] Clostridium_sporogenes_strain_PA_3679_isolate_FDA_VT91-4021963-LJTA010000011: 1 kmers
+[33/156] Clostridium_sporogenes_strain_IFR_18001-4203556-SWWI010000011: 485 kmers
+[34/156] GCA_000968315.1_CLOSIBUN13Av1.0_genomic: 12 kmers
+[35/156] Clostridium_tepidum_strain_BSD2780120874b_170522_A10_NODE_10_length_142578_cov_687469-3120551-JADPGM0100000101: 89 kmers
+[36/156] Clostridium_tyrobutyricum_1001713st1_A1_1001713B170207_170306: 5 kmers
+[37/156] Enterococcus_hirae_strain_FSIS11815565_SAMN10411540_rid6811913denovo01-2741740-AAXGXV0100000011: 9 kmers
+[38/156] Clostridium_tyrobutyricum_strain_FAM22553-3085051-JTES010000011: 2 kmers
+[39/156] Enterococcus_faecium_strain_VREN0338_SAMEA3484465_rid9479953denovo01-2870651-DACJRL0100000011: 9 kmers
+[40/156] Enterobacter_cloacae_strain_CRE86_NODE_1000_length_241_cov_147849-5296850-PXJR010010001: 2 kmers
+[41/156] GCA_000333915.1_XZL9_v1_genomic: 1 kmers
+[42/156] Enterococcus_faecium_strain_CVM_N59711F_N59711F_S50_L001_R1_001-2870574-PTUU010000011: 6 kmers
+[43/156] Coprobacillus_BSD2780120874sp1_BSD2780120874st1_A10_BSD2780120874b_170522: 89 kmers
+[44/156] Clostridium_tertium_isolate_src5_genome_assembly-3902863-OAOE010000681: 110 kmers
+[45/156] Enterococcus_faecium_strain_CVM_N59653F_N59653F_S49_L001_R1_001-2830254-PTTQ010000011: 6 kmers
+[46/156] Enterococcus_faecium_strain_FSIS11810860_SAMN09545023_rid4906443denovo01-2774866-AAXHDX0100000011: 4 kmers
+[47/156] GCA_007830995.1_ASM783099v1_genomic: 163 kmers
+[48/156] Clostridium_tyrobutyricum_strain_1001713B170207_170306_A1_NODE_10_length_114356_cov_434535-3020770-JADNNK0100000101: 5 kmers
+[49/156] Eubacterium_callanderi_strain_NLAE_zl_G225_genome_assembly-4368996-FOWI010000231: 283 kmers
+[50/156] Clostridium_paraputrificum_D52st2_F5_D52t1_170925: 1923 kmers
+[51/156] Clostridium_sporogenes_strain_IFR_18022-4184667-SWRI010000011: 1198 kmers
+[52/156] GCA_015655285.1_ASM1565528v1_genomic: 1 kmers
+[53/156] GCA_902167745.1_Lactobacillus_gasseri_SV_Bg7063_mod2_genomic: 1 kmers
+[54/156] GCA_015505265.1_PDT000424640.1_genomic: 4 kmers
+[55/156] Clostridium_paraputrificum_strain_D52t1_170925_F5_NODE_10_length_113622_cov_267988-3678533-JADMQV0100000101: 1923 kmers
+[56/156] Lactobacillus_gasseri_strain_Indica1-2096244-WWFD010000011: 1 kmers
+[57/156] GCA_902373575.1_MGYG-HGUT-01289_genomic: 1 kmers
+[58/156] Ruminococcus_bicirculans_D59st1_B5_D59t2_181005: 2 kmers
+[59/156] Ruminococcus_bicirculans_strain_D59t2_181005_B8_NODE_10_length_99365_cov_317018-3146046-JADMNX0100000101: 2 kmers
+[60/156] Harryflintia_acetispora_BSD3448080949st1_F5_BSD3448080949_160606: 2 kmers
+[61/156] GCA_001587225.1_B4098_genomic: 1243 kmers
+[62/156] Ruminococcus_sp_isolate_COPD362_SA9251_bin5-2445968-WHFX010000011: 2 kmers
+[63/156] Streptococcus_agalactiae_strain_LZF003-2207556-NAYY010000041: 331 kmers
+[64/156] Bacillus_pacificus_GCA_045348155.1: 7 kmers
+[65/156] Tissierella_praeacuta_1001174st1_F11_1001174B_160307: 5 kmers
+[66/156] Turicibacter_sanguinis_BSD3178071175st2_D10_BSD3178071175_160912: 26 kmers
+[67/156] Staphylococcus_capitis_strain_DE0423_NODE_100_length_215_cov_0618421-2445738-VDSR010001001: 2 kmers
+[68/156] Streptococcus_anginosus_strain_UMB248_NODE_10_length_70190_cov_35933874-2261348-VYWV010000101: 2 kmers
+[69/156] Streptococcus_dysgalactiae_subsp_dysgalactiae_strain_DB60705_15-2190656-CP0331651: 331 kmers
+[70/156] Bacillus_pacificus_GCA_044501435.1: 43 kmers
+[71/156] Turicibacter_sanguinis_BSD2780120874st1_G1_BSD2780120874b_170522: 3 kmers
+[72/156] Bacillus_pacificus_GCA_050628465.1: 36 kmers
+[73/156] uncultured_Blautia_sp_isolate_UMGS1436_genome_assembly-5382012-URXF010000011: 1 kmers
+[74/156] Bacillus_pacificus_GCA_036212185.1: 437 kmers
+[75/156] Turicibacter_sanguinis_BSD2780120874st3_F12_BSD2780120874b_170522: 532 kmers
+[76/156] Bacillus_pacificus_GCA_029708255.1: 425 kmers
+[77/156] Bacillus_pacificus_GCA_049219145.1: 126 kmers
+[78/156] Bacillus_pacificus_GCA_009884315.1: 12 kmers
+[79/156] Bacillus_pacificus_GCA_003858675.1: 6 kmers
+[80/156] Bacillus_pacificus_GCA_025519125.1: 276 kmers
+[81/156] Bacillus_pacificus_GCA_024205385.1: 8 kmers
+[82/156] Bacillus_pacificus_GCA_050818935.1: 315 kmers
+[83/156] Bacillus_pacificus_GCA_039302775.1: 13 kmers
+[84/156] Bacillus_pacificus_GCA_036211165.1: 30 kmers
+[85/156] Bacillus_pacificus_GCA_050457825.1: 5 kmers
+[86/156] Bacillus_pacificus_GCA_020861345.1: 1190 kmers
+[87/156] Bacillus_pacificus_GCA_020662105.1: 54 kmers
+[88/156] Bacillus_pacificus_GCA_029707345.1: 10 kmers
+[89/156] Bacillus_pacificus_GCA_026108145.1: 14 kmers
+[90/156] Bacillus_pacificus_GCA_050628165.1: 79 kmers
+[91/156] Bacillus_pacificus_GCA_050457805.1: 72 kmers
+[92/156] Bacillus_pacificus_GCA_036543265.1: 9 kmers
+[93/156] Bacillus_pacificus_GCA_013284485.1: 7 kmers
+[94/156] Bacillus_pacificus_GCA_030971845.1: 3 kmers
+[95/156] Bacillus_pacificus_GCA_036851475.1: 730 kmers
+[96/156] Bacillus_pacificus_GCA_025517035.1: 7 kmers
+[97/156] Bacillus_pacificus_GCA_050627915.1: 13 kmers
+[98/156] Bacillus_pacificus_GCA_048053935.1: 1919 kmers
+[99/156] Bacillus_pacificus_GCA_051844135.1: 6 kmers
+[100/156] Bacillus_pacificus_GCA_025519185.1: 9 kmers
+[101/156] Bacillus_pacificus_GCA_020686025.1: 584 kmers
+[102/156] Bacillus_pacificus_GCA_020686565.1: 1125 kmers
+[103/156] Bacillus_pacificus_GCA_020686145.1: 17 kmers
+[104/156] Bacillus_pacificus_GCA_025517745.1: 1242 kmers
+[105/156] Bacillus_pacificus_GCA_043292855.1: 12 kmers
+[106/156] Bacillus_pacificus_GCA_046576205.1: 31 kmers
+[107/156] Bacillus_pacificus_GCA_050474765.1: 191 kmers
+[108/156] Bacillus_pacificus_GCA_052887475.1: 430 kmers
+[109/156] Bacillus_pacificus_GCA_035618255.1: 8 kmers
+[110/156] Bacillus_pacificus_GCA_041531075.1: 90 kmers
+[111/156] Bacillus_pacificus_GCA_006349595.1: 34 kmers
+[112/156] Bacillus_pacificus_GCA_025519075.1: 3 kmers
+[113/156] Bacillus_pacificus_GCA_025519105.1: 178 kmers
+[114/156] Bacillus_pacificus_GCA_029709235.1: 26 kmers
+[115/156] Bacillus_spizizenii_GCA_026788875.1: 1 kmers
+[116/156] Bacillus_pacificus_GCA_011684125.1: 245 kmers
+[117/156] Bacillus_pacificus_GCA_035666115.1: 3 kmers
+[118/156] Clostridioides_difficile_GCA_003490105.1: 2 kmers
+[119/156] Clostridioides_difficile_GCA_001447175.1: 2 kmers
+[120/156] Clostridioides_difficile_GCA_030503935.1: 2 kmers
+[121/156] Clostridioides_difficile_GCA_018884885.1: 2 kmers
+[122/156] Clostridioides_difficile_GCA_033315685.1: 2 kmers
+[123/156] Clostridioides_difficile_GCA_003482065.1: 2 kmers
+[124/156] Bacillus_pacificus_GCA_043293855.1: 1147 kmers
+[125/156] Clostridioides_difficile_GCA_009867095.1: 2 kmers
+[126/156] Clostridioides_difficile_GCA_003482345.1: 2 kmers
+[127/156] Clostridioides_difficile_GCA_018884905.1: 2 kmers
+[128/156] Clostridioides_difficile_GCA_002073735.2: 2 kmers
+[129/156] Clostridioides_difficile_GCA_018885065.1: 2 kmers
+[130/156] Clostridioides_difficile_GCA_003482325.1: 2 kmers
+[131/156] Clostridioides_difficile_GCA_018884925.1: 2 kmers
+[132/156] Enterococcus_faecalis_GCA_023375465.1: 6 kmers
+[133/156] Enterococcus_faecalis_GCA_016743895.1: 6 kmers
+[134/156] Lactobacillus_gasseri_GCA_009857935.1: 1 kmers
+[135/156] Sarcina_perfringens_family_GCA_002006235.2: 2 kmers
+[136/156] Bacillus_pacificus_GCA_050629105.1: 1745 kmers
+[137/156] Sarcina_perfringens_family_GCA_004015185.1: 61 kmers
+[138/156] Sarcina_perfringens_family_GCA_026240615.1: 2 kmers
+[139/156] Sarcina_perfringens_family_GCA_002074155.1: 11 kmers
+[140/156] Sarcina_perfringens_family_GCA_055814455.1: 4 kmers
+[141/156] Streptococcus_agalactiae_GCA_029625255.1: 331 kmers
+[142/156] Sarcina_perfringens_family_GCA_001902295.1: 10 kmers
+[143/156] Sarcina_perfringens_family_GCA_003013615.1: 871 kmers
+[144/156] Bacillus_pacificus_GCA_036209155.1: 1990 kmers
+[145/156] Bacillus_pacificus_GCA_036211605.1: 2938 kmers
+[146/156] Bacillus_pacificus_GCA_046560315.1: 4091 kmers
+[147/156] Bacillus_pacificus_GCA_025516245.1: 4424 kmers
+[148/156] Sarcina_perfringens_family_GCA_056033985.1: 3196 kmers
+[149/156] Bacillus_pacificus_GCA_052887165.1: 5062 kmers
+[150/156] Bacillus_pacificus_GCA_052887295.1: 9740 kmers
+[151/156] Bacillus_pacificus_GCA_052887255.1: 12829 kmers
+[152/156] Bacillus_pacificus_GCA_030223195.1: 13350 kmers
+[153/156] Bacillus_pacificus_GCA_052947615.1: 16327 kmers
+[154/156] Bacillus_pacificus_GCA_041021265.1: 16371 kmers
+[155/156] Bacillus_pacificus_GCA_031316815.1: 49800 kmers
+[156/156] GCA_918206025.1_ISI_2307_genomic: 49961 kmers
+
+Starting external merge with 64 partitions...
+Pass 1: repartitioning 436 shards into 64 buckets...
+  repartitioned 20/436
+  repartitioned 40/436
+  repartitioned 60/436
+  repartitioned 80/436
+  repartitioned 100/436
+  repartitioned 120/436
+  repartitioned 140/436
+  repartitioned 160/436
+  repartitioned 180/436
+  repartitioned 200/436
+  repartitioned 220/436
+  repartitioned 240/436
+  repartitioned 260/436
+  repartitioned 280/436
+  repartitioned 300/436
+  repartitioned 320/436
+  repartitioned 340/436
+  repartitioned 360/436
+  repartitioned 380/436
+  repartitioned 400/436
+  repartitioned 420/436
+  repartitioned 436/436
+Pass 2: aggregating each bucket and writing output parts...
+Output parts dir: /metrica/scratch/strainer_dev/ATCC20_Bacillus_pacificus_ATCC10987
+  bucket 1/64: wrote part_0000.parquet (18,620,734 pairs so far)
+  bucket 2/64: wrote part_0001.parquet (37,587,108 pairs so far)
+  bucket 3/64: wrote part_0002.parquet (57,564,425 pairs so far)
+  bucket 4/64: wrote part_0003.parquet (77,142,893 pairs so far)
+  bucket 5/64: wrote part_0004.parquet (96,956,013 pairs so far)
+  bucket 6/64: wrote part_0005.parquet (116,236,225 pairs so far)
+  bucket 7/64: wrote part_0006.parquet (137,177,105 pairs so far)
+  bucket 8/64: wrote part_0007.parquet (156,693,789 pairs so far)
+  bucket 9/64: wrote part_0008.parquet (175,886,403 pairs so far)
+  bucket 10/64: wrote part_0009.parquet (194,637,921 pairs so far)
+  bucket 11/64: wrote part_0010.parquet (216,701,045 pairs so far)
+  bucket 12/64: wrote part_0011.parquet (236,359,884 pairs so far)
+  bucket 13/64: wrote part_0012.parquet (255,769,182 pairs so far)
+  bucket 14/64: wrote part_0013.parquet (275,769,702 pairs so far)
+  bucket 15/64: wrote part_0014.parquet (297,378,699 pairs so far)
+  bucket 16/64: wrote part_0015.parquet (316,490,446 pairs so far)
+  bucket 17/64: wrote part_0016.parquet (336,137,999 pairs so far)
+  bucket 18/64: wrote part_0017.parquet (355,052,481 pairs so far)
+  bucket 19/64: wrote part_0018.parquet (373,895,656 pairs so far)
+  bucket 20/64: wrote part_0019.parquet (392,286,665 pairs so far)
+  bucket 21/64: wrote part_0020.parquet (411,411,452 pairs so far)
+  bucket 22/64: wrote part_0021.parquet (432,813,440 pairs so far)
+  bucket 23/64: wrote part_0022.parquet (451,969,031 pairs so far)
+  bucket 24/64: wrote part_0023.parquet (471,007,629 pairs so far)
+  bucket 25/64: wrote part_0024.parquet (491,203,389 pairs so far)
+  bucket 26/64: wrote part_0025.parquet (510,109,817 pairs so far)
+  bucket 27/64: wrote part_0026.parquet (529,249,732 pairs so far)
+  bucket 28/64: wrote part_0027.parquet (547,965,622 pairs so far)
+  bucket 29/64: wrote part_0028.parquet (568,059,028 pairs so far)
+  bucket 30/64: wrote part_0029.parquet (587,525,903 pairs so far)
+  bucket 31/64: wrote part_0030.parquet (605,803,507 pairs so far)
+  bucket 32/64: wrote part_0031.parquet (626,405,964 pairs so far)
+  bucket 33/64: wrote part_0032.parquet (645,443,419 pairs so far)
+  bucket 34/64: wrote part_0033.parquet (666,208,272 pairs so far)
+  bucket 35/64: wrote part_0034.parquet (685,651,987 pairs so far)
+  bucket 36/64: wrote part_0035.parquet (704,271,912 pairs so far)
+  bucket 37/64: wrote part_0036.parquet (722,777,637 pairs so far)
+  bucket 38/64: wrote part_0037.parquet (743,527,141 pairs so far)
+  bucket 39/64: wrote part_0038.parquet (761,633,690 pairs so far)
+  bucket 40/64: wrote part_0039.parquet (780,358,502 pairs so far)
+  bucket 41/64: wrote part_0040.parquet (798,591,194 pairs so far)
+  bucket 42/64: wrote part_0041.parquet (821,235,848 pairs so far)
+  bucket 43/64: wrote part_0042.parquet (841,108,466 pairs so far)
+  bucket 44/64: wrote part_0043.parquet (860,546,566 pairs so far)
+  bucket 45/64: wrote part_0044.parquet (880,177,002 pairs so far)
+  bucket 46/64: wrote part_0045.parquet (899,465,967 pairs so far)
+  bucket 47/64: wrote part_0046.parquet (919,270,755 pairs so far)
+  bucket 48/64: wrote part_0047.parquet (940,500,500 pairs so far)
+  bucket 49/64: wrote part_0048.parquet (960,351,663 pairs so far)
+  bucket 50/64: wrote part_0049.parquet (979,274,503 pairs so far)
+  bucket 51/64: wrote part_0050.parquet (1,000,722,849 pairs so far)
+  bucket 52/64: wrote part_0051.parquet (1,019,849,540 pairs so far)
+  bucket 53/64: wrote part_0052.parquet (1,040,211,705 pairs so far)
+  bucket 54/64: wrote part_0053.parquet (1,058,805,225 pairs so far)
+  bucket 55/64: wrote part_0054.parquet (1,077,232,454 pairs so far)
+  bucket 56/64: wrote part_0055.parquet (1,098,117,468 pairs so far)
+  bucket 57/64: wrote part_0056.parquet (1,118,359,432 pairs so far)
+  bucket 58/64: wrote part_0057.parquet (1,136,910,629 pairs so far)
+  bucket 59/64: wrote part_0058.parquet (1,155,147,124 pairs so far)
+  bucket 60/64: wrote part_0059.parquet (1,175,869,462 pairs so far)
+  bucket 61/64: wrote part_0060.parquet (1,196,219,129 pairs so far)
+  bucket 62/64: wrote part_0061.parquet (1,215,026,837 pairs so far)
+  bucket 63/64: wrote part_0062.parquet (1,233,138,338 pairs so far)
+  bucket 64/64: wrote part_0063.parquet (1,252,845,775 pairs so far)
+
+Writing hash lookup to /metrica/scratch/strainer_dev/ATCC20_Bacillus_pacificus_ATCC10987.hash_lookup.parquet...
+
+Final: 1,252,845,775 unique pairs across 64 output parts
+Output parts: /metrica/scratch/strainer_dev/ATCC20_Bacillus_pacificus_ATCC10987/
+Hash lookup:  /metrica/scratch/strainer_dev/ATCC20_Bacillus_pacificus_ATCC10987.hash_lookup.parquet
+
+To read the full result:
+  pairs  = pl.scan_parquet("/metrica/scratch/strainer_dev/ATCC20_Bacillus_pacificus_ATCC10987/*.parquet")
+  lookup = pl.read_parquet("/metrica/scratch/strainer_dev/ATCC20_Bacillus_pacificus_ATCC10987.hash_lookup.parquet")
+  # join lookup twice to decode kmerA_hash and kmerB_hash
+Shard dir cleaned up.
+Done!
