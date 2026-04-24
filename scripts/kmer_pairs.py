@@ -35,7 +35,18 @@ def get_test_dataset():
     df = pl.DataFrame(data, schema=["#kmer", "ST-1", "ST-2", 'ST-3', 'ST-4', 'ST-5'])
     print('Creating Test Data')
     print(df)
-    return df
+
+    # Creating test data set for checking pairs and trilicate counts etc:
+    data = [
+        ["A", "B", "C", "D", "E", "F"],
+        [ 1,   1,   1,   1,   1,   0 ],
+        [ 1,   1,   0,   1,   0,   1 ],
+        [ 0,   0,   0,   1,   1,   1 ],
+        [ 0 ,  0,   0,   0,   1,   0],
+        [ 1,   1,   1,   1,   1,   1]
+    ]
+    df2 = pl.DataFrame(data, schema=["#kmer", "SAMPLE-1", "SAMPLE-2", 'SAMPLE-3', 'SAMPLE-4', 'SAMPLE-5'])  
+    return df, df2
 
 def strain_name_from_path(path):
     base = os.path.basename(path)
@@ -382,6 +393,137 @@ def drop_reference_similar_strains(df, similarity_threshold=0.95, kmer_column="#
 
     return df.select([kmer_column] + keep_cols)
 
+def get_singleton_hits(df_samples, df_informative, kmer_column="#kmer"):
+    """Compute per-sample coverage for informative singletons.
+
+    df_samples:    Polars DataFrame, wide format [#kmer, sample1, sample2, ...]
+    df_informative: Polars DataFrame with #kmer column (the informative singleton panel)
+    Returns a Polars DataFrame with one row per sample.
+    """
+    sample_cols = [c for c in df_samples.columns if c != kmer_column]
+    n_total = len(df_informative)
+    inform_set = df_informative[kmer_column]
+
+    df_hits = df_samples.filter(pl.col(kmer_column).is_in(inform_set.implode()))
+
+    # per-sample aggregates: observed count, mean hit count
+    rows = []
+    for s in sample_cols:
+        col = df_hits[s]
+        observed = (col > 0).sum()
+        rows.append({
+            "sample": s,
+            "inform_singletons_observed": observed,
+            "inform_singletons_count_mean": col.mean() if len(col) else 0.0,
+            "inform_singletons_coverage": observed / n_total if n_total else 0.0,
+        })
+    return pl.DataFrame(rows)
+
+
+def get_pair_hits(df_samples, df_informative, kmer_column="#kmer"):
+    """Compute per-sample coverage for informative pairs.
+
+    df_informative: Polars DataFrame with columns [kmerA, kmerB, ...]
+    A pair is 'observed' in a sample when both kmers have count > 0 there.
+    """
+    sample_cols = [c for c in df_samples.columns if c != kmer_column]
+    n_total = len(df_informative)
+
+    # restrict the sample matrix to kmers that appear in any pair
+    pair_kmers = pl.concat([df_informative["kmerA"], df_informative["kmerB"]]).unique()
+    df_hits = df_samples.filter(pl.col(kmer_column).is_in(pair_kmers.implode()))
+
+    # join pairs to their A and B counts per sample
+    df_A = df_hits.rename({kmer_column: "kmerA", **{s: f"{s}__A" for s in sample_cols}})
+    df_B = df_hits.rename({kmer_column: "kmerB", **{s: f"{s}__B" for s in sample_cols}})
+
+    df_pair = (
+        df_informative.select(["kmerA", "kmerB"])
+        .join(df_A, on="kmerA", how="inner")
+        .join(df_B, on="kmerB", how="inner")
+    )
+
+    # per-sample pair count = min(count_A, count_B); present when > 0
+    rows = []
+    for s in sample_cols:
+        pair_count = pl.min_horizontal(pl.col(f"{s}__A"), pl.col(f"{s}__B"))
+        stats = df_pair.select([
+            (pair_count > 0).sum().alias("observed"),
+            pair_count.mean().alias("mean_count"),
+        ]).row(0, named=True)
+        rows.append({
+            "sample": s,
+            "inform_pairs_observed": stats["observed"],
+            "inform_pairs_count_mean": stats["mean_count"] or 0.0,
+            "inform_pairs_coverage": stats["observed"] / n_total if n_total else 0.0,
+        })
+    return pl.DataFrame(rows)
+
+
+import glob
+import polars as pl
+
+def get_triple_hits_streaming(df_samples, triplets_glob, kmer_column="#kmer"):
+    """Stream informative triplets from multiple parquet part files and compute
+    per-sample coverage without materializing the full triplet frame.
+
+    triplets_glob: glob pattern like
+        "/path/to/output/{basename}.inform_triplets.part*.parquet"
+    """
+    part_files = sorted(glob.glob(triplets_glob))
+    if not part_files:
+        raise FileNotFoundError(f"No triplet part files matched {triplets_glob}")
+
+    sample_cols = [c for c in df_samples.columns if c != kmer_column]
+
+    # per-sample running totals
+    observed = {s: 0 for s in sample_cols}
+    sum_count = {s: 0 for s in sample_cols}
+    n_total = 0  # total triplets across all parts
+
+    for path in part_files:
+        df_part = pl.read_parquet(path)
+        n_total += len(df_part)
+        if len(df_part) == 0:
+            continue
+
+        # restrict the sample matrix to kmers touched by this part (small memory win)
+        part_kmers = pl.concat([df_part["kmerA"], df_part["kmerB"], df_part["kmerC"]]).unique()
+        df_hits = df_samples.filter(pl.col(kmer_column).is_in(part_kmers.implode()))
+
+        df_A = df_hits.rename({kmer_column: "kmerA", **{s: f"{s}__A" for s in sample_cols}})
+        df_B = df_hits.rename({kmer_column: "kmerB", **{s: f"{s}__B" for s in sample_cols}})
+        df_C = df_hits.rename({kmer_column: "kmerC", **{s: f"{s}__C" for s in sample_cols}})
+
+        df_trip = (
+            df_part.select(["kmerA", "kmerB", "kmerC"])
+            .join(df_A, on="kmerA", how="inner")
+            .join(df_B, on="kmerB", how="inner")
+            .join(df_C, on="kmerC", how="inner")
+        )
+
+        # accumulate per-sample stats from this part
+        for s in sample_cols:
+            trip_count = pl.min_horizontal(
+                pl.col(f"{s}__A"), pl.col(f"{s}__B"), pl.col(f"{s}__C")
+            )
+            stats = df_trip.select([
+                (trip_count > 0).sum().alias("observed"),
+                trip_count.sum().alias("sum_count"),
+            ]).row(0, named=True)
+            observed[s] += stats["observed"] or 0
+            sum_count[s] += stats["sum_count"] or 0
+
+        del df_part, df_hits, df_A, df_B, df_C, df_trip
+
+    rows = [{
+        "sample": s,
+        "inform_triples_observed": observed[s],
+        "inform_triples_count_mean": sum_count[s] / n_total if n_total else 0.0,
+        "inform_triples_coverage": observed[s] / n_total if n_total else 0.0,
+    } for s in sample_cols]
+    return pl.DataFrame(rows)
+
 def main():
     parser = argparse.ArgumentParser(description='Map scrubbed kmers onto a genome.')
     parser.add_argument('--csv_path', help='a set of kmer counts of pangenomes to create informative kmer pairs from')
@@ -394,7 +536,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok = True)
 
     if args.testmode:
-        df = get_test_dataset()
+        df, df_samples = get_test_dataset()
         basename = 'testmode'
     else:
         basename = strain_name_from_path(args.csv_path)
@@ -443,10 +585,11 @@ def main():
     df_non_inform_pairs = pairs_dict_to_df(dict_non_inform_pairs)
     print(df_non_inform_pairs)
     df_inform_pairs.write_parquet(os.path.join(args.output_dir , f'{basename}.inform_kmer_pairs.parquet'), compression='zstd')
-    del df_inform_pairs
-    del df_non_inform_pairs
-    del dict_inform_pairs
-    gc.collect()
+    if not args.testmode:
+        del df_inform_pairs
+        del df_non_inform_pairs
+        del dict_inform_pairs
+        gc.collect()
     
     # Get all informative triplets:
     # this is too much data for ram and needs to be streamed to files directly
@@ -462,6 +605,16 @@ def main():
         print(pl.read_parquet(os.path.join(args.output_dir , f'{basename}.inform_kmer_triplets.parquet')))
         print('Non informative Triplets: ')
         print(pl.read_parquet(os.path.join(args.output_dir , f'{basename}.non_inform_kmer_triplets.parquet')))
+
+        print('Creating coverage outputs')
+        print(df_samples)
+        df_cov_s = get_singleton_hits(df_samples, df_inform_singleton)
+        df_cov_p = get_pair_hits(df_samples, df_inform_pairs)
+        df_cov_t = get_triple_hits_streaming(df_samples,
+                                             os.path.join(args.output_dir, f"{basename}.inform_triplets.part*.parquet"),)
+        df_cov = df_cov_s.join(df_cov_p, on="sample", how="left").join(df_cov_t, on="sample", how="left")
+
+        print(df_cov)
 
 
 if __name__ == '__main__':
