@@ -177,16 +177,19 @@ def _init_worker(presence, kmers):
     _KMERS = kmers
 
 def _process_anchor_chunk(args):
-    '''Process a chunk of (i, j_list) anchors. Returns path to written parquet.'''
-    chunk_id, anchor_items, output_dir, basename = args
+    '''Process a chunk of (i, j_list) anchors. Returns counts.'''
+    chunk_id, anchor_items, output_dir, basename, write_non_inform = args
     schema = pa.schema([
         ("kmerA", pa.string()), ("kmerB", pa.string()),
         ("kmerC", pa.string()), ("count", pa.int64()),
     ])
     inform_path = f"{output_dir}/{basename}.inform_triplets.part{chunk_id:04d}.parquet"
-    non_inform_path = f"{output_dir}/{basename}.non_inform_triplets.part{chunk_id:04d}.parquet"
     inform_w = pq.ParquetWriter(inform_path, schema, compression="zstd")
-    non_inform_w = pq.ParquetWriter(non_inform_path, schema, compression="zstd")
+
+    non_inform_w = None
+    if write_non_inform:
+        non_inform_path = f"{output_dir}/{basename}.non_inform_triplets.part{chunk_id:04d}.parquet"
+        non_inform_w = pq.ParquetWriter(non_inform_path, schema, compression="zstd")
 
     i_a, i_b, i_c, i_n = [], [], [], []
     n_a, n_b, n_c, n_n = [], [], [], []
@@ -209,30 +212,32 @@ def _process_anchor_chunk(args):
         for j in j_list:
             kB = _KMERS[j]
             ab = _PRESENCE[i] & _PRESENCE[j]
-            # early termination: if ab is huge, unlikely to find informative triplets
-            # (optional - depends on your data)
             for k in range(j + 1, n):
                 c = len(ab & _PRESENCE[k])
-                kC = _KMERS[k]
                 if c == 0:
+                    kC = _KMERS[k]
                     i_a.append(kA); i_b.append(kB); i_c.append(kC); i_n.append(0)
                     n_inform += 1
                     if len(i_a) >= BATCH:
                         flush(inform_w, inform_buf)
                 else:
-                    n_a.append(kA); n_b.append(kB); n_c.append(kC); n_n.append(c)
                     n_non_inform += 1
-                    if len(n_a) >= BATCH:
-                        flush(non_inform_w, non_inform_buf)
+                    if write_non_inform:
+                        kC = _KMERS[k]
+                        n_a.append(kA); n_b.append(kB); n_c.append(kC); n_n.append(c)
+                        if len(n_a) >= BATCH:
+                            flush(non_inform_w, non_inform_buf)
 
     flush(inform_w, inform_buf)
-    flush(non_inform_w, non_inform_buf)
     inform_w.close()
-    non_inform_w.close()
+    if write_non_inform:
+        flush(non_inform_w, non_inform_buf)
+        non_inform_w.close()
     return chunk_id, n_inform, n_non_inform
 
 def create_kmer_triplets_parallel(non_inform_pairs, df_w_count, output_dir, basename,
-                                   n_workers=None, kmer_column="#kmer"):
+                                   n_workers=None, kmer_column="#kmer",
+                                   write_non_inform=False):
     from collections import defaultdict
     genome_cols = [c for c in df_w_count.columns if c != kmer_column]
     kmers = df_w_count[kmer_column].to_list()
@@ -260,14 +265,16 @@ def create_kmer_triplets_parallel(non_inform_pairs, df_w_count, output_dir, base
         chunks[w].append((i, j_list))
         chunk_loads[w] += load
 
-    args_list = [(cid, chunk, output_dir, basename) for cid, chunk in enumerate(chunks) if chunk]
+    args_list = [(cid, chunk, output_dir, basename, write_non_inform)
+                 for cid, chunk in enumerate(chunks) if chunk]
 
     with Pool(n_workers, initializer=_init_worker, initargs=(presence, kmers)) as pool:
         results = pool.map(_process_anchor_chunk, args_list)
 
     total_inform = sum(r[1] for r in results)
     total_non_inform = sum(r[2] for r in results)
-    print(f"Done. Informative: {total_inform:,}  Non-informative: {total_non_inform:,}")
+    print(f"Done. Informative: {total_inform:,}  Non-informative: {total_non_inform:,} "
+          f"(write_non_inform={write_non_inform})")
  
 
 
