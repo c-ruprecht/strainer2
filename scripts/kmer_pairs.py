@@ -18,35 +18,56 @@ import numpy as np
 from collections import defaultdict
 
 def get_test_dataset():
-    ''' Creates a reabable test dataset to test rare kmer combination creation
-    A: rare singleton all 0s
-    B/C: rare pair, never in two at same time
-    B/C/D/E: rare triplicate
+    '''Create a readable test dataset for rare kmer combination detection.
+
+    Strain panel (what's informative):
+      A         — rare singleton, absent from all strains
+      B, C      — rare pair, never co-occur in any strain
+      B, C, D, E — rare triplicate
+      ST-4      — empty strain (all zeros)
+      ST-5      — reference-like strain (all ones, should be dropped as ref-similar)
+
+    Sample panel (what coverages are observed):
+      SAMPLE-1..5 — varied hit patterns to exercise coverage at each level
     '''
-    data = [
-        ["A", "B", "C", "D", "E", "F"],
-        [ 0,   1,   0,   1,   1,   0 ],
-        [ 0,   0,   1,   1,   0,   1 ],
-        [ 0,   1,   0,   0,   1,   1 ],
-        [ 0 ,  0,   0,   0,   0,   0],
-        [ 1,   1,   1,   1,   1,   1]
+    # Strain panel
+    strain_rows = [
+        # kmer   ST-1 ST-2 ST-3 ST-4 ST-5
+        ["A",     0,   0,   0,   0,   1],
+        ["B",     1,   0,   1,   0,   1],
+        ["C",     0,   1,   0,   0,   1],
+        ["D",     1,   1,   0,   0,   1],
+        ["E",     1,   0,   1,   0,   1],
+        ["F",     0,   1,   1,   0,   1],
     ]
+    df = pl.DataFrame(
+        strain_rows,
+        schema=["#kmer", "ST-1", "ST-2", "ST-3", "ST-4", "ST-5"],
+        orient="row",
+    )
 
-    df = pl.DataFrame(data, schema=["#kmer", "ST-1", "ST-2", 'ST-3', 'ST-4', 'ST-5'])
-    print('Creating Test Data')
+    # Sample panel
+    sample_rows = [
+        # kmer   SAMPLE-1 SAMPLE-2 SAMPLE-3 SAMPLE-4 SAMPLE-5
+        ["A",      1,       1,       0,       0,       1],
+        ["B",      1,       1,       0,       0,       1],
+        ["C",      1,       0,       0,       0,       1],
+        ["D",      1,       1,       1,       0,       1],
+        ["E",      1,       0,       1,       1,       1],
+        ["F",      0,       1,       1,       0,       1],
+    ]
+    df_samples = pl.DataFrame(
+        sample_rows,
+        schema=["#kmer", "SAMPLE-1", "SAMPLE-2", "SAMPLE-3", "SAMPLE-4", "SAMPLE-5"],
+        orient="row",
+    )
+
+    print("Creating Test Data")
+    print("Strain panel:")
     print(df)
-
-    # Creating test data set for checking pairs and trilicate counts etc:
-    data = [
-        ["A", "B", "C", "D", "E", "F"],
-        [ 1,   1,   1,   1,   1,   0 ],
-        [ 1,   1,   0,   1,   0,   1 ],
-        [ 0,   0,   0,   1,   1,   1 ],
-        [ 0 ,  0,   0,   0,   1,   0],
-        [ 1,   1,   1,   1,   1,   1]
-    ]
-    df2 = pl.DataFrame(data, schema=["#kmer", "SAMPLE-1", "SAMPLE-2", 'SAMPLE-3', 'SAMPLE-4', 'SAMPLE-5'])  
-    return df, df2
+    print("Sample panel:")
+    print(df_samples)
+    return df, df_samples
 
 def strain_name_from_path(path):
     base = os.path.basename(path)
@@ -257,12 +278,13 @@ def create_kmer_triplets_streaming(
     basename,
     kmer_column="#kmer",
     batch_size=1_000_000,
+    write_non_inform=False,
 ):
     '''Extend non-informative pairs to triplets, streaming results to parquet.
 
-    Writes two files:
+    Writes:
       - {basename}.inform_kmer_triplets.parquet     (count == 0)
-      - {basename}.non_inform_kmer_triplets.parquet (count > 0)
+      - {basename}.non_inform_kmer_triplets.parquet (count > 0)   [only if write_non_inform=True]
 
     Returns (n_inform, n_non_inform) counts.
     '''
@@ -286,11 +308,14 @@ def create_kmer_triplets_streaming(
         ("count", pa.int64()),
     ])
     inform_path = f"{output_dir}/{basename}.inform_kmer_triplets.parquet"
-    non_inform_path = f"{output_dir}/{basename}.non_inform_kmer_triplets.parquet"
     inform_writer = pq.ParquetWriter(inform_path, schema, compression="zstd")
-    non_inform_writer = pq.ParquetWriter(non_inform_path, schema, compression="zstd")
 
-    # batch buffers
+    non_inform_writer = None
+    if write_non_inform:
+        non_inform_path = f"{output_dir}/{basename}.non_inform_kmer_triplets.parquet"
+        non_inform_writer = pq.ParquetWriter(non_inform_path, schema, compression="zstd")
+
+    # buffers
     i_a, i_b, i_c, i_n = [], [], [], []
     n_a, n_b, n_c, n_n = [], [], [], []
     n_inform = 0
@@ -301,21 +326,27 @@ def create_kmer_triplets_streaming(
         nonlocal i_a, i_b, i_c, i_n
         if not i_a:
             return
-        table = pa.table({"kmerA": i_a, "kmerB": i_b, "kmerC": i_c, "count": i_n}, schema=schema)
-        inform_writer.write_table(table)
+        inform_writer.write_table(
+            pa.table({"kmerA": i_a, "kmerB": i_b, "kmerC": i_c, "count": i_n}, schema=schema)
+        )
         i_a, i_b, i_c, i_n = [], [], [], []
 
     def flush_non_inform():
         nonlocal n_a, n_b, n_c, n_n
         if not n_a:
             return
-        table = pa.table({"kmerA": n_a, "kmerB": n_b, "kmerC": n_c, "count": n_n}, schema=schema)
-        non_inform_writer.write_table(table)
+        non_inform_writer.write_table(
+            pa.table({"kmerA": n_a, "kmerB": n_b, "kmerC": n_c, "count": n_n}, schema=schema)
+        )
         n_a, n_b, n_c, n_n = [], [], [], []
 
     total_pairs = sum(len(v) for v in pairs_by_a.values())
     processed = 0
-    print(f"Extending {total_pairs:,} non-informative pairs to triplets", flush=True)
+    print(
+        f"Extending {total_pairs:,} non-informative pairs to triplets "
+        f"(write_non_inform={write_non_inform})",
+        flush=True,
+    )
 
     for i, j_list in pairs_by_a.items():
         kA = kmers[i]
@@ -324,25 +355,28 @@ def create_kmer_triplets_streaming(
             ab = presence[i] & presence[j]
             for k in range(j + 1, n):
                 c = len(ab & presence[k])
-                kC = kmers[k]
                 if c == 0:
+                    kC = kmers[k]
                     i_a.append(kA); i_b.append(kB); i_c.append(kC); i_n.append(0)
                     n_inform += 1
                     if len(i_a) >= batch_size:
                         flush_inform()
                 else:
-                    n_a.append(kA); n_b.append(kB); n_c.append(kC); n_n.append(c)
                     n_non_inform += 1
-                    if len(n_a) >= batch_size:
-                        flush_non_inform()
+                    if write_non_inform:
+                        kC = kmers[k]
+                        n_a.append(kA); n_b.append(kB); n_c.append(kC); n_n.append(c)
+                        if len(n_a) >= batch_size:
+                            flush_non_inform()
             processed += 1
             if processed % 100_000 == 0:
                 print(f"  [{processed:,}/{total_pairs:,}] inform={n_inform:,} non_inform={n_non_inform:,}", flush=True)
 
     flush_inform()
-    flush_non_inform()
     inform_writer.close()
-    non_inform_writer.close()
+    if write_non_inform:
+        flush_non_inform()
+        non_inform_writer.close()
 
     print(f"Done. Informative triplets: {n_inform:,}  Non-informative triplets: {n_non_inform:,}", flush=True)
     return n_inform, n_non_inform
@@ -600,11 +634,15 @@ def main():
                                 basename,
                                 n_workers=args.threads,)
     if args.testmode:
-        # reading the output
-        print('Informative Triplets')
-        print(pl.read_parquet(os.path.join(args.output_dir , f'{basename}.inform_kmer_triplets.parquet')))
-        print('Non informative Triplets: ')
-        print(pl.read_parquet(os.path.join(args.output_dir , f'{basename}.non_inform_kmer_triplets.parquet')))
+        import glob
+
+        print("Informative Triplets")
+        inform_parts = sorted(glob.glob(
+            os.path.join(args.output_dir, f"{basename}.inform_triplets.part*.parquet")
+        ))
+        if inform_parts:
+            print(pl.read_parquet(inform_parts))
+        
 
         print('Creating coverage outputs')
         print(df_samples)

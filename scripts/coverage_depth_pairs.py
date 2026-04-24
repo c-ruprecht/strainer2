@@ -111,17 +111,17 @@ def main():
     print('Samples with kmer counts: ' + str(len(pair_cols)))
     print(df_samples)
     ### Singletons
-    df_singletons = pl.read_parquet(args.inform_kmer_singles)
-    print(f'Mapping kmers against informative kmers: {len(df_singletons)}')
+    df_singletons = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_singleton.parquet"))
+    print(f'getting singleton coverage: {len(df_singletons)}')
     df_cov_s = get_singleton_hits(df_samples, df_singletons)
 
     ### Pairs
     print('getting pair coverage')
-    df_kmer_pairs = pl.read_parquet(args.inform_kmer_pairs)
+    df_kmer_pairs = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_pairs.parquet"))
     df_cov_p = get_pair_hits(df_samples, df_kmer_pairs)
     
     ### Triples
-    print('Getting triplicate coverage')
+    print('getting triplicate coverage')
     df_cov_t = get_triple_hits_streaming(df_samples,
                                         os.path.join(args.inform_kmers, f"*.inform_triplets.part*.parquet"))
 
@@ -173,8 +173,15 @@ def main():
 
     fig.update_layout(legend_title_text='metric', xaxis_title='depth', yaxis_title='coverage')
     fig.write_image(output_dir + '/coverage-depth-combined.svg')
+    fig = px.scatter(df_cov_depth,
+                     x = 'sample',
+                     y = ['coverage_all_kmer','inform_singletons_coverage', 'inform_pairs_coverage','inform_triples_coverage'],
+                     template = 'simple_white')
+    fig.update_layout(height=800)                  # taller figure (default ~450)
+    fig.update_xaxes(tickfont=dict(size=9)) 
+    fig.write_image(output_dir + '/coverage-per-sample.svg')
 
-    df_cov_depth.sort_values(['coverage_kmer_single'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
+    df_cov_depth.sort_values(['coverage_all_kmer'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
 
 
 if __name__ == '__main__':
