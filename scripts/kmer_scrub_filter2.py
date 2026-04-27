@@ -502,6 +502,8 @@ def main():
 
             if args.figures:
                 plot_genome_bins(df, df_smooth, basename, bin_size=args.bin_size, output_dir=args.output_dir)
+                fig_counts = plot_kmer_counts(df_smooth[['#kmer','reference_count','pangenome_count', 'metagenome_count','drug_count']])
+                fig_counts.write_image(os.path.join(args.output_dir, f'{basename}.selected_kmer_counts.svg'))
                 
                 fig_bins2 = plot_box_coverage(df, df_smooth, basename, bin_size=args.bin_size)
                 fig_bins2.write_image(os.path.join(args.output_dir, f'{basename}.box_genome_bins.svg'))
