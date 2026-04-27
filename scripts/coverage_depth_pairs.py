@@ -3,6 +3,7 @@ import plotly.express as px
 import numpy as np
 import os
 import polars as pl
+import glob
 import gc
 import argparse
 from kmer_pairs import get_singleton_hits, get_pair_hits, get_triple_hits_streaming
@@ -93,11 +94,13 @@ def main():
     df_cov_depth = df_hits_stack.groupby(['strain','sample']).agg(**{'total_unique_kmers': ('#kmer', 'nunique'),
                                                             'total_kmers_with_count': ('count_per10B_kmers', lambda x: sum(x>0)),
                                                             'count_mean': ('count', 'mean'),
-                                                            'count_mean_per10B_kmers': ('count_per10B_kmers', 'mean'),
-                                                            'count_mean_excl0_per10B_kmers': ('count_per10B_kmers', lambda x: x[x>0].mean())})
+                                                            
+                                                            })
 
     df_cov_depth['coverage_all_kmer'] = df_cov_depth['total_kmers_with_count']/df_cov_depth['total_unique_kmers']
     df_cov_depth = df_cov_depth.reset_index()
+    df_cov_depth['total_kmers_evaluated'] = df_cov_depth['sample'].map(dict_total_reads)
+
     #df_cov_depth.sort_values(['coverage_kmer_single'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
     #print(df_cov_depth.loc[df_cov_depth['coverage']>0.02]['sample'].unique())
     #visualize_count_map(df_hits_stack, df_cov_depth, outdir = output_dir, min_coverage=0.1)
@@ -109,7 +112,6 @@ def main():
     pair_cols = ["#kmer"] + [col for col in df_samples.columns if col != "#kmer" and df_samples[col].sum() > 1]
     df_samples = df_samples.select(pair_cols)
     print('Samples with kmer counts: ' + str(len(pair_cols)))
-    print(df_samples)
     ### Singletons
     df_singletons = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_singleton.parquet"))
     print(f'getting singleton coverage: {len(df_singletons)}')
@@ -122,25 +124,29 @@ def main():
     
     ### Triples
     print('getting triplicate coverage')
-    df_cov_t = get_triple_hits_streaming(df_samples,
-                                        os.path.join(args.inform_kmers, f"*.inform_triplets.part*.parquet"))
+    triplet_glob = os.path.join(args.inform_kmers, "*.inform_triplets.part*.parquet")
+    if glob.glob(triplet_glob):
+        df_cov_t = get_triple_hits_streaming(df_samples, triplet_glob)
+    else:
+        print('  no triplet files found, skipping')
+        sample_cols = [c for c in df_samples.columns if c != "#kmer"]
+        df_cov_t = pl.DataFrame({
+            "sample": sample_cols,
+            "inform_triples_total": [0] * len(sample_cols),
+            "inform_triples_observed": [0] * len(sample_cols),
+            "inform_triples_count_mean": [0.0] * len(sample_cols),
+            "inform_triples_coverage": [0.0] * len(sample_cols),
+        }) 
 
     df_cov_inform = df_cov_s.join(df_cov_p, on="sample", how="left").join(df_cov_t, on = 'sample', how = 'left').to_pandas()
     
     df_cov_depth = df_cov_depth.set_index('sample')
     df_cov_inform = df_cov_inform.set_index('sample')
     df_cov_depth = pd.concat([df_cov_depth, df_cov_inform], axis = 1)
-    print(df_cov_depth)
+
 
     
-
-    ### Triples
-    print('Reading Triplets')
-    print(df_kmer_pairs)
-    
-
     df_cov_depth = df_cov_depth.reset_index()
-    print(df_cov_depth)
     fig = px.scatter(df_cov_depth, x='count_mean', y='coverage_all_kmer',
                 log_x=True, template='simple_white',
                 hover_data=['sample'], width=600)

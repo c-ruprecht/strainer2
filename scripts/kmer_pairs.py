@@ -18,47 +18,59 @@ import numpy as np
 from collections import defaultdict
 
 def get_test_dataset():
-    '''Create a readable test dataset for rare kmer combination detection.
+    '''Test dataset with multiple informative singletons, pairs, and triplets.
 
-    Strain panel (what's informative):
-      A         — rare singleton, absent from all strains
-      B, C      — rare pair, never co-occur in any strain
-      B, C, D, E — rare triplicate
-      ST-4      — empty strain (all zeros)
-      ST-5      — reference-like strain (all ones, should be dropped as ref-similar)
+    Effective strains: ST-1..ST-6 (ST-empty all-zero, ST-ref ref-like, both dropped).
 
-    Sample panel (what coverages are observed):
-      SAMPLE-1..5 — varied hit patterns to exercise coverage at each level
+    Informative singletons (2): A1, A2 — absent from all effective strains
+    Informative pairs (2):
+      (P1, P2):  P1={1,2,3}, P2={4,5,6}
+      (P3, P4):  P3={1,4,5}, P4={2,3,6}
+    Informative triplets (2):
+      (T1, T2, T3): T1={1,2,4,5}, T2={1,3,4,6}, T3={2,3,5,6}
+      (U1, U2, U3): U1={1,2,4,6}, U2={1,3,5,6}, U3={2,3,4,5}
     '''
-    # Strain panel
     strain_rows = [
-        # kmer   ST-1 ST-2 ST-3 ST-4 ST-5
-        ["A",     0,   0,   0,   0,   1],
-        ["B",     1,   0,   1,   0,   1],
-        ["C",     0,   1,   0,   0,   1],
-        ["D",     1,   1,   0,   0,   1],
-        ["E",     1,   0,   1,   0,   1],
-        ["F",     0,   1,   1,   0,   1],
+        # kmer   ST-1 ST-2 ST-3 ST-4 ST-5 ST-6 ST-empty ST-ref
+        ["A1",    0,   0,   0,   0,   0,   0,    0,       1],
+        ["A2",    0,   0,   0,   0,   0,   0,    0,       1],
+        ["T1",    1,   1,   0,   1,   1,   0,    0,       1],
+        ["T2",    1,   0,   1,   1,   0,   1,    0,       1],
+        ["T3",    0,   1,   1,   0,   1,   1,    0,       1],
+        ["U1",    1,   1,   0,   1,   0,   1,    0,       1],
+        ["U2",    1,   0,   1,   0,   1,   1,    0,       1],
+        ["U3",    0,   1,   1,   1,   1,   0,    0,       1],
+        ["P1",    1,   1,   1,   0,   0,   0,    0,       1],
+        ["P2",    0,   0,   0,   1,   1,   1,    0,       1],
+        ["P3",    1,   0,   0,   1,   1,   0,    0,       1],
+        ["P4",    0,   1,   1,   0,   0,   1,    0,       1],
     ]
     df = pl.DataFrame(
         strain_rows,
-        schema=["#kmer", "ST-1", "ST-2", "ST-3", "ST-4", "ST-5"],
+        schema=["#kmer", "ST-1", "ST-2", "ST-3", "ST-4", "ST-5", "ST-6", "ST-empty", "ST-ref"],
         orient="row",
     )
 
-    # Sample panel
+    # Sample panel — design counts to exercise coverage logic.
+    # Make sure to give pair partners and triplet members co-occurring counts in some samples.
     sample_rows = [
-        # kmer   SAMPLE-1 SAMPLE-2 SAMPLE-3 SAMPLE-4 SAMPLE-5
-        ["A",      1,       1,       0,       0,       1],
-        ["B",      1,       1,       0,       0,       1],
-        ["C",      1,       0,       0,       0,       1],
-        ["D",      1,       1,       1,       0,       1],
-        ["E",      1,       0,       1,       1,       1],
-        ["F",      0,       1,       1,       0,       1],
+        # kmer    S1   S2   S3   S4   S5
+        ["A1",    100,  50,   0,   0,   0],   # singleton observed in S1, S2
+        ["A2",     20,   0,   0,   0,  10],
+        ["T1",      0,   0,  50,   0,  50],   # T-triplet observed in S3 (50,40,30) and S5 (10,20,30)
+        ["T2",      0,   0,  100,   0,  100],
+        ["T3",      0,   0,  100,   0,  100],
+        ["U1",      0,   0,   0,  50,  50],   # U-triplet observed in S4 and S5
+        ["U2",      0,   0,   0,  50,  50],
+        ["U3",      0,   0,   0,  50,  50],
+        ["P1",      0, 100,   0,   0,   0],   # (P1,P2) pair observed in S2 (both>0)? need P2>0 too
+        ["P2",      0,  50,   0,   0,   0],
+        ["P3",      0,   0,   0,  50,   0],   # (P3,P4) pair observed in S4
+        ["P4",      0,   0,   0,  50,   0],
     ]
     df_samples = pl.DataFrame(
         sample_rows,
-        schema=["#kmer", "SAMPLE-1", "SAMPLE-2", "SAMPLE-3", "SAMPLE-4", "SAMPLE-5"],
+        schema=["#kmer", "S1", "S2", "S3", "S4", "S5"],
         orient="row",
     )
 
@@ -241,40 +253,46 @@ def create_kmer_triplets_parallel(non_inform_pairs, df_w_count, output_dir, base
     from collections import defaultdict
     genome_cols = [c for c in df_w_count.columns if c != kmer_column]
     kmers = df_w_count[kmer_column].to_list()
-    kmer_to_idx = {k: i for i, k in enumerate(kmers)}
-    mat = (df_w_count.select(genome_cols).to_numpy() > 0)
-    presence = [frozenset(np.nonzero(row)[0]) for row in mat]
+    
 
-    pairs_by_a = defaultdict(list)
-    for (a, b) in non_inform_pairs.keys():
-        pairs_by_a[kmer_to_idx[a]].append(kmer_to_idx[b])
+    print(len(kmers))
+    if len(kmers) == 0:
+        print('no kmers left after pairing')
+    else:
+        kmer_to_idx = {k: i for i, k in enumerate(kmers)}
+        mat = (df_w_count.select(genome_cols).to_numpy() > 0)
+        presence = [frozenset(np.nonzero(row)[0]) for row in mat]
 
-    # split anchors into chunks for workers
-    # balance by total work per chunk, not just number of anchors
-    items = sorted(pairs_by_a.items())  # deterministic order
-    n_workers = n_workers or max(1, os.cpu_count() - 1)
+        pairs_by_a = defaultdict(list)
+        for (a, b) in non_inform_pairs.keys():
+            pairs_by_a[kmer_to_idx[a]].append(kmer_to_idx[b])
 
-    # assign items to workers greedily by workload (j_list length × remaining-k-count)
-    n_total = len(kmers)
-    workloads = [(i, j_list, sum(n_total - j - 1 for j in j_list)) for i, j_list in items]
-    workloads.sort(key=lambda x: -x[2])  # biggest first
-    chunks = [[] for _ in range(n_workers)]
-    chunk_loads = [0] * n_workers
-    for i, j_list, load in workloads:
-        w = chunk_loads.index(min(chunk_loads))
-        chunks[w].append((i, j_list))
-        chunk_loads[w] += load
+        # split anchors into chunks for workers
+        # balance by total work per chunk, not just number of anchors
+        items = sorted(pairs_by_a.items())  # deterministic order
+        n_workers = n_workers or max(1, os.cpu_count() - 1)
 
-    args_list = [(cid, chunk, output_dir, basename, write_non_inform)
-                 for cid, chunk in enumerate(chunks) if chunk]
+        # assign items to workers greedily by workload (j_list length × remaining-k-count)
+        n_total = len(kmers)
+        workloads = [(i, j_list, sum(n_total - j - 1 for j in j_list)) for i, j_list in items]
+        workloads.sort(key=lambda x: -x[2])  # biggest first
+        chunks = [[] for _ in range(n_workers)]
+        chunk_loads = [0] * n_workers
+        for i, j_list, load in workloads:
+            w = chunk_loads.index(min(chunk_loads))
+            chunks[w].append((i, j_list))
+            chunk_loads[w] += load
 
-    with Pool(n_workers, initializer=_init_worker, initargs=(presence, kmers)) as pool:
-        results = pool.map(_process_anchor_chunk, args_list)
+        args_list = [(cid, chunk, output_dir, basename, write_non_inform)
+                    for cid, chunk in enumerate(chunks) if chunk]
 
-    total_inform = sum(r[1] for r in results)
-    total_non_inform = sum(r[2] for r in results)
-    print(f"Done. Informative: {total_inform:,}  Non-informative: {total_non_inform:,} "
-          f"(write_non_inform={write_non_inform})")
+        with Pool(n_workers, initializer=_init_worker, initargs=(presence, kmers)) as pool:
+            results = pool.map(_process_anchor_chunk, args_list)
+
+        total_inform = sum(r[1] for r in results)
+        total_non_inform = sum(r[2] for r in results)
+        print(f"Done. Informative: {total_inform:,}  Non-informative: {total_non_inform:,} "
+            f"(write_non_inform={write_non_inform})")
  
 
 
@@ -454,6 +472,7 @@ def get_singleton_hits(df_samples, df_informative, kmer_column="#kmer"):
         observed = (col > 0).sum()
         rows.append({
             "sample": s,
+            "inform_singletons_total": n_total,
             "inform_singletons_observed": observed,
             "inform_singletons_count_mean": col.mean() if len(col) else 0.0,
             "inform_singletons_coverage": observed / n_total if n_total else 0.0,
@@ -494,6 +513,7 @@ def get_pair_hits(df_samples, df_informative, kmer_column="#kmer"):
         ]).row(0, named=True)
         rows.append({
             "sample": s,
+            "inform_pairs_total": n_total,
             "inform_pairs_observed": stats["observed"],
             "inform_pairs_count_mean": stats["mean_count"] or 0.0,
             "inform_pairs_coverage": stats["observed"] / n_total if n_total else 0.0,
@@ -545,9 +565,8 @@ def get_triple_hits_streaming(df_samples, triplets_glob, kmer_column="#kmer"):
 
         # accumulate per-sample stats from this part
         for s in sample_cols:
-            trip_count = pl.min_horizontal(
-                pl.col(f"{s}__A"), pl.col(f"{s}__B"), pl.col(f"{s}__C")
-            )
+            # gets minimum of the kmer triplet
+            trip_count = pl.min_horizontal(pl.col(f"{s}__A"), pl.col(f"{s}__B"), pl.col(f"{s}__C"))
             stats = df_trip.select([
                 (trip_count > 0).sum().alias("observed"),
                 trip_count.sum().alias("sum_count"),
@@ -559,8 +578,9 @@ def get_triple_hits_streaming(df_samples, triplets_glob, kmer_column="#kmer"):
 
     rows = [{
         "sample": s,
+        "inform_triples_total": n_total,
         "inform_triples_observed": observed[s],
-        "inform_triples_count_mean": sum_count[s] / n_total if n_total else 0.0,
+        "inform_triples_count_mean": sum_count[s]/n_total if n_total else 0.0,
         "inform_triples_coverage": observed[s] / n_total if n_total else 0.0,
     } for s in sample_cols]
     return pl.DataFrame(rows)
@@ -572,7 +592,8 @@ def main():
     parser.add_argument('--testmode', action= 'store_true', help = 'Uses a test dataset instead of an input csv')
     parser.add_argument('--threads', type=int, default=None, help='Number of worker processes for triplet generation. Default: os.cpu_count() - 1')
     parser.add_argument('--ref_jaccard_threshold', type=float, default=0.95, help='Drop strains whose Jaccard similarity to an all-present reference exceeds this')
-
+    parser.add_argument('--basename')
+    
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok = True)
 
@@ -580,7 +601,10 @@ def main():
         df, df_samples = get_test_dataset()
         basename = 'testmode'
     else:
-        basename = strain_name_from_path(args.csv_path)
+        if args.basename:
+            basename=args.basename
+        else:
+            basename = strain_name_from_path(args.csv_path)
         csv_path = args.csv_path
         # Polars for fast multithreaded reading of the csv file, needs more tha 16 gb ram
         df = pl.read_csv(csv_path, separator="\t")
@@ -593,10 +617,6 @@ def main():
     
     # Step 2
     # Check for cols with only 1s, print warning and drop
-    #ref_cols = [col for col, all_present in df.select(pl.exclude("#kmer").min().ge(1)).row(0, named=True).items() if all_present]
-    #if ref_cols:
-    #    print(f"Dropping {len(ref_cols)} reference columns (kmer present in all rows): {ref_cols[:3]}{'...' if len(ref_cols) > 3 else ''}")
-    #    df = df.drop(ref_cols)
     print('Checking for too similar columns')
     df = drop_reference_similar_strains(df, similarity_threshold=args.ref_jaccard_threshold)
 
@@ -628,15 +648,31 @@ def main():
     df_inform_pairs.write_parquet(os.path.join(args.output_dir , f'{basename}.inform_kmer_pairs.parquet'), compression='zstd')
     if not args.testmode:
         del df_inform_pairs
-        del df_non_inform_pairs
-        del dict_inform_pairs
+        del df_non_inform_pairs  
         gc.collect()
     
     # Get all informative triplets:
     # this is too much data for ram and needs to be streamed to files directly
     print('Creating triplicates')
+    # convert kmer pairs to set for removal
+    kmers_in_pairs = set()
+    for a, b in dict_inform_pairs.keys():
+        kmers_in_pairs.add(a)
+        kmers_in_pairs.add(b)
+    print('Removing kmer in informative pairs')
+    #print(kmers_in_pairs)
+
+    df_w_countpairs = df_w_count.filter(~pl.col("#kmer").is_in(kmers_in_pairs))
+    #print(df_w_countpairs)
+    print(f"Kmers remaining: {df_w_countpairs.shape[0]:,} (dropped {len(kmers_in_pairs):,})")
+    #print(dict_inform_pairs)
+    dict_non_inform_pairs = {(a, b): c for (a, b), c in dict_non_inform_pairs.items() 
+                            if a not in kmers_in_pairs and b not in kmers_in_pairs}
+    #print(dict_non_inform_pairs)
+    print(f"Non-inform pairs remaining: {len(dict_non_inform_pairs):,}")    
+    # Creat triplets for non informative pairs
     create_kmer_triplets_parallel(dict_non_inform_pairs,
-                                df_w_count,
+                                df_w_countpairs,
                                 args.output_dir,
                                 basename,
                                 n_workers=args.threads,)
@@ -658,7 +694,7 @@ def main():
         df_cov_t = get_triple_hits_streaming(df_samples,
                                              os.path.join(args.output_dir, f"{basename}.inform_triplets.part*.parquet"),)
         df_cov = df_cov_s.join(df_cov_p, on="sample", how="left").join(df_cov_t, on="sample", how="left")
-
+        df_cov.write_csv(os.path.join(args.output_dir, f'{basename}.coverage.csv'))
         print(df_cov)
 
 
