@@ -299,6 +299,65 @@ void GEN_all_kmer_counts(const char *B_file, const int seed, BIO_hash seqHash, u
         free(line);
 }
 
+/*
+   GEN_per_sample_kmer_counts
+
+   Like GEN_all_kmer_counts, but assigns each file in the list to its own
+   dedicated column = base_column + line_index. Different samples therefore
+   write to disjoint slots in the count vector — threads processing different
+   samples never contend on the same word, and within a single sample the
+   atomic __sync_fetch_and_add in GEN_calculate_kmer_count handles same-slot
+   contention.
+
+   `skip_file` is the same convention used by GEN_all_kmer_counts_skip_file:
+   pass NULL to process every file, or a path to skip any list entry whose
+   filename string-matches it (used to avoid double-counting the reference
+   when it appears in the drug list).
+*/
+void GEN_per_sample_kmer_counts(const char *list_file, const int seed,
+                                BIO_hash seqHash, unsigned int base_column,
+                                FILE *progress, int num_threads,
+                                const char *skip_file)
+{
+	FILE *fp = fopen(list_file, "r");
+	if (!fp) {
+		fprintf(stderr, "could not read file %s in GEN_per_sample_kmer_counts()\n", list_file);
+		exit(EXIT_FAILURE);
+	}
+
+	char *line = NULL;
+	size_t len = 0;
+	ssize_t readL;
+	char *pos;
+	int nlines = 0;
+
+	while ((readL = getline(&line, &len, fp)) != -1) nlines++;
+	rewind(fp);
+
+	kmer_pool *pool = pool_create(num_threads, nlines + 1);
+
+	int idx = 0;
+	while ((readL = getline(&line, &len, fp)) != -1) {
+		if ((pos = strchr(line, '\n')) != NULL) *pos = '\0';
+		if (progress) {
+			time_t ltime = time(NULL);
+			fprintf(progress, "%s\t%s", line, asctime(localtime(&ltime)));
+		}
+		kmer_job *job = (kmer_job *)malloc(sizeof(kmer_job));
+		job->filename = strdup(line);
+		job->skip_file = skip_file;            /* may be NULL */
+		job->seed = seed;
+		job->h = seqHash;
+		job->vec_column = base_column + idx;   /* unique column per sample */
+		pool_submit(pool, job);
+		idx++;
+	}
+
+	pool_wait_and_destroy(pool);
+	fclose(fp);
+	free(line);
+}
+
 void GEN_calculate_kmer_count(const char *file, const int seed, BIO_hash h, unsigned int vec_column) {
 	gzFile fp;
 	kseq_t *seq;

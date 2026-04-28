@@ -602,7 +602,7 @@ def triplets_dict_to_df(d):
     })
 import polars as pl
 
-def drop_reference_similar_strains(df, similarity_threshold=0.95, kmer_column="#kmer", verbose=True):
+def drop_reference_similar_strains(df, similarity_threshold=1, kmer_column="#kmer", verbose=True):
     '''Drop strain columns whose Jaccard similarity to an all-present reference
     exceeds the threshold.
 
@@ -625,6 +625,39 @@ def drop_reference_similar_strains(df, similarity_threshold=0.95, kmer_column="#
         shown = sorted(drop_cols, key=lambda c: -presence_frac[c])[:10]
         for c in shown:
             print(f"  drop {c[:60]}... (fraction {presence_frac[c]:.3f})")
+        if len(drop_cols) > 10:
+            print(f"  ... and {len(drop_cols) - 10} more")
+
+    return df.select([kmer_column] + keep_cols)
+
+def drop_high_presence_strains(df, presence_threshold=1.0, kmer_column="#kmer", verbose=True):
+    """Drop strain columns where the fraction of present kmers >= threshold.
+
+    presence_threshold=1.0 drops strains carrying every kmer in the panel
+    (i.e. reference-like strains that contribute no discriminating power).
+    """
+    import math
+
+    strain_cols = [c for c in df.columns if c != kmer_column]
+    n_kmers = df.shape[0]
+
+    presence_count = df.select(
+        [(pl.col(c) > 0).sum().alias(c) for c in strain_cols]
+    ).row(0, named=True)
+
+    # ceil so that count >= cutoff  <=>  count / n_kmers >= threshold (exact int compare)
+    cutoff = math.ceil(presence_threshold * n_kmers)
+
+    drop_cols = [c for c, k in presence_count.items() if k >= cutoff]
+    keep_cols = [c for c in strain_cols if c not in set(drop_cols)]
+
+    if verbose:
+        print(f"Strains: {len(keep_cols)}/{len(strain_cols)} "
+              f"(dropped {len(drop_cols)} with presence >= {presence_threshold})")
+        shown = sorted(drop_cols, key=lambda c: -presence_count[c])[:10]
+        for c in shown:
+            frac = presence_count[c] / n_kmers
+            print(f"  drop {c[:60]}... ({presence_count[c]}/{n_kmers} = {frac:.4f})")
         if len(drop_cols) > 10:
             print(f"  ... and {len(drop_cols) - 10} more")
 
@@ -789,7 +822,7 @@ def main():
     parser.add_argument('--output_dir')
     parser.add_argument('--testmode', action= 'store_true', help = 'Uses a test dataset instead of an input csv')
     parser.add_argument('--threads', type=int, default=None, help='Number of worker processes for triplet generation. Default: os.cpu_count() - 1')
-    parser.add_argument('--ref_jaccard_threshold', type=float, default=0.95, help='Drop strains whose Jaccard similarity to an all-present reference exceeds this')
+    parser.add_argument('--presence_threshold', type=float, default=0.95, help='Drop strains whose Jaccard similarity to an all-present reference exceeds this')
     parser.add_argument('--basename')
     
     args = parser.parse_args()
@@ -816,7 +849,8 @@ def main():
     # Step 2
     # Check for cols with only 1s, print warning and drop
     print('Checking for too similar columns')
-    df = drop_reference_similar_strains(df, similarity_threshold=args.ref_jaccard_threshold)
+    #df = drop_reference_similar_strains(df, similarity_threshold=args.ref_jaccard_threshold)
+    df = drop_high_presence_strains(df, presence_threshold=args.presence_threshold)
 
     # Step 3 Check for highly similar strains and remove
 

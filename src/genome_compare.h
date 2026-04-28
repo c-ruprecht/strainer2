@@ -51,7 +51,17 @@ void GEN_all_kmer_counts(const char *B_file, const int seed, BIO_hash seqHash, u
 /* similar to above function but allows you to specify a file to skip */
 void GEN_all_kmer_counts_skip_file(const char *B_file, const char *skip_file, const int seed, BIO_hash seqHash, unsigned int vec_column, FILE *progress, int num_threads);
 
-
+/* per-sample variant: each file in list_file gets its own dedicated column
+   = base_column + line_index. Disjoint columns mean threads processing
+   different samples never contend on the same word; intra-sample contention
+   is handled by the atomic increment in GEN_calculate_kmer_count.
+   Pass skip_file = NULL to process every entry, or a path to skip any list
+   entry whose filename string-matches it (used to avoid double-counting the
+   reference when it appears in the drug list). */
+void GEN_per_sample_kmer_counts(const char *list_file, const int seed,
+                                BIO_hash seqHash, unsigned int base_column,
+                                FILE *progress, int num_threads,
+                                const char *skip_file);
 
 
 void eliminate_nonunique_keys(BIO_hash seqHash, unsigned int *, unsigned int *);
