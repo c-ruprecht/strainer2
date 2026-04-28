@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import numpy as np
 from collections import defaultdict
+import glob
 
 def get_test_dataset():
     '''Test dataset with multiple informative singletons, pairs, and triplets.
@@ -140,38 +141,215 @@ def process_sample(sample_col, dict_kmer_pairs, df):
     
     return dict_kmer_pairs
 
-import numpy as np
+from collections import defaultdict
 from itertools import combinations
+from multiprocessing import Pool
+import os
 
-def create_kmer_pairs(df, kmer_column="#kmer"):
-    '''Create all kmer pairs and split by informativeness.
-    
-    Returns:
-        inform:     dict {(kmerA, kmerB): 0}   — pairs that never co-occur
-        non_inform: dict {(kmerA, kmerB): n}   — pairs co-occurring in n samples
-    '''
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+
+_PAIR_SCHEMA = pa.schema([
+    ("kmerA", pa.string()),
+    ("kmerB", pa.string()),
+    ("count", pa.int64()),
+])
+
+
+# ---------- single-process streaming ----------
+
+def create_kmer_pairs_streaming(
+    df, output_dir, basename,
+    kmer_column="#kmer", batch_size=1_000_000, write_non_inform=False,
+):
+    """Generate all kmer pairs, streaming informative pairs to parquet.
+
+    Writes:
+      - {basename}.inform_kmer_pairs.parquet      (count == 0)
+      - {basename}.non_inform_kmer_pairs.parquet  (count > 0) [if write_non_inform]
+
+    Returns (n_inform, dict_non_inform).
+    """
     genome_cols = [c for c in df.columns if c != kmer_column]
     kmers = df[kmer_column].to_list()
-
-    # N x G boolean matrix: is each kmer present in each sample?
+    n = len(kmers)
     mat = (df.select(genome_cols).to_numpy() > 0)
     presence = [frozenset(np.nonzero(row)[0]) for row in mat]
 
-    print(f"{len(kmers)} kmers, {len(genome_cols)} samples")
+    print(f"{n} kmers, {len(genome_cols)} samples", flush=True)
 
-    inform = {}
-    non_inform = {}
+    inform_path = os.path.join(output_dir, f"{basename}.inform_kmer_pairs.parquet")
+    inform_writer = pq.ParquetWriter(inform_path, _PAIR_SCHEMA, compression="zstd")
+
+    non_inform_writer = None
+    if write_non_inform:
+        non_inform_path = os.path.join(output_dir, f"{basename}.non_inform_kmer_pairs.parquet")
+        non_inform_writer = pq.ParquetWriter(non_inform_path, _PAIR_SCHEMA, compression="zstd")
+
+    i_a, i_b, i_n = [], [], []
+    n_a, n_b, n_n = [], [], []
+
+    def flush_inform():
+        nonlocal i_a, i_b, i_n
+        if not i_a: return
+        inform_writer.write_table(
+            pa.table({"kmerA": i_a, "kmerB": i_b, "count": i_n}, schema=_PAIR_SCHEMA)
+        )
+        i_a, i_b, i_n = [], [], []
+
+    def flush_non_inform():
+        nonlocal n_a, n_b, n_n
+        if not n_a: return
+        non_inform_writer.write_table(
+            pa.table({"kmerA": n_a, "kmerB": n_b, "count": n_n}, schema=_PAIR_SCHEMA)
+        )
+        n_a, n_b, n_n = [], [], []
+
+    dict_non_inform = {}
+    n_inform = 0
+    total_pairs = n * (n - 1) // 2
+    processed = 0
+
+    print(f"Generating {total_pairs:,} pairs (write_non_inform={write_non_inform})", flush=True)
+
     for (i, a), (j, b) in combinations(enumerate(kmers), 2):
-        pair = (a, b) if a < b else (b, a)
         c = len(presence[i] & presence[j])
+        kA, kB = (a, b) if a < b else (b, a)
         if c == 0:
-            inform[pair] = 0
+            i_a.append(kA); i_b.append(kB); i_n.append(0)
+            n_inform += 1
+            if len(i_a) >= batch_size:
+                flush_inform()
         else:
-            non_inform[pair] = c
+            dict_non_inform[(kA, kB)] = c
+            if write_non_inform:
+                n_a.append(kA); n_b.append(kB); n_n.append(c)
+                if len(n_a) >= batch_size:
+                    flush_non_inform()
 
-    print(f"Informative pairs: {len(inform):,}")
-    print(f"Non-informative pairs: {len(non_inform):,}")
-    return inform, non_inform
+        processed += 1
+        if processed % 5_000_000 == 0:
+            print(f"  [{processed:,}/{total_pairs:,}] inform={n_inform:,} non_inform={len(dict_non_inform):,}", flush=True)
+
+    flush_inform()
+    inform_writer.close()
+    if write_non_inform:
+        flush_non_inform()
+        non_inform_writer.close()
+
+    print(f"Done. Informative pairs: {n_inform:,}  Non-informative pairs: {len(dict_non_inform):,}", flush=True)
+    return n_inform, dict_non_inform
+# ---------- parallel ----------
+
+_PRESENCE = None
+_KMERS = None
+
+def _init_worker(presence, kmers):
+    global _PRESENCE, _KMERS
+    _PRESENCE = presence
+    _KMERS = kmers
+
+
+def _process_pair_chunk(args):
+    chunk_id, i_indices, output_dir, basename, write_non_inform, batch_size = args
+    n = len(_KMERS)
+
+    inform_path = os.path.join(output_dir, f"{basename}.inform_kmer_pairs.part{chunk_id:04d}.parquet")
+    inform_w = pq.ParquetWriter(inform_path, _PAIR_SCHEMA, compression="zstd")
+
+    non_inform_w = None
+    if write_non_inform:
+        non_inform_path = os.path.join(output_dir, f"{basename}.non_inform_kmer_pairs.part{chunk_id:04d}.parquet")
+        non_inform_w = pq.ParquetWriter(non_inform_path, _PAIR_SCHEMA, compression="zstd")
+
+    i_a, i_b, i_n = [], [], []
+    n_a, n_b, n_n = [], [], []
+
+    def flush(writer, cols):
+        if cols[0]:
+            writer.write_table(
+                pa.table({"kmerA": cols[0], "kmerB": cols[1], "count": cols[2]}, schema=_PAIR_SCHEMA)
+            )
+            cols[0].clear(); cols[1].clear(); cols[2].clear()
+
+    inform_buf = [i_a, i_b, i_n]
+    non_inform_buf = [n_a, n_b, n_n]
+    dict_non_inform_chunk = {}
+    n_inform = 0
+
+    for i in i_indices:
+        kA = _KMERS[i]
+        pi = _PRESENCE[i]
+        for j in range(i + 1, n):
+            kB = _KMERS[j]
+            c = len(pi & _PRESENCE[j])
+            a_, b_ = (kA, kB) if kA < kB else (kB, kA)
+            if c == 0:
+                i_a.append(a_); i_b.append(b_); i_n.append(0)
+                n_inform += 1
+                if len(i_a) >= batch_size:
+                    flush(inform_w, inform_buf)
+            else:
+                dict_non_inform_chunk[(a_, b_)] = c
+                if write_non_inform:
+                    n_a.append(a_); n_b.append(b_); n_n.append(c)
+                    if len(n_a) >= batch_size:
+                        flush(non_inform_w, non_inform_buf)
+
+    flush(inform_w, inform_buf)
+    inform_w.close()
+    if write_non_inform:
+        flush(non_inform_w, non_inform_buf)
+        non_inform_w.close()
+    return chunk_id, n_inform, dict_non_inform_chunk
+
+
+def create_kmer_pairs_parallel(
+    df, output_dir, basename,
+    n_workers=None, kmer_column="#kmer", batch_size=1_000_000, write_non_inform=False,
+):
+    """Parallel pair generation. Returns (n_inform, dict_non_inform)."""
+    genome_cols = [c for c in df.columns if c != kmer_column]
+    kmers = df[kmer_column].to_list()
+    n = len(kmers)
+    if n < 2:
+        print("Fewer than 2 kmers — nothing to pair.", flush=True)
+        return 0, {}
+
+    mat = (df.select(genome_cols).to_numpy() > 0)
+    presence = [frozenset(np.nonzero(row)[0]) for row in mat]
+
+    n_workers = n_workers or max(1, os.cpu_count() - 1)
+    n_workers = min(n_workers, n - 1)
+
+    # workload per anchor i is (n - i - 1); balance greedily, biggest first
+    workloads = [(i, n - i - 1) for i in range(n - 1)]
+    workloads.sort(key=lambda x: -x[1])
+    chunks = [[] for _ in range(n_workers)]
+    chunk_loads = [0] * n_workers
+    for i, load in workloads:
+        w = chunk_loads.index(min(chunk_loads))
+        chunks[w].append(i)
+        chunk_loads[w] += load
+
+    args_list = [
+        (cid, sorted(indices), output_dir, basename, write_non_inform, batch_size)
+        for cid, indices in enumerate(chunks) if indices
+    ]
+    print(f"Pair generation: {n:,} kmers, {n*(n-1)//2:,} total pairs, {len(args_list)} workers", flush=True)
+
+    with Pool(n_workers, initializer=_init_worker, initargs=(presence, kmers)) as pool:
+        results = pool.map(_process_pair_chunk, args_list)
+
+    n_inform = sum(r[1] for r in results)
+    dict_non_inform = {}
+    for _, _, d in results:
+        dict_non_inform.update(d)
+
+    print(f"Done. Informative pairs: {n_inform:,}  Non-informative pairs: {len(dict_non_inform):,} (write_non_inform={write_non_inform})", flush=True)
+    return n_inform, dict_non_inform
 
 from multiprocessing import Pool
 import pyarrow as pa
@@ -480,49 +658,69 @@ def get_singleton_hits(df_samples, df_informative, kmer_column="#kmer"):
     return pl.DataFrame(rows)
 
 
-def get_pair_hits(df_samples, df_informative, kmer_column="#kmer"):
-    """Compute per-sample coverage for informative pairs.
 
-    df_informative: Polars DataFrame with columns [kmerA, kmerB, ...]
+
+def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer"):
+    """Stream informative pairs from parquet part files and compute per-sample
+    coverage without materializing the full pair frame.
+
+    pairs_glob: glob pattern like
+        "/path/to/output/{basename}.inform_kmer_pairs.part*.parquet"
+        (a single parquet path also works — glob will return [path])
+
     A pair is 'observed' in a sample when both kmers have count > 0 there.
+    The per-sample mean is taken over all n_total pairs (zeros included),
+    matching get_triple_hits_streaming's convention.
     """
+    part_files = sorted(glob.glob(pairs_glob))
+    if not part_files:
+        raise FileNotFoundError(f"No pair part files matched {pairs_glob}")
+
     sample_cols = [c for c in df_samples.columns if c != kmer_column]
-    n_total = len(df_informative)
 
-    # restrict the sample matrix to kmers that appear in any pair
-    pair_kmers = pl.concat([df_informative["kmerA"], df_informative["kmerB"]]).unique()
-    df_hits = df_samples.filter(pl.col(kmer_column).is_in(pair_kmers.implode()))
+    observed = {s: 0 for s in sample_cols}
+    sum_count = {s: 0 for s in sample_cols}
+    n_total = 0
 
-    # join pairs to their A and B counts per sample
-    df_A = df_hits.rename({kmer_column: "kmerA", **{s: f"{s}__A" for s in sample_cols}})
-    df_B = df_hits.rename({kmer_column: "kmerB", **{s: f"{s}__B" for s in sample_cols}})
+    for path in part_files:
+        df_part = pl.read_parquet(path)
+        n_total += len(df_part)
+        if len(df_part) == 0:
+            continue
 
-    df_pair = (
-        df_informative.select(["kmerA", "kmerB"])
-        .join(df_A, on="kmerA", how="inner")
-        .join(df_B, on="kmerB", how="inner")
-    )
+        # restrict the sample matrix to kmers touched by this part
+        part_kmers = pl.concat([df_part["kmerA"], df_part["kmerB"]]).unique()
+        df_hits = df_samples.filter(pl.col(kmer_column).is_in(part_kmers.implode()))
 
-    # per-sample pair count = min(count_A, count_B); present when > 0
-    rows = []
-    for s in sample_cols:
-        pair_count = pl.min_horizontal(pl.col(f"{s}__A"), pl.col(f"{s}__B"))
-        stats = df_pair.select([
-            (pair_count > 0).sum().alias("observed"),
-            pair_count.mean().alias("mean_count"),
-        ]).row(0, named=True)
-        rows.append({
-            "sample": s,
-            "inform_pairs_total": n_total,
-            "inform_pairs_observed": stats["observed"],
-            "inform_pairs_count_mean": stats["mean_count"] or 0.0,
-            "inform_pairs_coverage": stats["observed"] / n_total if n_total else 0.0,
-        })
+        df_A = df_hits.rename({kmer_column: "kmerA", **{s: f"{s}__A" for s in sample_cols}})
+        df_B = df_hits.rename({kmer_column: "kmerB", **{s: f"{s}__B" for s in sample_cols}})
+
+        df_pair = (
+            df_part.select(["kmerA", "kmerB"])
+            .join(df_A, on="kmerA", how="inner")
+            .join(df_B, on="kmerB", how="inner")
+        )
+
+        for s in sample_cols:
+            pair_count = pl.min_horizontal(pl.col(f"{s}__A"), pl.col(f"{s}__B"))
+            stats = df_pair.select([
+                (pair_count > 0).sum().alias("observed"),
+                pair_count.sum().alias("sum_count"),
+            ]).row(0, named=True)
+            observed[s] += stats["observed"] or 0
+            sum_count[s] += stats["sum_count"] or 0
+
+        del df_part, df_hits, df_A, df_B, df_pair
+
+    rows = [{
+        "sample": s,
+        "inform_pairs_total": n_total,
+        "inform_pairs_observed": observed[s],
+        "inform_pairs_count_mean": sum_count[s] / n_total if n_total else 0.0,
+        "inform_pairs_coverage": observed[s] / n_total if n_total else 0.0,
+    } for s in sample_cols]
     return pl.DataFrame(rows)
 
-
-import glob
-import polars as pl
 
 def get_triple_hits_streaming(df_samples, triplets_glob, kmer_column="#kmer"):
     """Stream informative triplets from multiple parquet part files and compute
@@ -638,27 +836,34 @@ def main():
     g = len([c for c in df_w_count.columns if c != "#kmer"])
     print(f"N kmers after zero-filter: {n:,}", flush=True)
     print(f"N genome columns: {g}", flush=True)
+    n_inform_pairs, dict_non_inform_pairs = create_kmer_pairs_parallel(df_w_count, args.output_dir, basename, n_workers=args.threads,)
+    #print informative pairs
+    inform_pair_parts = sorted(glob.glob(os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")))
+    if args.testmode:
+        print("Informative Pairs")
+        if inform_pair_parts:
+            print(pl.read_parquet(inform_pair_parts))
 
-
-    dict_inform_pairs, dict_non_inform_pairs = create_kmer_pairs(df_w_count)
-    df_inform_pairs = pairs_dict_to_df(dict_inform_pairs)
-    print(df_inform_pairs)
-    df_non_inform_pairs = pairs_dict_to_df(dict_non_inform_pairs)
-    print(df_non_inform_pairs)
-    df_inform_pairs.write_parquet(os.path.join(args.output_dir , f'{basename}.inform_kmer_pairs.parquet'), compression='zstd')
+    print(f"Total informative pairs: {n_inform_pairs:,}")
+    print(n_inform_pairs)
     if not args.testmode:
-        del df_inform_pairs
-        del df_non_inform_pairs  
         gc.collect()
     
     # Get all informative triplets:
     # this is too much data for ram and needs to be streamed to files directly
     print('Creating triplicates')
     # convert kmer pairs to set for removal
+    
     kmers_in_pairs = set()
-    for a, b in dict_inform_pairs.keys():
-        kmers_in_pairs.add(a)
-        kmers_in_pairs.add(b)
+    for f in sorted(glob.glob(os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet"))):
+        t = pq.read_table(f, columns=["kmerA", "kmerB"]).to_pydict()
+        kmers_in_pairs.update(t["kmerA"])
+        kmers_in_pairs.update(t["kmerB"])
+
+    #kmers_in_pairs = set()
+    #for a, b in dict_inform_pairs.keys():
+    #    kmers_in_pairs.add(a)
+    #    kmers_in_pairs.add(b)
     print('Removing kmer in informative pairs')
     #print(kmers_in_pairs)
 
@@ -677,20 +882,17 @@ def main():
                                 basename,
                                 n_workers=args.threads,)
     if args.testmode:
-        import glob
+        
 
         print("Informative Triplets")
-        inform_parts = sorted(glob.glob(
-            os.path.join(args.output_dir, f"{basename}.inform_triplets.part*.parquet")
-        ))
+        inform_parts = sorted(glob.glob(os.path.join(args.output_dir, f"{basename}.inform_triplets.part*.parquet")))
         if inform_parts:
             print(pl.read_parquet(inform_parts))
         
-
         print('Creating coverage outputs')
         print(df_samples)
         df_cov_s = get_singleton_hits(df_samples, df_inform_singleton)
-        df_cov_p = get_pair_hits(df_samples, df_inform_pairs)
+        df_cov_p = get_pair_hits_streaming(df_samples,os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet"))
         df_cov_t = get_triple_hits_streaming(df_samples,
                                              os.path.join(args.output_dir, f"{basename}.inform_triplets.part*.parquet"),)
         df_cov = df_cov_s.join(df_cov_p, on="sample", how="left").join(df_cov_t, on="sample", how="left")

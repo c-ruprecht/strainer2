@@ -6,7 +6,7 @@ import polars as pl
 import glob
 import gc
 import argparse
-from kmer_pairs import get_singleton_hits, get_pair_hits, get_triple_hits_streaming
+from kmer_pairs import get_singleton_hits, get_pair_hits_streaming, get_triple_hits_streaming
 import warnings
 warnings.filterwarnings("ignore", module="kaleido")
 
@@ -119,8 +119,11 @@ def main():
 
     ### Pairs
     print('getting pair coverage')
-    df_kmer_pairs = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_pairs.parquet"))
-    df_cov_p = get_pair_hits(df_samples, df_kmer_pairs)
+    #df_kmer_pairs = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_pairs.parquet"))
+    #df_cov_p = get_pair_hits(df_samples, df_kmer_pairs)
+    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.part*.parquet")
+    if glob.glob(pair_glob):
+        df_cov_p = get_pair_hits_streaming(df_samples, pair_glob)
     
     ### Triples
     print('getting triplicate coverage')
