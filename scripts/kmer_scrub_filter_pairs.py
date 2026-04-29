@@ -495,7 +495,8 @@ def main():
                                                       ~(pl.col('metagenome_count') == 0))
         
         # Creating pairs rom non informative singletons
-        df_pairs = df_indiv_counts.filter(pl.col('#kmer').is_in(df_non_inform_singletons['#kmer']).implode())
+        df_pairs = df_indiv_counts.filter(pl.col('#kmer').is_in(df_non_inform_singletons['#kmer'].implode())
+                                          )
         #clean up 
         gc.collect()
         del df_global_counts, df_indiv_counts, df_non_inform_singletons, df_no_drugs
