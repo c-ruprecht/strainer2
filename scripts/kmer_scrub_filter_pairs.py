@@ -495,24 +495,23 @@ def main():
                                                       ~(pl.col('metagenome_count') == 0))
         
         # Creating pairs rom non informative singletons
-        df_pairs = df_indiv_counts.filter(pl.col('#kmer').is_in(df_non_inform_singletons['#kmer']))
+        df_pairs = df_indiv_counts.filter(pl.col('#kmer').is_in(df_non_inform_singletons['#kmer']).implode())
         #clean up 
         gc.collect()
         del df_global_counts, df_indiv_counts, df_non_inform_singletons, df_no_drugs
+        
+        print('Pivot dataframe for pair generation')
+        # drop duplicate samples
+        df_pairs=df_pairs.unique(subset=["#kmer", "sample_id"])
+        df_pairs = df_pairs.pivot(on="sample_id",index="#kmer",values="count").fill_null(0)
 
-        df_pairs = df_pairs.pivot(
-                                on="sample_id",
-                                index="#kmer",
-                                values="count",
-                                ).fill_null(0)
-
+        print('Creating pairs in parallel')
         n_inform_pairs, dict_non_inform_pairs = create_kmer_pairs_parallel(df_pairs, 
                                         args.output_dir,
                                         basename = args.basename,
                                         n_workers = args.threads)
         
-        # = create_kmer_pairs_parallel(df_w_count, args.output_dir, basename, n_workers=args.threads,)
-        #print informative pairs
+
         inform_pair_parts = sorted(glob.glob(os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")))
         if inform_pair_parts:
             df_inform_pairs = pl.concat([pl.read_parquet(p) for p in inform_pair_parts])
