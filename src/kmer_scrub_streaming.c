@@ -2,6 +2,7 @@
 #include "BIO_sequence.h"   /* must precede genome_compare.h: defines BIO_sequences */
 #include "BIO_hash.h"
 #include "genome_compare.h"
+#include "kseq.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -10,45 +11,24 @@
 #include <time.h>
 #include <stdint.h>
 #include <errno.h>
+#include <zlib.h>
 
-/*
-	GEN_calculate_kmer_count is defined in genome_compare.c but not
-	declared in genome_compare.h. Forward-declare it here so we can call
-	it without modifying the existing header.
-*/
-extern void GEN_calculate_kmer_count(const char *file, const int seed,
-                                     BIO_hash h, unsigned int vec_column);
+KSEQ_INIT(gzFile, gzread)
 
-/*
-	Number of "global" columns occupied by the existing
-	GEN_all_kmer_counts* machinery. Per-thread scratch columns start at
-	GLOBAL_COLS and run through (GLOBAL_COLS + num_threads - 1).
-*/
 #define GLOBAL_COLS 4
 
-/* ── Bounded row queue ────────────────────────────────────────────────── */
+/* ── Bounded row queue + writer thread ────────────────────────────────── */
 
-/*
-	Rows pushed by workers and consumed by the writer thread. We store a
-	pointer to the kmer string (stable for the hash's lifetime, no copy
-	needed) and a heap-allocated copy of sample_id (one allocation per
-	(sample, type) — we share a single sample_id pointer across all rows
-	for a given sample using a small ref-counted holder).
-
-	Reference counting matters here: hundreds of millions of rows can
-	share one sample_id string, and we cannot free the string until the
-	writer has drained the last row that references it.
-*/
 typedef struct sample_id_s {
-	char           *id;         /* heap-allocated, freed when refcount hits 0 */
-	char            type[3];    /* "ge", "me", "dr" — null-terminated */
-	int             refcount;   /* incremented before push, decremented in writer */
-	pthread_mutex_t mtx;        /* guards refcount */
+	char           *id;
+	char            type[3];
+	int             refcount;
+	pthread_mutex_t mtx;
 } sample_id_t;
 
 typedef struct {
-	const char  *kmer;          /* pointer into BIO_hash key, do not free */
-	sample_id_t *sid;           /* shared, ref-counted */
+	const char  *kmer;
+	sample_id_t *sid;
 	uint32_t     count;
 } row_t;
 
@@ -57,7 +37,7 @@ struct streaming_writer_s {
 	row_t           *queue;
 	size_t           cap;
 	size_t           head, tail, size;
-	int              shutdown;          /* set by streaming_writer_close */
+	int              shutdown;
 	pthread_mutex_t  mtx;
 	pthread_cond_t   not_empty;
 	pthread_cond_t   not_full;
@@ -66,7 +46,6 @@ struct streaming_writer_s {
 
 static void sample_id_unref(sample_id_t *sid);
 
-/* Writer thread: drains rows and gzwrites them. */
 static void *writer_main(void *arg)
 {
 	streaming_writer *w = (streaming_writer *)arg;
@@ -75,13 +54,10 @@ static void *writer_main(void *arg)
 		pthread_mutex_lock(&w->mtx);
 		while (w->size == 0 && !w->shutdown)
 			pthread_cond_wait(&w->not_empty, &w->mtx);
-
 		if (w->size == 0 && w->shutdown) {
 			pthread_mutex_unlock(&w->mtx);
 			break;
 		}
-
-		/* drain a chunk under the lock to amortize signaling cost */
 		row_t batch[256];
 		size_t n = 0;
 		while (n < (sizeof batch / sizeof batch[0]) && w->size > 0) {
@@ -106,19 +82,19 @@ static void *writer_main(void *arg)
 
 streaming_writer *streaming_writer_open(const char *path, size_t queue_capacity)
 {
-	if (queue_capacity == 0) queue_capacity = 1u << 20; /* ~1M rows */
+	if (queue_capacity == 0) queue_capacity = 1u << 20;
 
 	streaming_writer *w = calloc(1, sizeof(*w));
 	if (!w) return NULL;
 
-	w->gz = gzopen(path, "wb9");
+	w->gz = gzopen(path, "wb6");  /* level 6: ~3x faster than 9, ~5% bigger */
 	if (!w->gz) {
 		fprintf(stderr, "streaming_writer_open: gzopen %s failed: %s\n",
 		        path, strerror(errno));
 		free(w);
 		return NULL;
 	}
-	gzbuffer(w->gz, 1u << 20); /* 1 MiB internal buffer */
+	gzbuffer(w->gz, 1u << 20);
 
 	w->queue = calloc(queue_capacity, sizeof(row_t));
 	if (!w->queue) {
@@ -127,13 +103,10 @@ streaming_writer *streaming_writer_open(const char *path, size_t queue_capacity)
 		return NULL;
 	}
 	w->cap = queue_capacity;
-	w->head = w->tail = w->size = 0;
-	w->shutdown = 0;
 	pthread_mutex_init(&w->mtx, NULL);
 	pthread_cond_init(&w->not_empty, NULL);
 	pthread_cond_init(&w->not_full, NULL);
 
-	/* header */
 	gzprintf(w->gz, "kmer\tsample_type\tsample_id\tcount\n");
 
 	if (pthread_create(&w->writer_tid, NULL, writer_main, w) != 0) {
@@ -165,7 +138,6 @@ void streaming_writer_close(streaming_writer *w)
 	free(w);
 }
 
-/* Push one row. Blocks if the queue is full (backpressure). */
 static void writer_push(streaming_writer *w, row_t r)
 {
 	pthread_mutex_lock(&w->mtx);
@@ -188,7 +160,7 @@ static sample_id_t *sample_id_new(const char *id, const char *type)
 	if (!s->id) { perror("strdup"); exit(EXIT_FAILURE); }
 	strncpy(s->type, type, sizeof(s->type) - 1);
 	s->type[sizeof(s->type) - 1] = '\0';
-	s->refcount = 1; /* held by producer until all rows pushed */
+	s->refcount = 1;
 	pthread_mutex_init(&s->mtx, NULL);
 	return s;
 }
@@ -212,7 +184,7 @@ static void sample_id_unref(sample_id_t *s)
 	}
 }
 
-/* ── basename helpers (mirror the originals from kmer_scrub_count_individual) */
+/* ── Helpers ──────────────────────────────────────────────────────────── */
 
 static char *basename_no_ext(const char *path)
 {
@@ -241,46 +213,109 @@ static char *basename_no_ext(const char *path)
 	return out;
 }
 
-/* ── Worker thread pool ───────────────────────────────────────────────── */
+/* Forward-declared: defined in genome_compare.c but not in its header */
+extern int   contains_N(char *str);
+extern char *orient_string(char *seed_seq, char *seedStrRevComp, int seed);
+
+/*
+	Single-pass dual-counter for one file.
+
+	Reads the file once. For every k-mer hit in the reference hash:
+	  - atomically increments counts[global_col]   (pangenome / metagenome / drug)
+	  - atomically increments counts[scratch_col]  (this worker's scratch)
+
+	Both increments are atomic because this is the same column-write pattern
+	the existing GEN_calculate_kmer_count uses; other threads may be writing
+	to *different* columns of the same value vector concurrently. Different
+	memory addresses, no contention, but use the atomic for safety and
+	consistency with existing semantics.
+*/
+static void calculate_kmer_count_dual(const char *file,
+                                      const int seed,
+                                      BIO_hash h,
+                                      unsigned int global_col,
+                                      unsigned int scratch_col)
+{
+	gzFile fp = gzopen(file, "r");
+	if (fp == NULL) {
+		fprintf(stderr, "could not read file %s in calculate_kmer_count_dual()\n",
+		        file);
+		return;  /* don't crash the whole job for one bad file */
+	}
+	kseq_t *seq = kseq_init(fp);
+
+	char *seedStrRevComp = (char *)malloc(sizeof(char) * (seed + 1));
+	char *orientStr;
+	unsigned int *count = NULL;
+	char temp_nuc;
+	char *seed_seq;
+	int has_N;
+
+	while (kseq_read(seq) >= 0) {
+		if ((int)seq->seq.l < seed) continue;
+
+		BIO_stringToUpper(seq->seq.s);
+		seed_seq = seq->seq.s;
+		has_N = contains_N(seed_seq);
+
+		for (unsigned int i = 0; i < seq->seq.l - seed + 1; i++) {
+			temp_nuc = seed_seq[seed];
+			seed_seq[seed] = '\0';
+			orientStr = orient_string(seed_seq, seedStrRevComp, seed);
+
+			if (!has_N || !contains_N(orientStr)) {
+				count = (unsigned int *)BIO_searchHash(h, orientStr);
+				if (count != NULL) {
+					__sync_fetch_and_add(&count[global_col],  1);
+					__sync_fetch_and_add(&count[scratch_col], 1);
+				}
+			}
+
+			seed_seq[seed] = temp_nuc;
+			seed_seq++;
+		}
+	}
+
+	kseq_destroy(seq);
+	gzclose(fp);
+	free(seedStrRevComp);
+}
+
+/* ── Worker pool ──────────────────────────────────────────────────────── */
 
 typedef struct {
-	char *filepath;     /* heap-allocated, owned by the job */
+	char *filepath;
 } sample_job_t;
 
 typedef struct {
-	/* job queue */
 	sample_job_t   **jobs;
 	int              jhead, jtail, jsize, jcap;
 	int              shutdown;
 	pthread_mutex_t  jmtx;
 	pthread_cond_t   jhas_work;
 
-	/* worker tid assignment — atomic counter consumed by workers at start */
 	int              tid_counter;
 
-	/* shared per-call state */
 	int              seed;
 	BIO_hash         h;
 	int              num_threads;
 	streaming_writer *writer;
-	const char      *sample_type;   /* "ge" / "me" / "dr" */
-	const char      *skip_file;     /* may be NULL */
+	const char      *sample_type;
+	unsigned int     global_col;
+	const char      *skip_file;
 	FILE            *progress;
 	pthread_mutex_t  progress_mtx;
 } worker_pool_t;
 
 /*
-	Sweep the hash: for every k-mer where this thread's column is non-zero,
-	push a row to the writer and zero the column.
+	After a sample is fully counted, sweep the hash:
+	  - emit one row per non-zero scratch entry to the writer
+	  - zero the scratch column
 
-	Safety:
-	 - Each worker reads/writes only its own column index. No two workers
-	   touch the same uint32_t word.
-	 - Other workers may be concurrently incrementing *their own* columns
-	   in the same value vector. Different memory addresses, no race.
-	 - The hash structure itself (h->data, h->M, h->data[i].DATA) is
-	   read-only during this phase — no rule mutates the hash topology
-	   after seeding, and BIO_searchHash is a pure read.
+	Different workers run this concurrently for *different* scratch columns,
+	so there's no contention on the writes. Reads of h->data[i].DATA and
+	the kmer key are safe because the hash topology is read-only after
+	seeding.
 */
 static void emit_and_zero_column(BIO_hash h,
                                  unsigned int col,
@@ -295,7 +330,7 @@ static void emit_and_zero_column(BIO_hash h,
 
 		sample_id_ref(sid);
 		row_t r;
-		r.kmer  = h->data[i].key;  /* stable pointer for hash lifetime */
+		r.kmer  = h->data[i].key;
 		r.sid   = sid;
 		r.count = c;
 		writer_push(writer, r);
@@ -308,9 +343,8 @@ static void *worker_main(void *arg)
 {
 	worker_pool_t *p = (worker_pool_t *)arg;
 
-	/* claim a stable worker tid in [0, num_threads) */
 	int tid = __sync_fetch_and_add(&p->tid_counter, 1);
-	unsigned int col = (unsigned int)(GLOBAL_COLS + tid);
+	unsigned int scratch_col = (unsigned int)(GLOBAL_COLS + tid);
 
 	for (;;) {
 		pthread_mutex_lock(&p->jmtx);
@@ -327,7 +361,6 @@ static void *worker_main(void *arg)
 
 		const char *path = job->filepath;
 
-		/* skip-file convention: matches the existing -C reference dedup */
 		if (p->skip_file != NULL && strcmp(path, p->skip_file) == 0) {
 			fprintf(stderr, "skipping %s (identical match)\n", path);
 			free(job->filepath);
@@ -343,18 +376,17 @@ static void *worker_main(void *arg)
 			pthread_mutex_unlock(&p->progress_mtx);
 		}
 
-		/* derive sample_id from basename (strip .fasta.gz / .fna.gz / etc.) */
 		char *id = basename_no_ext(path);
 		sample_id_t *sid = sample_id_new(id, p->sample_type);
 		free(id);
 
-		/* count this sample into our exclusive column */
-		GEN_calculate_kmer_count(path, p->seed, p->h, col);
+		/* SINGLE PASS: read file once, increment both global + scratch */
+		calculate_kmer_count_dual(path, p->seed, p->h,
+		                          p->global_col, scratch_col);
 
-		/* emit non-zero rows and zero the column */
-		emit_and_zero_column(p->h, col, sid, p->writer);
+		/* emit + zero scratch column */
+		emit_and_zero_column(p->h, scratch_col, sid, p->writer);
 
-		/* drop our own reference; writer holds the rest */
 		sample_id_unref(sid);
 
 		free(job->filepath);
@@ -365,33 +397,32 @@ static void *worker_main(void *arg)
 
 /* ── Public entry point ───────────────────────────────────────────────── */
 
-void GEN_per_sample_kmer_counts_streaming(const char *list_path,
-                                          const char *sample_type,
-                                          int seed,
-                                          BIO_hash h,
-                                          int num_threads,
-                                          streaming_writer *writer,
-                                          FILE *progress,
-                                          const char *skip_file)
+void GEN_per_sample_kmer_counts_dual(const char *list_path,
+                                     const char *sample_type,
+                                     unsigned int global_col,
+                                     int seed,
+                                     BIO_hash h,
+                                     int num_threads,
+                                     streaming_writer *writer,
+                                     FILE *progress,
+                                     const char *skip_file)
 {
 	FILE *fp = fopen(list_path, "r");
 	if (!fp) {
 		fprintf(stderr,
-		        "GEN_per_sample_kmer_counts_streaming: cannot open %s: %s\n",
+		        "GEN_per_sample_kmer_counts_dual: cannot open %s: %s\n",
 		        list_path, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
-	/* count lines to size the job queue */
 	int nlines = 0;
 	{
 		char *line = NULL;
 		size_t cap = 0;
 		while (getline(&line, &cap, fp) != -1) {
-			/* skip blank lines */
-			char *p = line;
-			while (*p == ' ' || *p == '\t') p++;
-			if (*p != '\n' && *p != '\0') nlines++;
+			char *q = line;
+			while (*q == ' ' || *q == '\t') q++;
+			if (*q != '\n' && *q != '\0') nlines++;
 		}
 		free(line);
 		rewind(fp);
@@ -399,14 +430,13 @@ void GEN_per_sample_kmer_counts_streaming(const char *list_path,
 
 	if (nlines == 0) {
 		fclose(fp);
-		return; /* nothing to do; not an error */
+		return;
 	}
 
 	worker_pool_t p;
 	memset(&p, 0, sizeof p);
 	p.jcap        = nlines + 1;
 	p.jobs        = malloc(sizeof(sample_job_t *) * p.jcap);
-	p.jhead = p.jtail = p.jsize = 0;
 	p.shutdown    = 0;
 	p.tid_counter = 0;
 	p.seed        = seed;
@@ -414,19 +444,18 @@ void GEN_per_sample_kmer_counts_streaming(const char *list_path,
 	p.num_threads = num_threads;
 	p.writer      = writer;
 	p.sample_type = sample_type;
+	p.global_col  = global_col;
 	p.skip_file   = skip_file;
 	p.progress    = progress;
 	pthread_mutex_init(&p.jmtx, NULL);
 	pthread_cond_init(&p.jhas_work, NULL);
 	pthread_mutex_init(&p.progress_mtx, NULL);
 
-	/* enqueue all samples up front */
 	{
 		char *line = NULL;
 		size_t cap = 0;
 		ssize_t n;
 		while ((n = getline(&line, &cap, fp)) != -1) {
-			/* trim trailing newline / whitespace */
 			while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r' ||
 			                 line[n-1] == ' '  || line[n-1] == '\t'))
 				line[--n] = '\0';
@@ -442,12 +471,10 @@ void GEN_per_sample_kmer_counts_streaming(const char *list_path,
 	}
 	fclose(fp);
 
-	/* launch workers */
 	pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
 	for (int i = 0; i < num_threads; i++)
 		pthread_create(&threads[i], NULL, worker_main, &p);
 
-	/* signal shutdown — workers will exit once the queue drains */
 	pthread_mutex_lock(&p.jmtx);
 	p.shutdown = 1;
 	pthread_cond_broadcast(&p.jhas_work);

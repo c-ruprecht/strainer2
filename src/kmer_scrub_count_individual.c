@@ -4,44 +4,43 @@
 #include <string.h>
 #include <unistd.h>
 #include <inttypes.h>
-#include "kseq.h"
 #include "BIO_sequence.h"
 #include "BIO_hash.h"
 #include "genome_compare.h"
 #include "kmer_scrub_streaming.h"
 
-KSEQ_INIT(gzFile, gzread)
-
 /*
-	kmer_scrub_count_individual
+	kmer_scrub_count_individual (single-pass variant)
 
-	Same CLI as before. Two output streams:
+	Same CLI as before. Same outputs:
 
-	  1) Global counts to stdout (TSV) — unchanged:
+	  1) Global counts to stdout (TSV) — unchanged format:
 	       #kmer  reference_count  pangenome_count  metagenome_count  [drug_count]
 
 	  2) Per-sample counts as a long-format gzipped TSV via -o:
 	       kmer  sample_type  sample_id  count
-	     where sample_type ∈ {ge, me, dr} and sample_id is the basename of
-	     the input file with extensions stripped.
 
-	Memory model
-	------------
-	Hash value vector layout per k-mer is (4 + num_threads) columns:
-	  [0..3]                  global counts (ref, pan, meta, drug)
-	  [4 .. 4+T-1]            per-thread scratch — exclusively owned by
-	                          worker thread tid
+	Architectural change vs the previous (two-pass) version
+	-------------------------------------------------------
+	Previously: Phase 1 read every input file to fill global cols 1/2/3,
+	then Phase 2 read every input file again to fill per-sample cols.
+	Each file was opened and decompressed twice.
 
-	Per-sample output is streamed: each worker counts a sample into its
-	own column, sweeps the hash to emit non-zero rows for that sample,
-	zeros its column, and moves on to the next sample. A single dedicated
-	writer thread owns the gzFile.
+	Now: a single pass per input file. Each worker's k-mer counter writes
+	to BOTH the global column (1, 2, or 3) and its scratch column
+	(4 + tid) on every k-mer match. After finishing a file, the worker
+	sweeps the hash to emit non-zero rows for its scratch column and
+	zero them, exactly as before.
 
-	Memory is therefore O(n_kmers × (4 + T)) regardless of the number of
-	samples in -A / -B / -C.
+	Wall-clock impact: roughly 2x speedup on I/O-bound workloads (which
+	is everything at this scale, since metagenome decompression dominates).
+
+	Memory model — unchanged:
+	  Hash value vector has (4 + num_threads) columns.
+	  Memory cost is O(n_kmers x (4 + T)), independent of n_samples.
 */
 
-#define N_GLOBAL_COLS 4   /* ref, pan, meta, drug */
+#define N_GLOBAL_COLS 4
 
 static void usage(void);
 static void print_hash_counts(BIO_hash seqHash, const char *C_file);
@@ -49,12 +48,12 @@ static void print_hash_counts(BIO_hash seqHash, const char *C_file);
 int main(int argc, char *argv[])
 {
 	BIO_hash seqHash;
-	char *A_file = NULL;       /* list of genome filenames */
-	char *B_file = NULL;       /* list of metagenome filenames */
-	char *C_file = NULL;       /* list of drug-strain genome filenames (optional) */
-	char *r_file = NULL;       /* reference genome */
-	char *p_file = NULL;       /* progress log (optional) */
-	char *o_file = NULL;       /* per-sample long TSV.gz output (optional) */
+	char *A_file = NULL;
+	char *B_file = NULL;
+	char *C_file = NULL;
+	char *r_file = NULL;
+	char *p_file = NULL;
+	char *o_file = NULL;
 	const int seed = 31;
 	const int default_hash_val = 1;
 	const int default_hash_increment = 1;
@@ -92,9 +91,8 @@ int main(int argc, char *argv[])
 	}
 
 	/*
-		Hash size: 4 global columns + one scratch column per worker
-		thread. This is the entire memory cost of per-sample tracking
-		and is independent of the number of samples in -A/-B/-C.
+		Hash size: 4 global columns + one scratch column per worker thread.
+		Independent of n_samples — that's the whole point.
 	*/
 	const int size_of_hash_vec = N_GLOBAL_COLS + num_threads;
 
@@ -105,33 +103,44 @@ int main(int argc, char *argv[])
 	                                 default_hash_val, default_hash_increment,
 	                                 0, size_of_hash_vec);
 
-	/* --- Phase 1: global counts (columns 1, 2, 3) — unchanged API --- */
-	GEN_all_kmer_counts(A_file, seed, seqHash, 1, progress, num_threads);
-	GEN_all_kmer_counts(B_file, seed, seqHash, 2, progress, num_threads);
-	if (C_file)
-		GEN_all_kmer_counts_skip_file(C_file, r_file, seed, seqHash, 3,
-		                              progress, num_threads);
+	/*
+		Single pass per list. Each call:
+		  - reads each file in the list once
+		  - increments counts[global_col] AND counts[4 + tid] per k-mer hit
+		  - emits non-zero scratch rows + zeros the column per sample
 
-	/* --- Phase 2: per-sample counts streamed to gzipped TSV --- */
-	if (o_file) {
-		streaming_writer *w = streaming_writer_open(o_file, 0);
-		if (!w) {
-			fprintf(stderr, "could not open per-sample output %s\n", o_file);
-			exit(EXIT_FAILURE);
-		}
-
-		GEN_per_sample_kmer_counts_streaming(A_file, "ge", seed, seqHash,
-		                                     num_threads, w, progress, NULL);
-		GEN_per_sample_kmer_counts_streaming(B_file, "me", seed, seqHash,
-		                                     num_threads, w, progress, NULL);
-		if (C_file)
-			GEN_per_sample_kmer_counts_streaming(C_file, "dr", seed, seqHash,
-			                                     num_threads, w, progress, r_file);
-
-		streaming_writer_close(w);
+		The -o flag is required for this binary; without per-sample
+		output there's no reason to use _individual over the original
+		kmer_scrub_count.
+	*/
+	if (!o_file) {
+		fprintf(stderr, "error: -o is required for kmer_scrub_count_individual\n");
+		fprintf(stderr, "       (use kmer_scrub_count if you only need globals)\n");
+		exit(EXIT_FAILURE);
 	}
 
-	/* --- output 1: global counts to stdout (unchanged format) --- */
+	streaming_writer *w = streaming_writer_open(o_file, 0);
+	if (!w) {
+		fprintf(stderr, "could not open per-sample output %s\n", o_file);
+		exit(EXIT_FAILURE);
+	}
+
+	/* -A → pangenome (col 1) + ge rows */
+	GEN_per_sample_kmer_counts_dual(A_file, "ge", 1, seed, seqHash,
+	                                num_threads, w, progress, NULL);
+
+	/* -B → metagenome (col 2) + me rows */
+	GEN_per_sample_kmer_counts_dual(B_file, "me", 2, seed, seqHash,
+	                                num_threads, w, progress, NULL);
+
+	/* -C → drug (col 3) + dr rows; reference-skip preserved */
+	if (C_file)
+		GEN_per_sample_kmer_counts_dual(C_file, "dr", 3, seed, seqHash,
+		                                num_threads, w, progress, r_file);
+
+	streaming_writer_close(w);
+
+	/* global counts to stdout (unchanged format) */
 	print_hash_counts(seqHash, C_file);
 
 	/* cleanup */
@@ -154,14 +163,15 @@ static void usage(void)
 	    "                        -A <file listing genome filenames>\n"
 	    "                        -B <file listing metagenome filenames>\n"
 	    "                       [-C <file listing drug-strain genome filenames>]\n"
-	    "                       [-o <per-sample long-format output, .tsv.gz>]\n"
+	    "                        -o <per-sample long-format output, .tsv.gz>  REQUIRED\n"
 	    "                       [-p <progress log file>]\n"
 	    "                       [-t <num threads, default 4>]\n"
 	    "\n"
 	    "  stdout: global counts (kmer, ref, pangenome, metagenome[, drug])\n"
 	    "  -o:     long-format gzipped TSV (kmer, sample_type, sample_id, count)\n"
-	    "          sample_type \xe2\x88\x88 {ge, me, dr}; load with polars.scan_csv.\n"
-	    "          Memory bounded by O(n_kmers \xc3\x97 (4 + threads)).\n");
+	    "          sample_type in {ge, me, dr}; load with polars.scan_csv.\n"
+	    "  Each input file is read exactly once. Memory bounded by\n"
+	    "  O(n_kmers x (4 + threads)).\n");
 	exit(1);
 }
 
