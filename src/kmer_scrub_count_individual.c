@@ -8,58 +8,43 @@
 #include "BIO_sequence.h"
 #include "BIO_hash.h"
 #include "genome_compare.h"
+#include "kmer_scrub_streaming.h"
 
 KSEQ_INIT(gzFile, gzread)
 
 /*
-	kmer_scrub_count
+	kmer_scrub_count_individual
 
-	Outputs:
-	  1. Global counts to stdout (TSV) — unchanged from previous version:
+	Same CLI as before. Two output streams:
+
+	  1) Global counts to stdout (TSV) — unchanged:
 	       #kmer  reference_count  pangenome_count  metagenome_count  [drug_count]
 
-	  2. (NEW) Per-sample counts as a long-format gzipped TSV via -o:
+	  2) Per-sample counts as a long-format gzipped TSV via -o:
 	       kmer  sample_type  sample_id  count
 	     where sample_type ∈ {ge, me, dr} and sample_id is the basename of
-	     the input file with extensions stripped. Streamable into Polars:
-	       pl.scan_csv("out.tsv.gz", separator="\t")
+	     the input file with extensions stripped.
 
-	Hash value layout (per kmer):
-	  [0] reference count
-	  [1] pangenome (global) count
-	  [2] metagenome (global) count
-	  [3] drug (global) count
-	  [4 .. 4+nA-1]            per-genome sample counts        (ge_*)
-	  [4+nA .. 4+nA+nB-1]      per-metagenome sample counts    (me_*)
-	  [4+nA+nB .. ...]         per-drug-genome sample counts   (dr_*)
+	Memory model
+	------------
+	Hash value vector layout per k-mer is (4 + num_threads) columns:
+	  [0..3]                  global counts (ref, pan, meta, drug)
+	  [4 .. 4+T-1]            per-thread scratch — exclusively owned by
+	                          worker thread tid
 
-	Race conditions:
-	  Per-sample columns are disjoint, so threads from the worker pool
-	  processing different samples never contend on the same word. Within a
-	  single sample the existing __sync_fetch_and_add in
-	  GEN_calculate_kmer_count handles same-slot increments atomically.
+	Per-sample output is streamed: each worker counts a sample into its
+	own column, sweeps the hash to emit non-zero rows for that sample,
+	zeros its column, and moves on to the next sample. A single dedicated
+	writer thread owns the gzFile.
+
+	Memory is therefore O(n_kmers × (4 + T)) regardless of the number of
+	samples in -A / -B / -C.
 */
 
 #define N_GLOBAL_COLS 4   /* ref, pan, meta, drug */
 
-void usage();
-void print_hash_counts(BIO_hash seqHash, const char *C_file);
-void write_per_sample_long_tsv_gz(BIO_hash seqHash,
-                                  char **ge_ids, int n_ge,
-                                  char **me_ids, int n_me,
-                                  char **dr_ids, int n_dr,
-                                  const char *out_path);
-
-/* helpers for sample list bookkeeping */
-static char **read_file_list(const char *list_path, int *n_out);
-static char  *basename_no_ext(const char *path);
-static void   free_str_array(char **arr, int n);
-
-/* declared in genome_compare.c (and should be added to genome_compare.h) */
-extern void GEN_per_sample_kmer_counts(const char *list_file, const int seed,
-                                       BIO_hash seqHash, unsigned int base_column,
-                                       FILE *progress, int num_threads,
-                                       const char *skip_file);
+static void usage(void);
+static void print_hash_counts(BIO_hash seqHash, const char *C_file);
 
 int main(int argc, char *argv[])
 {
@@ -95,6 +80,7 @@ int main(int argc, char *argv[])
 		usage();
 		return 1;
 	}
+	if (num_threads < 1) num_threads = 1;
 
 	if (p_file != NULL) {
 		progress = fopen(p_file, "w");
@@ -105,81 +91,51 @@ int main(int argc, char *argv[])
 		fprintf(progress, "adding kmer counts for:\n");
 	}
 
-	/* --- read sample lists so we know how many per-sample columns to allocate --- */
-	int n_ge = 0, n_me = 0, n_dr = 0;
-	char **ge_files = read_file_list(A_file, &n_ge);
-	char **me_files = read_file_list(B_file, &n_me);
-	char **dr_files = NULL;
-	if (C_file) dr_files = read_file_list(C_file, &n_dr);
-
-	if (n_ge == 0 || n_me == 0) {
-		fprintf(stderr, "empty sample list in -A or -B\n");
-		exit(EXIT_FAILURE);
-	}
-
-	/* derive sample IDs from basenames */
-	char **ge_ids = malloc(sizeof(char*) * n_ge);
-	char **me_ids = malloc(sizeof(char*) * n_me);
-	char **dr_ids = (n_dr > 0) ? malloc(sizeof(char*) * n_dr) : NULL;
-	for (int i = 0; i < n_ge; i++) ge_ids[i] = basename_no_ext(ge_files[i]);
-	for (int i = 0; i < n_me; i++) me_ids[i] = basename_no_ext(me_files[i]);
-	for (int i = 0; i < n_dr; i++) dr_ids[i] = basename_no_ext(dr_files[i]);
-
-	/* total columns in the count vector */
-	const int size_of_hash_vec = N_GLOBAL_COLS + n_ge + n_me + n_dr;
-
-	const unsigned int GE_BASE = N_GLOBAL_COLS;
-	const unsigned int ME_BASE = GE_BASE + n_ge;
-	const unsigned int DR_BASE = ME_BASE + n_me;
+	/*
+		Hash size: 4 global columns + one scratch column per worker
+		thread. This is the entire memory cost of per-sample tracking
+		and is independent of the number of samples in -A/-B/-C.
+	*/
+	const int size_of_hash_vec = N_GLOBAL_COLS + num_threads;
 
 	seqHash = BIO_initHash(DEFAULT_GENOME_HASH_SIZE);
 
-	/* seed the hash with reference kmers (column 0) */
+	/* seed the hash with reference k-mers (column 0) */
 	GEN_hash_sequences_set_count_vec(r_file, seed, seqHash,
 	                                 default_hash_val, default_hash_increment,
 	                                 0, size_of_hash_vec);
 
-	/* --- global counts: existing API, fills columns 1, 2, 3 --- */
+	/* --- Phase 1: global counts (columns 1, 2, 3) — unchanged API --- */
 	GEN_all_kmer_counts(A_file, seed, seqHash, 1, progress, num_threads);
 	GEN_all_kmer_counts(B_file, seed, seqHash, 2, progress, num_threads);
 	if (C_file)
 		GEN_all_kmer_counts_skip_file(C_file, r_file, seed, seqHash, 3,
 		                              progress, num_threads);
 
-	/* --- per-sample counts: each file → its own dedicated column.
-	   Pooled in parallel just like the global counts. Disjoint columns
-	   eliminate inter-sample races; intra-sample races are handled by
-	   the atomic increment in GEN_calculate_kmer_count. --- */
+	/* --- Phase 2: per-sample counts streamed to gzipped TSV --- */
 	if (o_file) {
-		GEN_per_sample_kmer_counts(A_file, seed, seqHash, GE_BASE,
-		                           progress, num_threads, NULL);
-		GEN_per_sample_kmer_counts(B_file, seed, seqHash, ME_BASE,
-		                           progress, num_threads, NULL);
+		streaming_writer *w = streaming_writer_open(o_file, 0);
+		if (!w) {
+			fprintf(stderr, "could not open per-sample output %s\n", o_file);
+			exit(EXIT_FAILURE);
+		}
+
+		GEN_per_sample_kmer_counts_streaming(A_file, "ge", seed, seqHash,
+		                                     num_threads, w, progress, NULL);
+		GEN_per_sample_kmer_counts_streaming(B_file, "me", seed, seqHash,
+		                                     num_threads, w, progress, NULL);
 		if (C_file)
-			GEN_per_sample_kmer_counts(C_file, seed, seqHash, DR_BASE,
-			                           progress, num_threads, r_file);
+			GEN_per_sample_kmer_counts_streaming(C_file, "dr", seed, seqHash,
+			                                     num_threads, w, progress, r_file);
+
+		streaming_writer_close(w);
 	}
 
 	/* --- output 1: global counts to stdout (unchanged format) --- */
 	print_hash_counts(seqHash, C_file);
 
-	/* --- output 2: long-format gzipped TSV of per-sample counts --- */
-	if (o_file) {
-		write_per_sample_long_tsv_gz(seqHash,
-		                             ge_ids, n_ge,
-		                             me_ids, n_me,
-		                             dr_ids, n_dr,
-		                             o_file);
-	}
-
 	/* cleanup */
 	BIO_destroyHashD(seqHash);
-	free_str_array(ge_files, n_ge);
-	free_str_array(me_files, n_me);
-	free_str_array(dr_files, n_dr);
-	free_str_array(ge_ids, n_ge);
-	free_str_array(me_ids, n_me);
-	free_str_array(dr_ids, n_dr);
 	free(A_file);
 	free(B_file);
 	free(C_file);
@@ -190,10 +146,11 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
-void usage()
+static void usage(void)
 {
 	fprintf(stderr,
-	    "Usage: kmer_scrub_count -r <reference genome>\n"
+	    "Usage: kmer_scrub_count_individual\n"
+	    "                        -r <reference genome>\n"
 	    "                        -A <file listing genome filenames>\n"
 	    "                        -B <file listing metagenome filenames>\n"
 	    "                       [-C <file listing drug-strain genome filenames>]\n"
@@ -203,12 +160,12 @@ void usage()
 	    "\n"
 	    "  stdout: global counts (kmer, ref, pangenome, metagenome[, drug])\n"
 	    "  -o:     long-format gzipped TSV (kmer, sample_type, sample_id, count)\n"
-	    "          sample_type ∈ {ge, me, dr}; load with polars.scan_csv.\n");
+	    "          sample_type \xe2\x88\x88 {ge, me, dr}; load with polars.scan_csv.\n"
+	    "          Memory bounded by O(n_kmers \xc3\x97 (4 + threads)).\n");
 	exit(1);
 }
 
-/* unchanged: writes the original global-counts TSV to stdout */
-void print_hash_counts(BIO_hash seqHash, const char *C_file)
+static void print_hash_counts(BIO_hash seqHash, const char *C_file)
 {
 	char **allKeys = BIO_getHashKeys(seqHash);
 	int hash_size = BIO_getHashSize(seqHash);
@@ -229,129 +186,4 @@ void print_hash_counts(BIO_hash seqHash, const char *C_file)
 			       allKeys[i], counts[0], counts[1], counts[2]);
 	}
 	BIO_destroyHashKeys(allKeys);
-}
-
-/*
-	Long-format per-sample writer.
-
-	One row per (kmer, sample) pair where count > 0. Skipping zeros keeps
-	the file small — most kmers are absent from most samples — and Polars
-	handles the implicit zeros via pivot/fill_null on the consumer side.
-	If you want dense output, remove the `if (c == 0) continue;` lines.
-
-	Writes via gzopen at level 9 (max compression) so the file streams
-	directly into pl.scan_csv("...tsv.gz", separator="\t").
-*/
-void write_per_sample_long_tsv_gz(BIO_hash seqHash,
-                                  char **ge_ids, int n_ge,
-                                  char **me_ids, int n_me,
-                                  char **dr_ids, int n_dr,
-                                  const char *out_path)
-{
-	gzFile gz = gzopen(out_path, "wb9");
-	if (!gz) {
-		fprintf(stderr, "could not open %s for writing\n", out_path);
-		exit(EXIT_FAILURE);
-	}
-	/* larger internal buffer = fewer syscalls on big writes */
-	gzbuffer(gz, 1 << 20);
-
-	/* header */
-	gzprintf(gz, "kmer\tsample_type\tsample_id\tcount\n");
-
-	const int GE_BASE = N_GLOBAL_COLS;
-	const int ME_BASE = GE_BASE + n_ge;
-	const int DR_BASE = ME_BASE + n_me;
-
-	char **allKeys = BIO_getHashKeys(seqHash);
-	int hash_size = BIO_getHashSize(seqHash);
-
-	for (unsigned int i = 0; i < (unsigned int)hash_size; i++) {
-		unsigned int *counts =
-		    (unsigned int*)BIO_searchHash(seqHash, allKeys[i]);
-		const char *kmer = allKeys[i];
-
-		for (int j = 0; j < n_ge; j++) {
-			unsigned int c = counts[GE_BASE + j];
-			if (c == 0) continue;
-			gzprintf(gz, "%s\tge\t%s\t%u\n", kmer, ge_ids[j], c);
-		}
-		for (int j = 0; j < n_me; j++) {
-			unsigned int c = counts[ME_BASE + j];
-			if (c == 0) continue;
-			gzprintf(gz, "%s\tme\t%s\t%u\n", kmer, me_ids[j], c);
-		}
-		for (int j = 0; j < n_dr; j++) {
-			unsigned int c = counts[DR_BASE + j];
-			if (c == 0) continue;
-			gzprintf(gz, "%s\tdr\t%s\t%u\n", kmer, dr_ids[j], c);
-		}
-	}
-
-	BIO_destroyHashKeys(allKeys);
-	gzclose(gz);
-}
-
-/* --- small helpers ----------------------------------------------------- */
-
-static char **read_file_list(const char *list_path, int *n_out)
-{
-	FILE *f = fopen(list_path, "r");
-	if (!f) {
-		fprintf(stderr, "could not open list file %s\n", list_path);
-		exit(EXIT_FAILURE);
-	}
-	int cap = 64, n = 0;
-	char **arr = malloc(sizeof(char*) * cap);
-	char buf[4096];
-	while (fgets(buf, sizeof(buf), f)) {
-		size_t len = strlen(buf);
-		while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' ||
-		                   buf[len-1] == ' '  || buf[len-1] == '\t'))
-			buf[--len] = '\0';
-		if (len == 0) continue;
-		if (n == cap) {
-			cap *= 2;
-			arr = realloc(arr, sizeof(char*) * cap);
-		}
-		arr[n++] = strdup(buf);
-	}
-	fclose(f);
-	*n_out = n;
-	return arr;
-}
-
-/* basename without directory and stripping common compression / fasta exts */
-static char *basename_no_ext(const char *path)
-{
-	const char *base = strrchr(path, '/');
-	base = base ? base + 1 : path;
-	char *out = strdup(base);
-
-	/* peel off up to two extensions: .fasta.gz, .fa.gz, .fastq.gz, .fna.gz, etc. */
-	for (int pass = 0; pass < 2; pass++) {
-		char *dot = strrchr(out, '.');
-		if (!dot) break;
-		const char *ext = dot + 1;
-		if (strcmp(ext, "gz")    == 0 ||
-		    strcmp(ext, "bz2")   == 0 ||
-		    strcmp(ext, "xz")    == 0 ||
-		    strcmp(ext, "fa")    == 0 ||
-		    strcmp(ext, "fna")   == 0 ||
-		    strcmp(ext, "ffn")   == 0 ||
-		    strcmp(ext, "fasta") == 0 ||
-		    strcmp(ext, "fastq") == 0 ||
-		    strcmp(ext, "fq")    == 0)
-			*dot = '\0';
-		else
-			break;
-	}
-	return out;
-}
-
-static void free_str_array(char **arr, int n)
-{
-	if (!arr) return;
-	for (int i = 0; i < n; i++) free(arr[i]);
-	free(arr);
 }

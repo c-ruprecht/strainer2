@@ -15,7 +15,7 @@ genome_compare: main.o $(shared_obj)
 kmer_scrub_count: kmer_scrub_count.o $(shared_obj)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-kmer_scrub_count_individual: kmer_scrub_count_individual.o $(shared_obj)
+kmer_scrub_count_individual: kmer_scrub_count_individual.o kmer_scrub_streaming.o $(shared_obj)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 strain_detect: strain_detect.o $(shared_obj)
