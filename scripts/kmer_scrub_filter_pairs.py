@@ -9,7 +9,7 @@ import argparse
 import gzip
 import os
 import sys
-
+import time
 import numpy as np
 import ahocorasick
 import pandas as pd
@@ -27,56 +27,240 @@ import glob
 import subprocess
 import math
 
+from collections import defaultdict
+from itertools import combinations
 
 import subprocess
 import os
 import polars as pl
 import shutil
+import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
+import numpy as np
+from itertools import combinations
+import os
+from collections import defaultdict
 
-def drop_high_similarity_scrubs(input_path, total_counts, output_dir, threads=12, threshold=0.96):
+def _process_kmer_partition(args):
+    filtered_path, prefixes, keep_kmers_subset, strain_index = args
+
+    sig_dict = {}
+    plen = len(prefixes[0])
+    
+    # one scan per worker, prefix filter only — pushed down into parquet
+    batch_iter = (
+        pl.scan_parquet(filtered_path)
+          .filter(pl.col('#kmer').str.slice(0, plen).is_in(prefixes))
+          .collect_batches()
+    )
+
+    for batch in batch_iter:
+        kmers = batch['#kmer'].to_list()
+        samples = batch['sample_id'].to_list()
+        for k, s in zip(kmers, samples):
+            if k not in keep_kmers_subset:
+                continue
+            sidx = strain_index[s]
+            st = sig_dict.get(k)
+            if st is None:
+                sig_dict[k] = {sidx}
+            else:
+                st.add(sidx)
+
+    return {k: sorted(v) for k, v in sig_dict.items()}
+
+def build_signatures_from_long(df_long, kmer_col="#kmer", strain_col="sample_id"):
+    """From long-format presence data, produce signature equivalence classes.
+
+    Returns:
+      sig_df: Polars DataFrame with columns [sig_id, n_kmers, strain_set (list[int]), n_strains]
+      kmer_to_sig: Polars DataFrame [#kmer, sig_id]
+      strain_index: dict mapping strain name -> int (for strain_set encoding)
+    """
+    strains = df_long[strain_col].unique().sort().to_list()
+    strain_index = {s: i for i, s in enumerate(strains)}
+
+    # one row per kmer with its sorted list of strain indices = canonical signature
+    kmer_sigs = (
+        df_long
+        .with_columns(pl.col(strain_col).replace_strict(strain_index).alias("_sidx"))
+        .group_by(kmer_col)
+        .agg(pl.col("_sidx").sort().alias("strain_set"))
+        .with_columns(pl.col("strain_set").list.len().alias("n_strains"))
+    )
+
+    # group kmers by identical signatures
+    sig_df = (
+        kmer_sigs
+        .group_by("strain_set")
+        .agg([
+            pl.col(kmer_col).alias("kmers"),
+            pl.col(kmer_col).len().alias("n_kmers"),
+            pl.col("n_strains").first(),
+        ])
+        .with_row_index("sig_id")
+    )
+
+    kmer_to_sig = (
+        sig_df.explode("kmers")
+              .select(pl.col("kmers").alias(kmer_col), "sig_id")
+    )
+
+    print(f"  {kmer_sigs.height:,} k-mers → {sig_df.height:,} unique signatures "
+          f"({kmer_sigs.height / sig_df.height:.1f}x compression)")
+    return sig_df, kmer_to_sig, strain_index
+
+_PAIR_SCHEMA = pa.schema([
+("kmerA", pa.string()),
+("kmerB", pa.string()),
+("sig_a", pa.uint32()),
+("sig_b", pa.uint32()),
+])
+
+
+def find_informative_pairs(sig_df, output_dir, basename, batch_size=1_000_000):
+    """Informative pair = two signatures with disjoint strain sets.
+    Expand each informative signature pair into all kmer × kmer products.
+    """
+    sigs = sig_df.sort("sig_id")
+    sig_sets = [frozenset(s) for s in sigs["strain_set"].to_list()]
+    sig_kmers = sigs["kmers"].to_list()
+    sig_ids = sigs["sig_id"].to_list()
+    n_sig = len(sig_sets)
+
+    inform_path = os.path.join(output_dir, f"{basename}.inform_kmer_pairs.parquet")
+    writer = pq.ParquetWriter(inform_path, _PAIR_SCHEMA, compression="zstd")
+
+    a_buf, b_buf, sa_buf, sb_buf = [], [], [], []
+    n_inform = 0
+
+    def flush():
+        nonlocal a_buf, b_buf, sa_buf, sb_buf
+        if not a_buf:
+            return
+        writer.write_table(pa.table(
+            {"kmerA": a_buf, "kmerB": b_buf, "sig_a": sa_buf, "sig_b": sb_buf},
+            schema=_PAIR_SCHEMA,
+        ))
+        a_buf, b_buf, sa_buf, sb_buf = [], [], [], []
+
+    print(f"  Scanning {n_sig*(n_sig-1)//2:,} signature pairs", flush=True)
+    for i, j in combinations(range(n_sig), 2):
+        if sig_sets[i].isdisjoint(sig_sets[j]):
+            # expand to all kmer pairs in this signature × signature block
+            ka_list, kb_list = sig_kmers[i], sig_kmers[j]
+            sid_a, sid_b = sig_ids[i], sig_ids[j]
+            for ka in ka_list:
+                for kb in kb_list:
+                    a, b = (ka, kb) if ka < kb else (kb, ka)
+                    a_buf.append(a); b_buf.append(b)
+                    sa_buf.append(sid_a); sb_buf.append(sid_b)
+                    n_inform += 1
+                    if len(a_buf) >= batch_size:
+                        flush()
+
+    flush()
+    writer.close()
+    print(f"  Informative pairs: {n_inform:,}", flush=True)
+    return n_inform
+_TRIP_SCHEMA = pa.schema([
+    ("kmerA", pa.string()), ("kmerB", pa.string()), ("kmerC", pa.string()),
+    ("sig_a", pa.uint32()), ("sig_b", pa.uint32()), ("sig_c", pa.uint32()),
+])
+
+
+def find_informative_triplets(
+    sig_df, output_dir, basename,
+    used_kmers=None,                 # set of k-mers already in informative pairs
+    batch_size=1_000_000,
+    max_kmers_per_sig=None,
+):
+    """Informative triplet = three signatures whose 3-way intersection is empty.
+    
+    used_kmers: optional set of k-mers to exclude (e.g. those already in pairs).
+                Signatures left with zero remaining k-mers are dropped.
+    """
+    sigs = sig_df.sort("sig_id").to_dicts()
+    
+    # filter out used k-mers; drop signatures that empty out
+    pruned = []
+    for row in sigs:
+        kept = row["kmers"] if used_kmers is None else [k for k in row["kmers"] if k not in used_kmers]
+        if kept:
+            if max_kmers_per_sig is not None:
+                kept = kept[:max_kmers_per_sig]
+            pruned.append({
+                "sig_id": row["sig_id"],
+                "strain_set": frozenset(row["strain_set"]),
+                "kmers": kept,
+            })
+    
+    n_sig = len(pruned)
+    print(f"  Triplet search over {n_sig} signatures (after dropping pair-used k-mers)", flush=True)
+    if n_sig < 3:
+        print("  Fewer than 3 signatures remaining — no triplets possible.", flush=True)
+        return 0
+
+    inform_path = os.path.join(output_dir, f"{basename}.inform_kmer_triplets.parquet")
+    writer = pq.ParquetWriter(inform_path, _TRIP_SCHEMA, compression="zstd")
+
+    a_buf, b_buf, c_buf = [], [], []
+    sa_buf, sb_buf, sc_buf = [], [], []
+    n_inform = 0
+
+    def flush():
+        nonlocal a_buf, b_buf, c_buf, sa_buf, sb_buf, sc_buf
+        if not a_buf:
+            return
+        writer.write_table(pa.table({
+            "kmerA": a_buf, "kmerB": b_buf, "kmerC": c_buf,
+            "sig_a": sa_buf, "sig_b": sb_buf, "sig_c": sc_buf,
+        }, schema=_TRIP_SCHEMA))
+        a_buf, b_buf, c_buf = [], [], []
+        sa_buf, sb_buf, sc_buf = [], [], []
+
+    for i, j in combinations(range(n_sig), 2):
+        sij = pruned[i]["strain_set"] & pruned[j]["strain_set"]
+        for k in range(j + 1, n_sig):
+            if sij.isdisjoint(pruned[k]["strain_set"]):
+                sid_i, sid_j, sid_k = pruned[i]["sig_id"], pruned[j]["sig_id"], pruned[k]["sig_id"]
+                for ka in pruned[i]["kmers"]:
+                    for kb in pruned[j]["kmers"]:
+                        for kc in pruned[k]["kmers"]:
+                            trip = sorted([(ka, sid_i), (kb, sid_j), (kc, sid_k)])
+                            a_buf.append(trip[0][0]); b_buf.append(trip[1][0]); c_buf.append(trip[2][0])
+                            sa_buf.append(trip[0][1]); sb_buf.append(trip[1][1]); sc_buf.append(trip[2][1])
+                            n_inform += 1
+                            if len(a_buf) >= batch_size:
+                                flush()
+
+    flush()
+    writer.close()
+    print(f"  Informative triplets: {n_inform:,}", flush=True)
+    return n_inform
+
+def drop_high_similarity_scrubs(input_path, total_counts, output_dir, threads=12, threshold=[0.01, 0.96]):
     print(f'Checking for highly similar strains')
     print(f'threshold: {threshold}')
     print(f'Total unique kmers of target strain: {total_counts}')
     print(f'threads: {threads}')
 
-    path_counts = os.path.join(output_dir, 'similarity_counts.tsv')
-
-    # Use pigz if available — parallel gzip decompression
-    if input_path.endswith('.zst') or input_path.endswith('.zstd'):
-        decompress = "zstd -dc -T0"
-    elif input_path.endswith('.gz'):
-        decompress = "pigz -dc -p 4" if shutil.which("pigz") else "zcat"
-    else:
-        raise ValueError(f"Unknown compression for {input_path}")    # Read header
-    header_line = subprocess.check_output(
-        f"{decompress} {input_path} | head -1", shell=True, text=True
-    ).strip()
-    header = header_line.split("\t")
-    kmer_col = header.index("kmer") + 1
-    sample_col = header.index("sample_id") + 1
-    print(f'kmer col: {kmer_col}, sample_id col: {sample_col}')
-
-    # Sort gets most of the threads; pigz gets a few; awk is single-threaded but fast
-    sort_threads = max(1, threads - 4)
-    sort_mem = f"{max(2, threads // 2)}G"  # scale memory budget with threads
-
-    cmd = f"""
-    set -euo pipefail
-    {decompress} {input_path} \
-      | tail -n +2 \
-      | awk -F'\\t' -v s={sample_col} -v k={kmer_col} 'BEGIN{{OFS="\\t"}} {{print $s, $k}}' \
-      | LC_ALL=C sort -u --parallel={sort_threads} -S {sort_mem} -T {output_dir} \
-      | awk -F'\\t' 'BEGIN{{OFS="\\t"; print "sample_id","num_unique_kmers"}}
-                     {{ if ($1 != prev) {{ if (prev != "") print prev, n; prev = $1; n = 0 }}
-                        n++ }}
-                     END{{ if (prev != "") print prev, n }}' \
-      > {path_counts}
-    """
-    subprocess.run(["bash", "-c", cmd], check=True)
-
-    df = pl.read_csv(path_counts, separator="\t")
+    df = pd.read_csv(input_path, sep = '\t')
     print(df)
-    return df
+    df_over = df.loc[(df['coverage_pct']>= threshold[1]) | (df['coverage_pct'] <= threshold[0])]
+    fig = px.histogram(df,
+                    x = 'coverage_pct',
+                    log_y = True,
+                    template = 'simple_white')
+    fig.add_vrect(x0= threshold[0],x1 = threshold[1],
+                  fillcolor="green", opacity=0.25, line_width=0,
+                  annotation_text=f"threshold:  {threshold}")
+    fig.write_image(os.path.join(output_dir, 'histogram_scrub_coverage.svg'))
+    print('Dropping strains over threshold')
+    print(df_over)
+    return df_over['sample_id']
+
 
 def load_genome(genome_path):
     opener = gzip.open if genome_path.endswith('.gz') else open
@@ -486,6 +670,7 @@ def main():
     parser.add_argument('--genome', help='Genome FASTA file (.fna or .fna.gz)')
     parser.add_argument('--counts_global', help='Either a kmer counts file or a scrubbed kmers file if map_scrubbed_kmers')
     parser.add_argument('--counts_individual', help='Either a kmer counts file or a scrubbed kmers file if map_scrubbed_kmers')
+    parser.add_argument('--counts_summary')
     parser.add_argument('--output-dir', default='.', help='Output directory (default: current directory)')
     parser.add_argument('--basename', default=None, help='Output basename (default: derived from genome filename)')
     parser.add_argument('--figures', action='store_true', default=False,
@@ -498,7 +683,8 @@ def main():
     parser.add_argument('--terminal-dist', type=int, default=300,  help='Distance from contig ends to flag terminal kmers (default: 300)')
     parser.add_argument('--map_scrubbed_kmers_only', action='store_true', help = 'Takes a file of rare kmers as a list, one kmer per line that will be mapped to a target genome')
     parser.add_argument('--independent', action='store_true', help = 'reduces bin size to 31 to and only allows 1 kmer per bin')
-
+    parser.add_argument('--force', action='store_true',
+                        help='Recompute outputs even if they already exist')
     args = parser.parse_args()
     if args.map_scrubbed_kmers_only:
         strain = strain_name_from_path(args.genome)
@@ -521,6 +707,7 @@ def main():
         df.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
                         sep='\t', index=False, compression='gzip')
     else:
+        
         strain = strain_name_from_path(args.genome)
         basename = args.basename if args.basename else strain
         os.makedirs(args.output_dir, exist_ok=True)
@@ -537,107 +724,245 @@ def main():
         print(df_global_counts)
         print(len(df_global_counts))
 
+        
+
+
+        li_drop = drop_high_similarity_scrubs(input_path = args.counts_summary,
+                                    total_counts= len(df_global_counts),
+                                    threshold= [0.01,0.96],
+                                    output_dir = os.path.join(args.output_dir))
+
         # Drop individual counts with threshold larger than ...
         lf_counts_individual = (pl.scan_csv(args.counts_individual, separator='\t')
                                     .rename({'kmer': '#kmer'})
-                                    .unique() 
+                                    .filter(~pl.col('sample_id').is_in(li_drop))
                                 )
         
         print(lf_counts_individual)
         
-        zst_path = os.path.join(args.output_dir, 'individual_counts.tsv.zst')
-        if not os.path.exists(zst_path):
-            print(f'Converting gzip to zstd: {zst_path}')
-            subprocess.run(
-                f"pigz -dc {args.counts_individual} | zstd -T0 -o {zst_path}",
-                shell=True, check=True,
-            )
-        else:
-            print(f'Reusing existing zstd file: {zst_path}')
-
-
-        drop_high_similarity_scrubs(input_path = zst_path,
-                                    total_counts= len(df_global_counts),
-                                    threshold= 0.96,
-                                    output_dir = args.output_dir,
-                                    threads = args.threads)
-
+        # Check for highly similar strains and drop
         #STOP here for now
-        sys.exit("Stopping before OOM step")
+        
 
         print(f'Total kmers: {len(df_global_counts)}')
-        print('Remove non unique kmers of ref genome:')
+        print('Remove kmers with count >1 from ref genome:')
         df_global_counts = df_global_counts.filter(pl.col("reference_count") == 1)
         print(f'Remaining kmers: {len(df_global_counts)}')
          # remove all drug count entries to its minimum
-        print('Removing all drug kmers > min (usually 0):')
+        print('Removing all kmers present in drug scrub:')
         df_no_drugs = df_global_counts.filter(pl.col("drug_count") == pl.col("drug_count").min())
         print(f'Remaining kmers: {len(df_no_drugs)}')
 
-        # get all informative 0s
-        df_inform_singletons = df_no_drugs.filter((pl.col("pangenome_count") == 0 )&(pl.col('metagenome_count') == 0))
-        df_inform_singletons.write_parquet(os.path.join(args.output_dir , f'{basename}.inform_kmer_singleton.parquet'), compression='zstd')
+        print('Getting all kmers with counts')
+        singles_path = os.path.join(args.output_dir , f'{basename}.inform_kmer_singleton.parquet')
+        # ── Stage 1: Filter counts_individual once, sink to parquet ───────
+        filtered_path = os.path.join(args.output_dir, f'{basename}.counts_filtered.parquet')
+        drop_set = set(li_drop)
 
-        # how do I reduce this to an ok number before trying to create pairs?
-        print(f'Informative singletons: {len(df_inform_singletons)}')
+        if os.path.exists(filtered_path) and not args.force:
+            print(f'Reusing filtered counts at {filtered_path}')
+        else:
+            print(f'Filtering {args.counts_individual} → {filtered_path}')
+            print(f'  Dropping {len(drop_set):,} strains')
+            t0 = time.time()
+            (pl.scan_csv(args.counts_individual, separator='\t')
+               .rename({'kmer': '#kmer'})
+               .filter(~pl.col('sample_id').is_in(drop_set))
+               .select(['#kmer', 'sample_id'])
+               .sink_parquet(filtered_path, compression='zstd'))
+            elapsed = time.time() - t0
+            size_gb = os.path.getsize(filtered_path) / 1e9
+            print(f'  Done in {elapsed:.0f}s, {size_gb:.1f} GB on disk')
+
+        # ── Stage 2: Informative singletons ───────────────────────────────
+        print('Getting all kmers with counts')
+        singles_path = os.path.join(args.output_dir, f'{basename}.inform_kmer_singleton.parquet')
+
+        if os.path.exists(singles_path) and not args.force:
+            print(f'Skipping informative singletons — {singles_path} already exists. Use --force to regenerate.')
+            df_inform_singletons = pl.read_parquet(singles_path)
+        else:
+            batch_iter = pl.scan_parquet(filtered_path).select('#kmer').collect_batches()
+
+            chunks = []
+            rows_seen = 0
+            t0 = time.time()
+
+            for i, batch in enumerate(batch_iter, 1):
+                chunks.append(batch['#kmer'])
+                rows_seen += batch.height
+
+                if i % 100 == 0:
+                    merged = pl.concat(chunks).unique()
+                    chunks = [merged]
+                    rate = rows_seen / (time.time() - t0)
+                    print(f'  batch {i:>5}  {rows_seen:>13,} rows  |  '
+                          f'{len(merged):>10,} unique  |  {rate/1e6:>5.2f} M rows/s')
+
+            seen = pl.concat(chunks).unique() if chunks else pl.Series('#kmer', [], dtype=pl.Utf8)
+            print(f'Final: {len(seen):,} unique k-mers')
+            kmers_w_count = seen
+
+            print('Get informative singletons')
+            df_inform_singletons = df_no_drugs.filter(~pl.col('#kmer').is_in(kmers_w_count))
+            df_inform_singletons.write_parquet(singles_path, compression='zstd')
+
+        print(f'Informative singletons: {len(df_inform_singletons):,}')
+
+        df_non_inform_singletons = df_no_drugs.filter(~pl.col('#kmer').is_in(df_inform_singletons['#kmer'].implode()))
+        print(f'Non-informative singletons (need pair search): {len(df_non_inform_singletons):,}')
+
+        # ── Stage 3: Build signatures from filtered parquet ───────────────
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing as mp
 
         
-        df_non_inform_singletons = df_no_drugs.filter(~(pl.col("pangenome_count") == 0 )&
-                                                      ~(pl.col('metagenome_count') == 0))
 
 
-        # Drop all kmers from individual that have been droppped
-        # drop all non unique sample names
-        keep_kmers = pl.LazyFrame({'#kmer': df_non_inform_singletons['#kmer']})
-        print('Sinking individual counts to parquet (filtered to surviving kmers)')
-        (pl.scan_csv(args.counts_individual, separator='\t')
-            .rename({'kmer': '#kmer'})
-            .join(keep_kmers, on='#kmer', how='semi')
-            .sink_parquet(
-                args.output_dir + '/counts_individual.parquet',
-                compression='zstd',
-            )
+        # in main():
+        print('Building signatures via parallel batched scan')
+        t0 = time.time()
+
+        keep_kmers = set(df_non_inform_singletons['#kmer'].to_list())
+        print(f'  k-mer set to track: {len(keep_kmers):,}')
+
+        strains = (pl.scan_parquet(filtered_path)
+                    .select('sample_id').unique()
+                    .collect(engine='streaming')
+                    ['sample_id'].sort().to_list())
+        strain_index = {s: i for i, s in enumerate(strains)}
+        print(f'  effective strains: {len(strains):,}')
+
+        # Partition k-mers by 2-letter prefix → 16 disjoint groups, distribute across workers
+        n_workers = min(args.threads or 8, 8)   # cap at 8
+        all_prefixes = [a + b for a in 'ACGT' for b in 'ACGT']  # 16 prefixes total
+
+        prefixes_per_worker = max(1, len(all_prefixes) // n_workers)
+        worker_assignments = [
+            all_prefixes[i:i + prefixes_per_worker]
+            for i in range(0, len(all_prefixes), prefixes_per_worker)
+        ]
+        n_workers = len(worker_assignments)   # may have changed due to integer division
+        plen = len(all_prefixes[0])
+        print(f'  using {n_workers} workers, prefixes per worker: {prefixes_per_worker}')
+
+        # map each prefix to its worker index
+        prefix_to_worker = {}
+        for w, prefs in enumerate(worker_assignments):
+            for p in prefs:
+                prefix_to_worker[p] = w
+
+        # split keep_kmers into per-worker subsets
+        keep_kmers_subsets = [set() for _ in range(n_workers)]
+        for k in keep_kmers:
+            w = prefix_to_worker.get(k[:plen])
+            if w is not None:
+                keep_kmers_subsets[w].add(k)
+        del keep_kmers
+        gc.collect()
+
+        worker_args = [
+            (filtered_path, prefs, subset, strain_index)
+            for prefs, subset in zip(worker_assignments, keep_kmers_subsets)
+            if subset
+        ]
+        del keep_kmers_subsets
+        gc.collect()
+
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            partial_dicts = list(ex.map(_process_kmer_partition, worker_args))
+
+        print(f'  workers done in {time.time()-t0:.0f}s')
+
+        # Combine into single kmer_sigs frame — partitions are disjoint by construction
+        print('Combining partitions')
+        t0 = time.time()
+        all_kmers, all_strain_lists = [], []
+        for d in partial_dicts:
+            all_kmers.extend(d.keys())
+            all_strain_lists.extend(d.values())
+        del partial_dicts
+        gc.collect()
+
+        kmer_sigs = pl.DataFrame({
+            '#kmer': all_kmers,
+            'strain_set': all_strain_lists,
+        }, schema={'#kmer': pl.Utf8, 'strain_set': pl.List(pl.UInt32)})
+        del all_kmers, all_strain_lists
+        gc.collect()
+        print(f'  combined into {kmer_sigs.height:,} k-mers in {time.time()-t0:.0f}s')
+
+        # rest unchanged: group_by signature → sig_df
+        sig_df = (
+            kmer_sigs
+            .with_columns(pl.col('strain_set').list.len().alias('n_strains'))
+            .group_by('strain_set')
+            .agg([
+                pl.col('#kmer').alias('kmers'),
+                pl.col('#kmer').len().alias('n_kmers'),
+                pl.col('n_strains').first(),
+            ])
+            .with_row_index('sig_id')
         )
-        print('finished sink')
+        print(f'  {kmer_sigs.height:,} k-mers → {sig_df.height:,} unique signatures '
+            f'({kmer_sigs.height / max(sig_df.height,1):.1f}x compression)')
 
-        df_indiv_counts = filter_long_counts_streaming(
-            parquet_path=args.output_dir + '/counts_individual.parquet',
-            output_dir=args.output_dir,
-            reference_kmers=df_non_inform_singletons['#kmer'],  # match what's in the parquet
-            presence_threshold=0.98,
+        del kmer_sigs
+        gc.collect()
+        # ── Convert dict to Polars DataFrame ──────────────────────────────
+        print('Converting to signature table')
+        t0 = time.time()
+        kmer_list = list(sig_dict.keys())
+        strain_lists = [sorted(sig_dict[k]) for k in kmer_list]
+        del sig_dict
+        gc.collect()
+
+        kmer_sigs = pl.DataFrame({
+            '#kmer': kmer_list,
+            'strain_set': strain_lists,
+        }, schema={'#kmer': pl.Utf8, 'strain_set': pl.List(pl.UInt32)})
+        del kmer_list, strain_lists
+        gc.collect()
+        print(f'  built sig frame in {time.time()-t0:.0f}s')
+
+        # ── Group k-mers by identical signatures → equivalence classes ────
+        sig_df = (
+            kmer_sigs
+            .with_columns(pl.col('strain_set').list.len().alias('n_strains'))
+            .group_by('strain_set')
+            .agg([
+                pl.col('#kmer').alias('kmers'),
+                pl.col('#kmer').len().alias('n_kmers'),
+                pl.col('n_strains').first(),
+            ])
+            .with_row_index('sig_id')
         )
- 
-    
+        print(f'  {kmer_sigs.height:,} k-mers → {sig_df.height:,} unique signatures '
+                f'({kmer_sigs.height / max(sig_df.height,1):.1f}x compression)')
+
+        del kmer_sigs
+        gc.collect()
+
+        print('\nSignature class size distribution:')
+        print(sig_df.select('n_kmers').describe())
+        print('\nLargest signature classes:')
+        print(sig_df.sort('n_kmers', descending=True)
+                    .select(['sig_id', 'n_strains', 'n_kmers'])
+                    .head(10))
+
+        # ── Stage 4: Find informative pairs ───────────────────────────────
+        print('\nFinding informative pairs')
+        n_pairs = find_informative_pairs(sig_df, args.output_dir, basename)
+
+        inform_pairs_path = os.path.join(args.output_dir, f'{basename}.inform_kmer_pairs.parquet')
+        df_inform_pairs = pl.read_parquet(inform_pairs_path)
+        print(f'Total informative pairs: {len(df_inform_pairs):,}')
         
-        
-        
-        # Creating pairs rom non informative singletons
-        df_pairs = df_indiv_counts.filter(pl.col('#kmer').is_in(df_non_inform_singletons['#kmer'].implode())
-                                          )
         #clean up 
         gc.collect()
         del df_global_counts, df_indiv_counts, df_non_inform_singletons, df_no_drugs
-        
-        print('Pivot dataframe for pair generation')
-        # drop duplicate samples
-        df_pairs=df_pairs.unique(subset=["#kmer", "sample_id"])
-        df_pairs = df_pairs.pivot(on="sample_id",index="#kmer",values="count").fill_null(0)
-
-        print('Creating pairs in parallel')
-        n_inform_pairs, dict_non_inform_pairs = create_kmer_pairs_parallel(df_pairs, 
-                                        args.output_dir,
-                                        basename = args.basename,
-                                        n_workers = args.threads)
-        
-
-        inform_pair_parts = sorted(glob.glob(os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")))
-        if inform_pair_parts:
-            df_inform_pairs = pl.concat([pl.read_parquet(p) for p in inform_pair_parts])
-        else:
-            df_inform_pairs = pl.DataFrame()
-
-        print(df_inform_pairs)
-        print(f"Total informative pairs: {len(df_inform_pairs)}")
+            
+            
         
         #mapping positions
         print('Mapping positions of remaining kmers')

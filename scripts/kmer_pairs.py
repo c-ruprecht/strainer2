@@ -78,9 +78,21 @@ def get_test_dataset():
     print("Creating Test Data")
     print("Strain panel:")
     print(df)
+    
+    df_long = (
+        df
+        .unpivot(
+            index='#kmer',
+            variable_name='sample_id',
+            value_name='count',
+        )
+        .filter(pl.col('count') > 0)
+        .select(['sample_id', '#kmer', 'count'])   # column order you asked for
+    )
+    print(df_long)
     print("Sample panel:")
     print(df_samples)
-    return df, df_samples
+    return df, df_samples, df_long
 
 def strain_name_from_path(path):
     base = os.path.basename(path)
@@ -824,12 +836,13 @@ def main():
     parser.add_argument('--threads', type=int, default=None, help='Number of worker processes for triplet generation. Default: os.cpu_count() - 1')
     parser.add_argument('--presence_threshold', type=float, default=0.95, help='Drop strains whose Jaccard similarity to an all-present reference exceeds this')
     parser.add_argument('--basename')
+    parser.add_argument('--create_triples', action = 'store_true')
     
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok = True)
 
     if args.testmode:
-        df, df_samples = get_test_dataset()
+        df, df_samples, df_long = get_test_dataset()
         basename = 'testmode'
     else:
         if args.basename:
@@ -851,8 +864,6 @@ def main():
     print('Checking for too similar columns')
     #df = drop_reference_similar_strains(df, similarity_threshold=args.ref_jaccard_threshold)
     df = drop_high_presence_strains(df, presence_threshold=args.presence_threshold)
-
-    # Step 3 Check for highly similar strains and remove
 
 
     # Get all informative kmer singletons:
@@ -885,53 +896,55 @@ def main():
     
     # Get all informative triplets:
     # this is too much data for ram and needs to be streamed to files directly
-    print('Creating triplicates')
-    # convert kmer pairs to set for removal
-    
-    kmers_in_pairs = set()
-    for f in sorted(glob.glob(os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet"))):
-        t = pq.read_table(f, columns=["kmerA", "kmerB"]).to_pydict()
-        kmers_in_pairs.update(t["kmerA"])
-        kmers_in_pairs.update(t["kmerB"])
-
-    #kmers_in_pairs = set()
-    #for a, b in dict_inform_pairs.keys():
-    #    kmers_in_pairs.add(a)
-    #    kmers_in_pairs.add(b)
-    print('Removing kmer in informative pairs')
-    #print(kmers_in_pairs)
-
-    df_w_countpairs = df_w_count.filter(~pl.col("#kmer").is_in(kmers_in_pairs))
-    #print(df_w_countpairs)
-    print(f"Kmers remaining: {df_w_countpairs.shape[0]:,} (dropped {len(kmers_in_pairs):,})")
-    #print(dict_inform_pairs)
-    dict_non_inform_pairs = {(a, b): c for (a, b), c in dict_non_inform_pairs.items() 
-                            if a not in kmers_in_pairs and b not in kmers_in_pairs}
-    #print(dict_non_inform_pairs)
-    print(f"Non-inform pairs remaining: {len(dict_non_inform_pairs):,}")    
-    # Creat triplets for non informative pairs
-    create_kmer_triplets_parallel(dict_non_inform_pairs,
-                                df_w_countpairs,
-                                args.output_dir,
-                                basename,
-                                n_workers=args.threads,)
-    if args.testmode:
         
-
-        print("Informative Triplets")
-        inform_parts = sorted(glob.glob(os.path.join(args.output_dir, f"{basename}.inform_triplets.part*.parquet")))
-        if inform_parts:
-            print(pl.read_parquet(inform_parts))
+    if args.create_triples or args.testmode:
+        print('Creating triplicates')
+        # convert kmer pairs to set for removal
         
-        print('Creating coverage outputs')
-        print(df_samples)
-        df_cov_s = get_singleton_hits(df_samples, df_inform_singleton)
-        df_cov_p = get_pair_hits_streaming(df_samples,os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet"))
-        df_cov_t = get_triple_hits_streaming(df_samples,
-                                             os.path.join(args.output_dir, f"{basename}.inform_triplets.part*.parquet"),)
-        df_cov = df_cov_s.join(df_cov_p, on="sample", how="left").join(df_cov_t, on="sample", how="left")
-        df_cov.write_csv(os.path.join(args.output_dir, f'{basename}.coverage.csv'))
-        print(df_cov)
+        kmers_in_pairs = set()
+        for f in sorted(glob.glob(os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet"))):
+            t = pq.read_table(f, columns=["kmerA", "kmerB"]).to_pydict()
+            kmers_in_pairs.update(t["kmerA"])
+            kmers_in_pairs.update(t["kmerB"])
+
+        #kmers_in_pairs = set()
+        #for a, b in dict_inform_pairs.keys():
+        #    kmers_in_pairs.add(a)
+        #    kmers_in_pairs.add(b)
+        print('Removing kmer in informative pairs')
+        #print(kmers_in_pairs)
+
+        df_w_countpairs = df_w_count.filter(~pl.col("#kmer").is_in(kmers_in_pairs))
+        #print(df_w_countpairs)
+        print(f"Kmers remaining: {df_w_countpairs.shape[0]:,} (dropped {len(kmers_in_pairs):,})")
+        #print(dict_inform_pairs)
+        dict_non_inform_pairs = {(a, b): c for (a, b), c in dict_non_inform_pairs.items() 
+                                if a not in kmers_in_pairs and b not in kmers_in_pairs}
+        #print(dict_non_inform_pairs)
+        print(f"Non-inform pairs remaining: {len(dict_non_inform_pairs):,}")    
+        # Creat triplets for non informative pairs
+        create_kmer_triplets_parallel(dict_non_inform_pairs,
+                                    df_w_countpairs,
+                                    args.output_dir,
+                                    basename,
+                                    n_workers=args.threads,)
+        if args.testmode:
+            
+
+            print("Informative Triplets")
+            inform_parts = sorted(glob.glob(os.path.join(args.output_dir, f"{basename}.inform_triplets.part*.parquet")))
+            if inform_parts:
+                print(pl.read_parquet(inform_parts))
+            
+            print('Creating coverage outputs')
+            print(df_samples)
+            df_cov_s = get_singleton_hits(df_samples, df_inform_singleton)
+            df_cov_p = get_pair_hits_streaming(df_samples,os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet"))
+            df_cov_t = get_triple_hits_streaming(df_samples,
+                                                os.path.join(args.output_dir, f"{basename}.inform_triplets.part*.parquet"),)
+            df_cov = df_cov_s.join(df_cov_p, on="sample", how="left").join(df_cov_t, on="sample", how="left")
+            df_cov.write_csv(os.path.join(args.output_dir, f'{basename}.coverage.csv'))
+            print(df_cov)
 
 
 if __name__ == '__main__':
