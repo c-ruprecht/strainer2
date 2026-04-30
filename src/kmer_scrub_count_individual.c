@@ -12,38 +12,32 @@
 /*
 	kmer_scrub_count_individual (single-pass variant)
 
-	Same CLI as before. Same outputs:
-
+	Outputs:
 	  1) Global counts to stdout (TSV) — unchanged format:
 	       #kmer  reference_count  pangenome_count  metagenome_count  [drug_count]
 
-	  2) Per-sample counts as a long-format gzipped TSV via -o:
+	  2) Per-sample counts as a long-format zstd-compressed TSV via -o:
 	       kmer  sample_type  sample_id  count
 
-	Architectural change vs the previous (two-pass) version
-	-------------------------------------------------------
-	Previously: Phase 1 read every input file to fill global cols 1/2/3,
-	then Phase 2 read every input file again to fill per-sample cols.
-	Each file was opened and decompressed twice.
+	  3) (NEW) Per-sample summary plain TSV via -S (optional):
+	       sample_type  sample_id  n_unique_kmers  coverage_pct
+	     coverage_pct = n_unique_kmers / total_reference_kmers
+	     One row per processed sample. Lets downstream code skip the
+	     expensive distinct-count over the big file.
 
-	Now: a single pass per input file. Each worker's k-mer counter writes
-	to BOTH the global column (1, 2, or 3) and its scratch column
-	(4 + tid) on every k-mer match. After finishing a file, the worker
-	sweeps the hash to emit non-zero rows for its scratch column and
-	zero them, exactly as before.
+	Architecture: single-pass per file, hash bounded by O(n_kmers x (4 + T)).
 
-	Wall-clock impact: roughly 2x speedup on I/O-bound workloads (which
-	is everything at this scale, since metagenome decompression dominates).
-
-	Memory model — unchanged:
-	  Hash value vector has (4 + num_threads) columns.
-	  Memory cost is O(n_kmers x (4 + T)), independent of n_samples.
+	Duplicate sample_id detection: if two input files yield the same
+	(sample_type, sample_id) pair (e.g. same basename), the second one
+	is skipped with a warning to stderr. Detection is process-global
+	across -A / -B / -C lists.
 */
 
 #define N_GLOBAL_COLS 4
 
 static void usage(void);
 static void print_hash_counts(BIO_hash seqHash, const char *C_file);
+static unsigned long count_seeded_kmers(BIO_hash seqHash);
 
 int main(int argc, char *argv[])
 {
@@ -54,6 +48,7 @@ int main(int argc, char *argv[])
 	char *r_file = NULL;
 	char *p_file = NULL;
 	char *o_file = NULL;
+	char *s_file = NULL;        /* NEW: summary output path */
 	const int seed = 31;
 	const int default_hash_val = 1;
 	const int default_hash_increment = 1;
@@ -61,7 +56,7 @@ int main(int argc, char *argv[])
 	int c;
 	FILE *progress = NULL;
 
-	while ((c = getopt(argc, argv, "A:B:C:r:p:o:t:Hhud")) != EOF)
+	while ((c = getopt(argc, argv, "A:B:C:r:p:o:S:t:Hhud")) != EOF)
 		switch (c) {
 			case 'A': A_file = strdup(optarg); break;
 			case 'B': B_file = strdup(optarg); break;
@@ -69,6 +64,7 @@ int main(int argc, char *argv[])
 			case 'r': r_file = strdup(optarg); break;
 			case 'p': p_file = strdup(optarg); break;
 			case 'o': o_file = strdup(optarg); break;
+			case 'S': s_file = strdup(optarg); break;
 			case 't': num_threads = atoi(optarg); break;
 			case 'u':
 			case 'h':
@@ -90,10 +86,6 @@ int main(int argc, char *argv[])
 		fprintf(progress, "adding kmer counts for:\n");
 	}
 
-	/*
-		Hash size: 4 global columns + one scratch column per worker thread.
-		Independent of n_samples — that's the whole point.
-	*/
 	const int size_of_hash_vec = N_GLOBAL_COLS + num_threads;
 
 	seqHash = BIO_initHash(DEFAULT_GENOME_HASH_SIZE);
@@ -103,16 +95,10 @@ int main(int argc, char *argv[])
 	                                 default_hash_val, default_hash_increment,
 	                                 0, size_of_hash_vec);
 
-	/*
-		Single pass per list. Each call:
-		  - reads each file in the list once
-		  - increments counts[global_col] AND counts[4 + tid] per k-mer hit
-		  - emits non-zero scratch rows + zeros the column per sample
+	/* count seeded reference k-mers — denominator for coverage_pct */
+	unsigned long total_ref_kmers = count_seeded_kmers(seqHash);
+	fprintf(stderr, "total reference k-mers: %lu\n", total_ref_kmers);
 
-		The -o flag is required for this binary; without per-sample
-		output there's no reason to use _individual over the original
-		kmer_scrub_count.
-	*/
 	if (!o_file) {
 		fprintf(stderr, "error: -o is required for kmer_scrub_count_individual\n");
 		fprintf(stderr, "       (use kmer_scrub_count if you only need globals)\n");
@@ -125,25 +111,45 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
+	summary_writer *summary = NULL;
+	if (s_file) {
+		summary = summary_writer_open(s_file, total_ref_kmers);
+		if (!summary) {
+			fprintf(stderr, "could not open summary output %s\n", s_file);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	/* Shared dedup registry — process-global across -A/-B/-C. */
+	seen_registry *seen = seen_registry_new();
+	if (!seen) {
+		fprintf(stderr, "could not allocate seen_registry\n");
+		exit(EXIT_FAILURE);
+	}
+
 	/* -A → pangenome (col 1) + ge rows */
 	GEN_per_sample_kmer_counts_dual(A_file, "ge", 1, seed, seqHash,
-	                                num_threads, w, progress, NULL);
+	                                num_threads, w, summary, seen,
+	                                progress, NULL);
 
 	/* -B → metagenome (col 2) + me rows */
 	GEN_per_sample_kmer_counts_dual(B_file, "me", 2, seed, seqHash,
-	                                num_threads, w, progress, NULL);
+	                                num_threads, w, summary, seen,
+	                                progress, NULL);
 
 	/* -C → drug (col 3) + dr rows; reference-skip preserved */
 	if (C_file)
 		GEN_per_sample_kmer_counts_dual(C_file, "dr", 3, seed, seqHash,
-		                                num_threads, w, progress, r_file);
+		                                num_threads, w, summary, seen,
+		                                progress, r_file);
 
 	streaming_writer_close(w);
+	if (summary) summary_writer_close(summary);
+	seen_registry_free(seen);
 
 	/* global counts to stdout (unchanged format) */
 	print_hash_counts(seqHash, C_file);
 
-	/* cleanup */
 	BIO_destroyHashD(seqHash);
 	free(A_file);
 	free(B_file);
@@ -151,6 +157,7 @@ int main(int argc, char *argv[])
 	free(r_file);
 	free(p_file);
 	free(o_file);
+	free(s_file);
 	if (progress != NULL) fclose(progress);
 	return 0;
 }
@@ -163,16 +170,34 @@ static void usage(void)
 	    "                        -A <file listing genome filenames>\n"
 	    "                        -B <file listing metagenome filenames>\n"
 	    "                       [-C <file listing drug-strain genome filenames>]\n"
-	    "                        -o <per-sample long-format output, .tsv.gz>  REQUIRED\n"
+	    "                        -o <per-sample long-format output, .tsv.zst>  REQUIRED\n"
+	    "                       [-S <per-sample summary output, .tsv>]\n"
 	    "                       [-p <progress log file>]\n"
 	    "                       [-t <num threads, default 4>]\n"
 	    "\n"
 	    "  stdout: global counts (kmer, ref, pangenome, metagenome[, drug])\n"
-	    "  -o:     long-format gzipped TSV (kmer, sample_type, sample_id, count)\n"
-	    "          sample_type in {ge, me, dr}; load with polars.scan_csv.\n"
+	    "  -o:     long-format zstd-compressed TSV.\n"
+	    "          load with polars: pl.scan_csv('out.tsv.zst', separator='\\t')\n"
+	    "  -S:     plain TSV summary, one row per sample, columns:\n"
+	    "          sample_type, sample_id, n_unique_kmers, coverage_pct\n"
+	    "          coverage_pct = n_unique_kmers / total_reference_kmers\n"
 	    "  Each input file is read exactly once. Memory bounded by\n"
-	    "  O(n_kmers x (4 + threads)).\n");
+	    "  O(n_kmers x (4 + threads)). Duplicate (sample_type, sample_id)\n"
+	    "  pairs are skipped with a warning.\n");
 	exit(1);
+}
+
+static unsigned long count_seeded_kmers(BIO_hash seqHash)
+{
+	unsigned long n = 0;
+	int hash_size = BIO_getHashSize(seqHash);
+	char **allKeys = BIO_getHashKeys(seqHash);
+	for (unsigned int i = 0; i < (unsigned int)hash_size; i++) {
+		unsigned int *counts = (unsigned int *)BIO_searchHash(seqHash, allKeys[i]);
+		if (counts && counts[0] > 0) n++;
+	}
+	BIO_destroyHashKeys(allKeys);
+	return n;
 }
 
 static void print_hash_counts(BIO_hash seqHash, const char *C_file)

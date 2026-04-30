@@ -12,10 +12,81 @@
 #include <stdint.h>
 #include <errno.h>
 #include <zlib.h>
+#include <zstd.h>
 
 KSEQ_INIT(gzFile, gzread)
 
 #define GLOBAL_COLS 4
+
+/* ── zstd stream writer (replaces gzFile) ─────────────────────────────
+   Wraps a stdio FILE* with a ZSTD_CStream. Produces a single zstd frame
+   stream that decompresses cleanly with `zstd -dc` or polars' scan_csv.
+   ──────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+	FILE       *fp;
+	ZSTD_CStream *cs;
+	void       *out_buf;
+	size_t      out_cap;
+} zstd_out_t;
+
+static zstd_out_t *zstd_out_open(const char *path, int level)
+{
+	zstd_out_t *z = calloc(1, sizeof(*z));
+	if (!z) return NULL;
+	z->fp = fopen(path, "wb");
+	if (!z->fp) { free(z); return NULL; }
+	z->cs = ZSTD_createCStream();
+	if (!z->cs) { fclose(z->fp); free(z); return NULL; }
+	size_t init_rc = ZSTD_initCStream(z->cs, level);
+	if (ZSTD_isError(init_rc)) {
+		ZSTD_freeCStream(z->cs); fclose(z->fp); free(z);
+		return NULL;
+	}
+	z->out_cap = ZSTD_CStreamOutSize();
+	z->out_buf = malloc(z->out_cap);
+	if (!z->out_buf) {
+		ZSTD_freeCStream(z->cs); fclose(z->fp); free(z);
+		return NULL;
+	}
+	return z;
+}
+
+/* Compress `len` bytes from `data` and write to underlying file. */
+static int zstd_out_write(zstd_out_t *z, const void *data, size_t len)
+{
+	ZSTD_inBuffer in = { data, len, 0 };
+	while (in.pos < in.size) {
+		ZSTD_outBuffer out = { z->out_buf, z->out_cap, 0 };
+		size_t rc = ZSTD_compressStream(z->cs, &out, &in);
+		if (ZSTD_isError(rc)) return -1;
+		if (out.pos > 0 &&
+		    fwrite(z->out_buf, 1, out.pos, z->fp) != out.pos)
+			return -1;
+	}
+	return 0;
+}
+
+static int zstd_out_close(zstd_out_t *z)
+{
+	if (!z) return 0;
+	int err = 0;
+	for (;;) {
+		ZSTD_outBuffer out = { z->out_buf, z->out_cap, 0 };
+		size_t rem = ZSTD_endStream(z->cs, &out);
+		if (ZSTD_isError(rem)) { err = -1; break; }
+		if (out.pos > 0 &&
+		    fwrite(z->out_buf, 1, out.pos, z->fp) != out.pos) {
+			err = -1; break;
+		}
+		if (rem == 0) break;
+	}
+	ZSTD_freeCStream(z->cs);
+	if (fclose(z->fp) != 0) err = -1;
+	free(z->out_buf);
+	free(z);
+	return err;
+}
 
 /* ── Bounded row queue + writer thread ────────────────────────────────── */
 
@@ -33,7 +104,7 @@ typedef struct {
 } row_t;
 
 struct streaming_writer_s {
-	gzFile           gz;
+	zstd_out_t      *zout;
 	row_t           *queue;
 	size_t           cap;
 	size_t           head, tail, size;
@@ -45,6 +116,22 @@ struct streaming_writer_s {
 };
 
 static void sample_id_unref(sample_id_t *sid);
+
+/* Small helper: format and write one row through the zstd stream.
+   We use a stack buffer big enough for any realistic kmer + ids. */
+static void write_row_zstd(zstd_out_t *z, const row_t *r)
+{
+	char buf[1024];
+	int n = snprintf(buf, sizeof buf, "%s\t%s\t%s\t%u\n",
+	                 r->kmer, r->sid->type, r->sid->id, r->count);
+	if (n < 0) return;
+	if ((size_t)n >= sizeof buf) {
+		/* extremely unlikely, but be safe */
+		fprintf(stderr, "write_row_zstd: row too long, truncated\n");
+		n = sizeof buf - 1;
+	}
+	zstd_out_write(z, buf, (size_t)n);
+}
 
 static void *writer_main(void *arg)
 {
@@ -69,11 +156,7 @@ static void *writer_main(void *arg)
 		pthread_mutex_unlock(&w->mtx);
 
 		for (size_t i = 0; i < n; i++) {
-			gzprintf(w->gz, "%s\t%s\t%s\t%u\n",
-			         batch[i].kmer,
-			         batch[i].sid->type,
-			         batch[i].sid->id,
-			         batch[i].count);
+			write_row_zstd(w->zout, &batch[i]);
 			sample_id_unref(batch[i].sid);
 		}
 	}
@@ -87,18 +170,20 @@ streaming_writer *streaming_writer_open(const char *path, size_t queue_capacity)
 	streaming_writer *w = calloc(1, sizeof(*w));
 	if (!w) return NULL;
 
-	w->gz = gzopen(path, "wb6");  /* level 6: ~3x faster than 9, ~5% bigger */
-	if (!w->gz) {
-		fprintf(stderr, "streaming_writer_open: gzopen %s failed: %s\n",
+	/* level 3 = zstd default. ~3-5x faster decompression than gzip-6,
+	   compression ratio in the same neighborhood. Higher levels mostly
+	   slow down compression for diminishing returns. */
+	w->zout = zstd_out_open(path, 3);
+	if (!w->zout) {
+		fprintf(stderr, "streaming_writer_open: zstd_out_open %s failed: %s\n",
 		        path, strerror(errno));
 		free(w);
 		return NULL;
 	}
-	gzbuffer(w->gz, 1u << 20);
 
 	w->queue = calloc(queue_capacity, sizeof(row_t));
 	if (!w->queue) {
-		gzclose(w->gz);
+		zstd_out_close(w->zout);
 		free(w);
 		return NULL;
 	}
@@ -107,11 +192,12 @@ streaming_writer *streaming_writer_open(const char *path, size_t queue_capacity)
 	pthread_cond_init(&w->not_empty, NULL);
 	pthread_cond_init(&w->not_full, NULL);
 
-	gzprintf(w->gz, "kmer\tsample_type\tsample_id\tcount\n");
+	const char *header = "kmer\tsample_type\tsample_id\tcount\n";
+	zstd_out_write(w->zout, header, strlen(header));
 
 	if (pthread_create(&w->writer_tid, NULL, writer_main, w) != 0) {
 		fprintf(stderr, "streaming_writer_open: pthread_create failed\n");
-		gzclose(w->gz);
+		zstd_out_close(w->zout);
 		free(w->queue);
 		free(w);
 		return NULL;
@@ -130,7 +216,7 @@ void streaming_writer_close(streaming_writer *w)
 
 	pthread_join(w->writer_tid, NULL);
 
-	gzclose(w->gz);
+	zstd_out_close(w->zout);
 	pthread_mutex_destroy(&w->mtx);
 	pthread_cond_destroy(&w->not_empty);
 	pthread_cond_destroy(&w->not_full);
@@ -148,6 +234,57 @@ static void writer_push(streaming_writer *w, row_t r)
 	w->size++;
 	pthread_cond_signal(&w->not_empty);
 	pthread_mutex_unlock(&w->mtx);
+}
+
+/* ── Summary writer (plain TSV, low volume → simple mutex) ─────────── */
+
+struct summary_writer_s {
+	FILE           *fp;
+	unsigned long   total_ref_kmers;
+	pthread_mutex_t mtx;
+};
+
+summary_writer *summary_writer_open(const char *path,
+                                    unsigned long total_reference_kmers)
+{
+	if (!path) return NULL;
+	summary_writer *s = calloc(1, sizeof(*s));
+	if (!s) return NULL;
+	s->fp = fopen(path, "w");
+	if (!s->fp) {
+		fprintf(stderr, "summary_writer_open: fopen %s failed: %s\n",
+		        path, strerror(errno));
+		free(s);
+		return NULL;
+	}
+	s->total_ref_kmers = total_reference_kmers;
+	pthread_mutex_init(&s->mtx, NULL);
+	fprintf(s->fp, "sample_type\tsample_id\tn_unique_kmers\tcoverage_pct\n");
+	return s;
+}
+
+void summary_writer_close(summary_writer *s)
+{
+	if (!s) return;
+	fclose(s->fp);
+	pthread_mutex_destroy(&s->mtx);
+	free(s);
+}
+
+static void summary_write_row(summary_writer *s,
+                              const char *sample_type,
+                              const char *sample_id,
+                              unsigned long n_unique_kmers)
+{
+	if (!s) return;
+	double coverage = s->total_ref_kmers > 0
+	    ? (double)n_unique_kmers / (double)s->total_ref_kmers
+	    : 0.0;
+	pthread_mutex_lock(&s->mtx);
+	fprintf(s->fp, "%s\t%s\t%lu\t%.6f\n",
+	        sample_type, sample_id, n_unique_kmers, coverage);
+	fflush(s->fp);  /* small file; flush so it's tail-able during long runs */
+	pthread_mutex_unlock(&s->mtx);
 }
 
 /* ── Sample ID ref-counting ───────────────────────────────────────────── */
@@ -184,6 +321,98 @@ static void sample_id_unref(sample_id_t *s)
 	}
 }
 
+/* ── Duplicate-sample registry ─────────────────────────────────────────
+   Small linear-probing hash of "type:id" strings. Volumes are tiny
+   (thousands of samples max), so a simple grow-on-load-factor design
+   is plenty.
+   ──────────────────────────────────────────────────────────────────── */
+
+struct seen_registry_s {
+	char           **slots;   /* NULL or owned heap string "type:id" */
+	size_t           cap;
+	size_t           size;
+	pthread_mutex_t  mtx;
+};
+
+static unsigned long sr_hash(const char *s)
+{
+	unsigned long h = 1469598103934665603UL;  /* FNV-1a */
+	for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211UL; }
+	return h;
+}
+
+static void sr_insert_into(char **slots, size_t cap, char *key)
+{
+	size_t i = sr_hash(key) % cap;
+	while (slots[i] != NULL) i = (i + 1) % cap;
+	slots[i] = key;
+}
+
+static void sr_grow(seen_registry *r)
+{
+	size_t new_cap = r->cap * 2;
+	char **new_slots = calloc(new_cap, sizeof(char *));
+	if (!new_slots) { perror("calloc"); exit(EXIT_FAILURE); }
+	for (size_t i = 0; i < r->cap; i++)
+		if (r->slots[i]) sr_insert_into(new_slots, new_cap, r->slots[i]);
+	free(r->slots);
+	r->slots = new_slots;
+	r->cap = new_cap;
+}
+
+seen_registry *seen_registry_new(void)
+{
+	seen_registry *r = calloc(1, sizeof(*r));
+	if (!r) return NULL;
+	r->cap = 256;
+	r->slots = calloc(r->cap, sizeof(char *));
+	if (!r->slots) { free(r); return NULL; }
+	pthread_mutex_init(&r->mtx, NULL);
+	return r;
+}
+
+void seen_registry_free(seen_registry *r)
+{
+	if (!r) return;
+	for (size_t i = 0; i < r->cap; i++) free(r->slots[i]);
+	free(r->slots);
+	pthread_mutex_destroy(&r->mtx);
+	free(r);
+}
+
+/* Returns 1 if (type, id) was already seen (and does NOT add it again),
+   0 if newly registered. */
+static int seen_registry_check_and_add(seen_registry *r,
+                                       const char *type,
+                                       const char *id)
+{
+	if (!r) return 0;
+
+	char key[512];
+	int n = snprintf(key, sizeof key, "%s:%s", type, id);
+	if (n < 0 || (size_t)n >= sizeof key) {
+		fprintf(stderr, "seen_registry: key too long for %s:%s\n", type, id);
+		return 0;  /* don't block; just skip dedup for pathological case */
+	}
+
+	pthread_mutex_lock(&r->mtx);
+	if (r->size * 2 >= r->cap) sr_grow(r);
+
+	size_t i = sr_hash(key) % r->cap;
+	while (r->slots[i] != NULL) {
+		if (strcmp(r->slots[i], key) == 0) {
+			pthread_mutex_unlock(&r->mtx);
+			return 1;
+		}
+		i = (i + 1) % r->cap;
+	}
+	r->slots[i] = strdup(key);
+	if (!r->slots[i]) { perror("strdup"); exit(EXIT_FAILURE); }
+	r->size++;
+	pthread_mutex_unlock(&r->mtx);
+	return 0;
+}
+
 /* ── Helpers ──────────────────────────────────────────────────────────── */
 
 static char *basename_no_ext(const char *path)
@@ -200,6 +429,7 @@ static char *basename_no_ext(const char *path)
 		if (strcmp(ext, "gz")    == 0 ||
 		    strcmp(ext, "bz2")   == 0 ||
 		    strcmp(ext, "xz")    == 0 ||
+		    strcmp(ext, "zst")   == 0 ||
 		    strcmp(ext, "fa")    == 0 ||
 		    strcmp(ext, "fna")   == 0 ||
 		    strcmp(ext, "ffn")   == 0 ||
@@ -213,23 +443,9 @@ static char *basename_no_ext(const char *path)
 	return out;
 }
 
-/* Forward-declared: defined in genome_compare.c but not in its header */
 extern int   contains_N(char *str);
 extern char *orient_string(char *seed_seq, char *seedStrRevComp, int seed);
 
-/*
-	Single-pass dual-counter for one file.
-
-	Reads the file once. For every k-mer hit in the reference hash:
-	  - atomically increments counts[global_col]   (pangenome / metagenome / drug)
-	  - atomically increments counts[scratch_col]  (this worker's scratch)
-
-	Both increments are atomic because this is the same column-write pattern
-	the existing GEN_calculate_kmer_count uses; other threads may be writing
-	to *different* columns of the same value vector concurrently. Different
-	memory addresses, no contention, but use the atomic for safety and
-	consistency with existing semantics.
-*/
 static void calculate_kmer_count_dual(const char *file,
                                       const int seed,
                                       BIO_hash h,
@@ -240,7 +456,7 @@ static void calculate_kmer_count_dual(const char *file,
 	if (fp == NULL) {
 		fprintf(stderr, "could not read file %s in calculate_kmer_count_dual()\n",
 		        file);
-		return;  /* don't crash the whole job for one bad file */
+		return;
 	}
 	kseq_t *seq = kseq_init(fp);
 
@@ -300,6 +516,8 @@ typedef struct {
 	BIO_hash         h;
 	int              num_threads;
 	streaming_writer *writer;
+	summary_writer   *summary;
+	seen_registry   *seen;
 	const char      *sample_type;
 	unsigned int     global_col;
 	const char      *skip_file;
@@ -307,21 +525,14 @@ typedef struct {
 	pthread_mutex_t  progress_mtx;
 } worker_pool_t;
 
-/*
-	After a sample is fully counted, sweep the hash:
-	  - emit one row per non-zero scratch entry to the writer
-	  - zero the scratch column
-
-	Different workers run this concurrently for *different* scratch columns,
-	so there's no contention on the writes. Reads of h->data[i].DATA and
-	the kmer key are safe because the hash topology is read-only after
-	seeding.
-*/
-static void emit_and_zero_column(BIO_hash h,
-                                 unsigned int col,
-                                 sample_id_t *sid,
-                                 streaming_writer *writer)
+/* Returns the count of distinct k-mers emitted (i.e. non-zero scratch
+   entries swept). Used to populate the summary. */
+static unsigned long emit_and_zero_column(BIO_hash h,
+                                          unsigned int col,
+                                          sample_id_t *sid,
+                                          streaming_writer *writer)
 {
+	unsigned long n = 0;
 	for (unsigned int i = 0; i < h->M; i++) {
 		unsigned int *counts = (unsigned int *)h->data[i].DATA;
 		if (counts == NULL) continue;
@@ -336,7 +547,9 @@ static void emit_and_zero_column(BIO_hash h,
 		writer_push(writer, r);
 
 		counts[col] = 0;
+		n++;
 	}
+	return n;
 }
 
 static void *worker_main(void *arg)
@@ -362,7 +575,22 @@ static void *worker_main(void *arg)
 		const char *path = job->filepath;
 
 		if (p->skip_file != NULL && strcmp(path, p->skip_file) == 0) {
-			fprintf(stderr, "skipping %s (identical match)\n", path);
+			fprintf(stderr, "skipping %s (identical match to reference)\n",
+			        path);
+			free(job->filepath);
+			free(job);
+			continue;
+		}
+
+		char *id = basename_no_ext(path);
+
+		/* Duplicate check BEFORE doing any work. We claim the (type, id)
+		   slot atomically; if already claimed, skip the file entirely. */
+		if (seen_registry_check_and_add(p->seen, p->sample_type, id)) {
+			fprintf(stderr,
+			        "skipping %s: sample_id '%s' (type=%s) already processed\n",
+			        path, id, p->sample_type);
+			free(id);
 			free(job->filepath);
 			free(job);
 			continue;
@@ -376,17 +604,17 @@ static void *worker_main(void *arg)
 			pthread_mutex_unlock(&p->progress_mtx);
 		}
 
-		char *id = basename_no_ext(path);
 		sample_id_t *sid = sample_id_new(id, p->sample_type);
-		free(id);
 
-		/* SINGLE PASS: read file once, increment both global + scratch */
 		calculate_kmer_count_dual(path, p->seed, p->h,
 		                          p->global_col, scratch_col);
 
-		/* emit + zero scratch column */
-		emit_and_zero_column(p->h, scratch_col, sid, p->writer);
+		unsigned long n_unique =
+		    emit_and_zero_column(p->h, scratch_col, sid, p->writer);
 
+		summary_write_row(p->summary, p->sample_type, id, n_unique);
+
+		free(id);
 		sample_id_unref(sid);
 
 		free(job->filepath);
@@ -404,6 +632,8 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
                                      BIO_hash h,
                                      int num_threads,
                                      streaming_writer *writer,
+                                     summary_writer  *summary,
+                                     seen_registry   *seen,
                                      FILE *progress,
                                      const char *skip_file)
 {
@@ -443,6 +673,8 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 	p.h           = h;
 	p.num_threads = num_threads;
 	p.writer      = writer;
+	p.summary     = summary;
+	p.seen        = seen;
 	p.sample_type = sample_type;
 	p.global_col  = global_col;
 	p.skip_file   = skip_file;

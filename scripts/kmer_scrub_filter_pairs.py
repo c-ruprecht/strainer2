@@ -8,6 +8,7 @@ Usage:
 import argparse
 import gzip
 import os
+import sys
 
 import numpy as np
 import ahocorasick
@@ -20,9 +21,62 @@ import polars as pl
 import pandas as pd
 import pyarrow as pa
 import gc
-from kmer_pairs import create_kmer_pairs_parallel
+from kmer_pairs import drop_high_presence_strains, create_kmer_pairs_parallel 
 import glob
 
+import subprocess
+import math
+
+
+import subprocess
+import os
+import polars as pl
+import shutil
+
+def drop_high_similarity_scrubs(input_path, total_counts, output_dir, threads=12, threshold=0.96):
+    print(f'Checking for highly similar strains')
+    print(f'threshold: {threshold}')
+    print(f'Total unique kmers of target strain: {total_counts}')
+    print(f'threads: {threads}')
+
+    path_counts = os.path.join(output_dir, 'similarity_counts.tsv')
+
+    # Use pigz if available — parallel gzip decompression
+    if input_path.endswith('.zst') or input_path.endswith('.zstd'):
+        decompress = "zstd -dc -T0"
+    elif input_path.endswith('.gz'):
+        decompress = "pigz -dc -p 4" if shutil.which("pigz") else "zcat"
+    else:
+        raise ValueError(f"Unknown compression for {input_path}")    # Read header
+    header_line = subprocess.check_output(
+        f"{decompress} {input_path} | head -1", shell=True, text=True
+    ).strip()
+    header = header_line.split("\t")
+    kmer_col = header.index("kmer") + 1
+    sample_col = header.index("sample_id") + 1
+    print(f'kmer col: {kmer_col}, sample_id col: {sample_col}')
+
+    # Sort gets most of the threads; pigz gets a few; awk is single-threaded but fast
+    sort_threads = max(1, threads - 4)
+    sort_mem = f"{max(2, threads // 2)}G"  # scale memory budget with threads
+
+    cmd = f"""
+    set -euo pipefail
+    {decompress} {input_path} \
+      | tail -n +2 \
+      | awk -F'\\t' -v s={sample_col} -v k={kmer_col} 'BEGIN{{OFS="\\t"}} {{print $s, $k}}' \
+      | LC_ALL=C sort -u --parallel={sort_threads} -S {sort_mem} -T {output_dir} \
+      | awk -F'\\t' 'BEGIN{{OFS="\\t"; print "sample_id","num_unique_kmers"}}
+                     {{ if ($1 != prev) {{ if (prev != "") print prev, n; prev = $1; n = 0 }}
+                        n++ }}
+                     END{{ if (prev != "") print prev, n }}' \
+      > {path_counts}
+    """
+    subprocess.run(["bash", "-c", cmd], check=True)
+
+    df = pl.read_csv(path_counts, separator="\t")
+    print(df)
+    return df
 
 def load_genome(genome_path):
     opener = gzip.open if genome_path.endswith('.gz') else open
@@ -470,29 +524,92 @@ def main():
         strain = strain_name_from_path(args.genome)
         basename = args.basename if args.basename else strain
         os.makedirs(args.output_dir, exist_ok=True)
+        
 
-        #
-        df_global_counts = pl.read_csv(args.counts_global, separator= '\t')
-        df_indiv_counts = pl.read_csv(args.counts_individual, separator= '\t')
-        df_indiv_counts = df_indiv_counts.rename({'kmer': '#kmer'})
+        # switch to scan csv for memory efficiency
+        df_global_counts = pl.read_csv(args.counts_global, 
+                                       separator= '\t', 
+                                       schema_overrides={'reference_count': pl.UInt32,
+                                                        'pangenome_count': pl.UInt32,
+                                                        'metagenome_count': pl.UInt32,
+                                                        'drug_count': pl.UInt32,}
+                                        )
+        print(df_global_counts)
+        print(len(df_global_counts))
+
+        # Drop individual counts with threshold larger than ...
+        lf_counts_individual = (pl.scan_csv(args.counts_individual, separator='\t')
+                                    .rename({'kmer': '#kmer'})
+                                    .unique() 
+                                )
+        
+        print(lf_counts_individual)
+        
+        zst_path = os.path.join(args.output_dir, 'individual_counts.tsv.zst')
+        if not os.path.exists(zst_path):
+            print(f'Converting gzip to zstd: {zst_path}')
+            subprocess.run(
+                f"pigz -dc {args.counts_individual} | zstd -T0 -o {zst_path}",
+                shell=True, check=True,
+            )
+        else:
+            print(f'Reusing existing zstd file: {zst_path}')
+
+
+        drop_high_similarity_scrubs(input_path = zst_path,
+                                    total_counts= len(df_global_counts),
+                                    threshold= 0.96,
+                                    output_dir = args.output_dir,
+                                    threads = args.threads)
+
+        #STOP here for now
+        sys.exit("Stopping before OOM step")
+
         print(f'Total kmers: {len(df_global_counts)}')
         print('Remove non unique kmers of ref genome:')
         df_global_counts = df_global_counts.filter(pl.col("reference_count") == 1)
         print(f'Remaining kmers: {len(df_global_counts)}')
-
-        # remove all drug count entries to its minimum
+         # remove all drug count entries to its minimum
         print('Removing all drug kmers > min (usually 0):')
         df_no_drugs = df_global_counts.filter(pl.col("drug_count") == pl.col("drug_count").min())
         print(f'Remaining kmers: {len(df_no_drugs)}')
-        
+
         # get all informative 0s
         df_inform_singletons = df_no_drugs.filter((pl.col("pangenome_count") == 0 )&(pl.col('metagenome_count') == 0))
         df_inform_singletons.write_parquet(os.path.join(args.output_dir , f'{basename}.inform_kmer_singleton.parquet'), compression='zstd')
+
+        # how do I reduce this to an ok number before trying to create pairs?
         print(f'Informative singletons: {len(df_inform_singletons)}')
 
         
         df_non_inform_singletons = df_no_drugs.filter(~(pl.col("pangenome_count") == 0 )&
                                                       ~(pl.col('metagenome_count') == 0))
+
+
+        # Drop all kmers from individual that have been droppped
+        # drop all non unique sample names
+        keep_kmers = pl.LazyFrame({'#kmer': df_non_inform_singletons['#kmer']})
+        print('Sinking individual counts to parquet (filtered to surviving kmers)')
+        (pl.scan_csv(args.counts_individual, separator='\t')
+            .rename({'kmer': '#kmer'})
+            .join(keep_kmers, on='#kmer', how='semi')
+            .sink_parquet(
+                args.output_dir + '/counts_individual.parquet',
+                compression='zstd',
+            )
+        )
+        print('finished sink')
+
+        df_indiv_counts = filter_long_counts_streaming(
+            parquet_path=args.output_dir + '/counts_individual.parquet',
+            output_dir=args.output_dir,
+            reference_kmers=df_non_inform_singletons['#kmer'],  # match what's in the parquet
+            presence_threshold=0.98,
+        )
+ 
+    
+        
+        
         
         # Creating pairs rom non informative singletons
         df_pairs = df_indiv_counts.filter(pl.col('#kmer').is_in(df_non_inform_singletons['#kmer'].implode())
