@@ -427,47 +427,55 @@ def smooth_downsample(df, total_target, bin_size, mode = None):
         result = pd.concat(contig_results)
         print(f'  Total: {len(df)} -> {len(result)} kmers after smooth downsampling')
         return result.sort_values(['contig_id', 'kmer_position'])
-def make_kmers_independent(df, type = 'singleton'):
     
-    if singleton:
-        contig_results = []
+def make_inform_kmers_independent(df, type = 'singleton'):
+    
+    if type == 'singleton':
+        df = assign_mapping_bin(df.loc[df['terminal_kmer'] == False], 31)
+
+        dict_drop = {}
         for contig_id, contig_df in df.groupby('contig_id'):
+            contig_df = contig_df.sort_values(['bin','drug_count', 'pangenome_count', 'metagenome_count'])
+            contig_df = contig_df.drop_duplicates('bin', keep = 'first')
+            contig_df = contig_df.sort_values('kmer_position', ascending = True)
             li_drop = []
-            for pos_i, (_, row) in enumerate(contig_result.iterrows()):
+            print(contig_df[['#kmer', 'kmer_position', 'reverse_complement']])
+            for pos_i, (_, row) in enumerate(contig_df.iterrows()):
                 if row['reverse_complement'] == True:
                     if pos_i == 0:
                         continue
                     else:
-                        neighbor = contig_result.iloc[pos_i-1]
+                        neighbor = contig_df.iloc[pos_i-1]
                         distance = row['kmer_position'] - neighbor['kmer_position']
                         if neighbor['reverse_complement'] == True:
                             req_distance = 31
                         if neighbor['reverse_complement'] == False:
                             req_distance = 62
                         if distance < req_distance and distance > 0:
-                            print('kmers are too close')
-                            print('drop worse kmer: ')
-                            pair =  contig_result.iloc[pos_i-1:pos_i+1]
+                            pair =  contig_df.iloc[pos_i-1:pos_i+1]
                             drop_position = pair.sort_values(['drug_count', 'pangenome_count', 'metagenome_count'], ascending = False).iloc[0]['kmer_position']
-                            print(drop_position)
                             li_drop.append(drop_position)
+                
                 if row['reverse_complement'] == False:
-                    if pos_i == len(contig_result)-1:
+                    if pos_i == len(contig_df)-1:
                         continue
                     else:
-                        neighbor = contig_result.iloc[pos_i+1]
+                        neighbor = contig_df.iloc[pos_i+1]
                         distance = neighbor['kmer_position'] - row['kmer_position']
                         if neighbor['reverse_complement'] == True:
                             req_distance = 62
                         if neighbor['reverse_complement'] == False:
                             req_distance = 31
                         if distance < req_distance:
-                            print('kmers are too close')
-                            pair = contig_result.iloc[pos_i:pos_i+2]
+                            pair = contig_df.iloc[pos_i:pos_i+2]
+                            # for singletons this is always 0 so whats the point here? could do some other score like jaccard from rest?
                             drop_position = pair.sort_values(['drug_count', 'pangenome_count', 'metagenome_count'],ascending=False).iloc[0]['kmer_position']
-                            print(f'drop worse kmer at position: {drop_position}')
                             li_drop.append(drop_position)
-    return li_drop
+            dict_drop[contig_id] = li_drop
+            print(f'Found too close kmers, on {contig_id}, drop: {len(li_drop)}')
+        return dict_drop
+    
+
 def plot_genome_bins(df, df_smooth, basename, bin_size, output_dir, map_only = False):
     if map_only:
         df=df.copy()
@@ -673,7 +681,7 @@ def main():
 
         li_drop = drop_high_similarity_scrubs(input_path = args.counts_summary,
                                     total_counts= len(df_global_counts),
-                                    threshold= [0.01,0.96],
+                                    threshold= [0.1,0.96],
                                     output_dir = os.path.join(args.output_dir))
 
         
@@ -713,9 +721,14 @@ def main():
         print(df_inform_singletons)
 
         # singletons should also be made independent!
-        df_loc_singles = pd.merge(df_inform_singletons.to_pandas(), df_locations, on = 'kmer', how = 'left')
+        df_loc_singles = pd.merge(df_inform_singletons.to_pandas(), df_locations, on = '#kmer', how = 'left')
         print(df_loc_singles)
-        make_kmers_independent(df_loc_singles, type = 'singleton')
+        # for now just to test independence
+        dict_drop = make_inform_kmers_independent(df_loc_singles, type = 'singleton')
+        print(dict_drop)
+        df_inform_singletons = 
+        # export parquet inform kmers
+        # drop 
 
         # start finding pairs
         sys.exit()
