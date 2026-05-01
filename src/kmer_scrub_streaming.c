@@ -259,7 +259,9 @@ summary_writer *summary_writer_open(const char *path,
 	}
 	s->total_ref_kmers = total_reference_kmers;
 	pthread_mutex_init(&s->mtx, NULL);
-	fprintf(s->fp, "sample_type\tsample_id\tn_unique_kmers\tcoverage_pct\n");
+	fprintf(s->fp,
+	        "sample_type\tsample_id\tn_unique_kmers\tcoverage_pct"
+	        "\tis_in_global\tis_in_individual\n");
 	return s;
 }
 
@@ -274,15 +276,19 @@ void summary_writer_close(summary_writer *s)
 static void summary_write_row(summary_writer *s,
                               const char *sample_type,
                               const char *sample_id,
-                              unsigned long n_unique_kmers)
+                              unsigned long n_unique_kmers,
+                              int is_in_global,
+                              int is_in_individual)
 {
 	if (!s) return;
 	double coverage = s->total_ref_kmers > 0
 	    ? (double)n_unique_kmers / (double)s->total_ref_kmers
 	    : 0.0;
 	pthread_mutex_lock(&s->mtx);
-	fprintf(s->fp, "%s\t%s\t%lu\t%.6f\n",
-	        sample_type, sample_id, n_unique_kmers, coverage);
+	fprintf(s->fp, "%s\t%s\t%lu\t%.6f\t%s\t%s\n",
+	        sample_type, sample_id, n_unique_kmers, coverage,
+	        is_in_global     ? "True" : "False",
+	        is_in_individual ? "True" : "False");
 	fflush(s->fp);  /* small file; flush so it's tail-able during long runs */
 	pthread_mutex_unlock(&s->mtx);
 }
@@ -446,15 +452,18 @@ static char *basename_no_ext(const char *path)
 extern int   contains_N(char *str);
 extern char *orient_string(char *seed_seq, char *seedStrRevComp, int seed);
 
-static void calculate_kmer_count_dual(const char *file,
-                                      const int seed,
-                                      BIO_hash h,
-                                      unsigned int global_col,
-                                      unsigned int scratch_col)
+/* Per-sample k-mer counting hot loop.
+   Increments ONLY the per-thread scratch column. The decision to fold
+   scratch into the global column is deferred until after the sample is
+   fully counted, so we can gate on coverage. */
+static void calculate_kmer_count_scratch(const char *file,
+                                         const int seed,
+                                         BIO_hash h,
+                                         unsigned int scratch_col)
 {
 	gzFile fp = gzopen(file, "r");
 	if (fp == NULL) {
-		fprintf(stderr, "could not read file %s in calculate_kmer_count_dual()\n",
+		fprintf(stderr, "could not read file %s in calculate_kmer_count_scratch()\n",
 		        file);
 		return;
 	}
@@ -482,7 +491,10 @@ static void calculate_kmer_count_dual(const char *file,
 			if (!has_N || !contains_N(orientStr)) {
 				count = (unsigned int *)BIO_searchHash(h, orientStr);
 				if (count != NULL) {
-					__sync_fetch_and_add(&count[global_col],  1);
+					/* Scratch is owned by this thread alone, but other threads
+					   may be touching the same hash bucket for a different
+					   sample's scratch column. Use atomic add to be safe under
+					   shared bucket access. */
 					__sync_fetch_and_add(&count[scratch_col], 1);
 				}
 			}
@@ -520,36 +532,80 @@ typedef struct {
 	seen_registry   *seen;
 	const char      *sample_type;
 	unsigned int     global_col;
+	double           cov_low;
+	double           cov_high;
+	unsigned long    total_ref_kmers;
 	const char      *skip_file;
 	FILE            *progress;
 	pthread_mutex_t  progress_mtx;
 } worker_pool_t;
 
-/* Returns the count of distinct k-mers emitted (i.e. non-zero scratch
-   entries swept). Used to populate the summary. */
-static unsigned long emit_and_zero_column(BIO_hash h,
-                                          unsigned int col,
-                                          sample_id_t *sid,
-                                          streaming_writer *writer)
+/* Two-phase sample finalize:
+
+   Phase 1 (count_unique_in_column): sweep scratch, count distinct k-mers
+   that hit (i.e. counts[scratch_col] > 0 AND counts[0] > 0 — only
+   reference-seeded k-mers count toward coverage).
+
+   Phase 2 (emit_zero_and_maybe_merge): sweep scratch a second time,
+   conditionally emit per-sample rows to the streaming writer,
+   conditionally fold into the global column atomically, and zero scratch.
+
+   We can't fuse phase 1 into phase 2 because the gating decision needs
+   the coverage value before any global merge or row emission happens.
+   Phase 1 is cheap (one int compare per bucket, no atomic ops, no row
+   pushes).
+*/
+static unsigned long count_unique_in_column(BIO_hash h,
+                                            unsigned int scratch_col)
 {
 	unsigned long n = 0;
 	for (unsigned int i = 0; i < h->M; i++) {
 		unsigned int *counts = (unsigned int *)h->data[i].DATA;
 		if (counts == NULL) continue;
-		unsigned int c = counts[col];
-		if (c == 0) continue;
-
-		sample_id_ref(sid);
-		row_t r;
-		r.kmer  = h->data[i].key;
-		r.sid   = sid;
-		r.count = c;
-		writer_push(writer, r);
-
-		counts[col] = 0;
-		n++;
+		/* Only count reference-seeded buckets. counts[0] > 0 means the
+		   k-mer was added during the reference seeding pass. */
+		if (counts[0] > 0 && counts[scratch_col] > 0) n++;
 	}
 	return n;
+}
+
+/* Sweep scratch_col exactly once, doing whichever of {emit rows, merge
+   into global} are enabled, and always zeroing scratch at the end. */
+static void emit_zero_and_maybe_merge(BIO_hash h,
+                                      unsigned int scratch_col,
+                                      unsigned int global_col,
+                                      int merge_into_global,
+                                      int emit_individual,
+                                      sample_id_t *sid,
+                                      streaming_writer *writer)
+{
+	/* If the writer was not provided (e.g. driver run without -o), force
+	   emit_individual off — there's nothing to emit to. */
+	if (writer == NULL) emit_individual = 0;
+
+	for (unsigned int i = 0; i < h->M; i++) {
+		unsigned int *counts = (unsigned int *)h->data[i].DATA;
+		if (counts == NULL) continue;
+		unsigned int c = counts[scratch_col];
+		if (c == 0) continue;
+
+		if (emit_individual) {
+			sample_id_ref(sid);
+			row_t r;
+			r.kmer  = h->data[i].key;
+			r.sid   = sid;
+			r.count = c;
+			writer_push(writer, r);
+		}
+
+		if (merge_into_global) {
+			/* Other workers may be merging their own samples into the
+			   same global column concurrently — must be atomic. */
+			__sync_fetch_and_add(&counts[global_col], c);
+		}
+
+		counts[scratch_col] = 0;
+	}
 }
 
 static void *worker_main(void *arg)
@@ -606,13 +662,48 @@ static void *worker_main(void *arg)
 
 		sample_id_t *sid = sample_id_new(id, p->sample_type);
 
-		calculate_kmer_count_dual(path, p->seed, p->h,
-		                          p->global_col, scratch_col);
+		/* Hot loop: scratch-only counting. */
+		calculate_kmer_count_scratch(path, p->seed, p->h, scratch_col);
 
-		unsigned long n_unique =
-		    emit_and_zero_column(p->h, scratch_col, sid, p->writer);
+		/* Phase 1: how many reference-seeded k-mers did this sample hit? */
+		unsigned long n_unique = count_unique_in_column(p->h, scratch_col);
 
-		summary_write_row(p->summary, p->sample_type, id, n_unique);
+		double coverage = p->total_ref_kmers > 0
+		    ? (double)n_unique / (double)p->total_ref_kmers
+		    : 0.0;
+
+		/* Coverage band gates. Two independent decisions:
+		     coverage > cov_high  → drop from BOTH global and individual
+		     coverage < cov_low   → drop from individual ONLY (still global)
+		   Otherwise both flags True. */
+		int is_in_global     = (coverage <= p->cov_high);
+		int is_in_individual = is_in_global && (coverage >= p->cov_low);
+
+		if (!is_in_global) {
+			fprintf(stderr,
+			        "excluding %s [%s] from global+individual: "
+			        "coverage=%.6f > cov_high=%.6f\n",
+			        id, p->sample_type, coverage, p->cov_high);
+		} else if (!is_in_individual) {
+			fprintf(stderr,
+			        "excluding %s [%s] from individual only: "
+			        "coverage=%.6f < cov_low=%.6f\n",
+			        id, p->sample_type, coverage, p->cov_low);
+		}
+
+		/* Phase 2: do whichever passes are enabled, in a single sweep,
+		   and always zero scratch for the next sample on this thread. */
+		emit_zero_and_maybe_merge(p->h, scratch_col, p->global_col,
+		                          is_in_global, is_in_individual,
+		                          sid, p->writer);
+
+		/* Reflect the actual outcome in the summary. If writer was NULL
+		   we couldn't have emitted individual rows regardless. */
+		int summary_in_individual =
+		    is_in_individual && (p->writer != NULL);
+
+		summary_write_row(p->summary, p->sample_type, id,
+		                  n_unique, is_in_global, summary_in_individual);
 
 		free(id);
 		sample_id_unref(sid);
@@ -634,6 +725,9 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
                                      streaming_writer *writer,
                                      summary_writer  *summary,
                                      seen_registry   *seen,
+                                     double cov_low,
+                                     double cov_high,
+                                     unsigned long total_reference_kmers,
                                      FILE *progress,
                                      const char *skip_file)
 {
@@ -665,20 +759,23 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 
 	worker_pool_t p;
 	memset(&p, 0, sizeof p);
-	p.jcap        = nlines + 1;
-	p.jobs        = malloc(sizeof(sample_job_t *) * p.jcap);
-	p.shutdown    = 0;
-	p.tid_counter = 0;
-	p.seed        = seed;
-	p.h           = h;
-	p.num_threads = num_threads;
-	p.writer      = writer;
-	p.summary     = summary;
-	p.seen        = seen;
-	p.sample_type = sample_type;
-	p.global_col  = global_col;
-	p.skip_file   = skip_file;
-	p.progress    = progress;
+	p.jcap            = nlines + 1;
+	p.jobs            = malloc(sizeof(sample_job_t *) * p.jcap);
+	p.shutdown        = 0;
+	p.tid_counter     = 0;
+	p.seed            = seed;
+	p.h               = h;
+	p.num_threads     = num_threads;
+	p.writer          = writer;
+	p.summary         = summary;
+	p.seen            = seen;
+	p.sample_type     = sample_type;
+	p.global_col      = global_col;
+	p.cov_low         = cov_low;
+	p.cov_high        = cov_high;
+	p.total_ref_kmers = total_reference_kmers;
+	p.skip_file       = skip_file;
+	p.progress        = progress;
 	pthread_mutex_init(&p.jmtx, NULL);
 	pthread_cond_init(&p.jhas_work, NULL);
 	pthread_mutex_init(&p.progress_mtx, NULL);

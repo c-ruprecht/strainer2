@@ -12,7 +12,7 @@
  * Usage:
  *   kmer_strain_detect -k <kmer.tsv[.gz]> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-j threads]
  */
-
+#define _GNU_SOURCE
 #include "zlib.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -357,7 +357,7 @@ static void usage(void) {
     fprintf(stderr, "Usage: kmer_strain_detect -k <kmer_tsv> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-G <background.txt>] [-j threads]\n\n");
     fprintf(stderr, "  -k  kmer TSV with a '#kmer' column (plain or gzipped)\n");
     fprintf(stderr, "  -B  target metagenomes file (tab-separated: type file1 [file2])\n");
-    fprintf(stderr, "  -G  background metagenomes file (same format as -B); columns prefixed 'backmeta_'\n");
+    fprintf(stderr, "  -G  background metagenomes file (same format as -B); columns prefixed 'b_'\n");
     fprintf(stderr, "      types: PE, SE, PEI\n");
     fprintf(stderr, "  -o  output file (e.g. sample.kmer_hits.tsv.gz)\n");
     fprintf(stderr, "  -j  threads (default: 4)\n\n");
@@ -403,8 +403,10 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "loaded %d background metagenome(s)\n", n_bg);
         mgs = realloc(mgs, (n_mg + n_bg) * sizeof(Metagenome));
         for (int i = 0; i < n_bg; i++) {
-            char *prefixed = malloc(strlen(bg[i].basename) + 9); /* "backmeta_" + '\0' */
-            sprintf(prefixed, "backmeta_%s", bg[i].basename);
+            char *prefixed = NULL;
+            if (asprintf(&prefixed, "b_%s", bg[i].basename) < 0) {
+                perror("asprintf"); exit(1);
+            }
             free(bg[i].basename);
             bg[i].basename = prefixed;
             mgs[n_mg + i] = bg[i];

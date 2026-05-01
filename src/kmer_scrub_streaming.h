@@ -24,7 +24,35 @@
 
 	Optional summary file (plain TSV, one row per sample):
 	  sample_type<TAB>sample_id<TAB>n_unique_kmers<TAB>coverage_pct
+	          <TAB>is_in_global<TAB>is_in_individual
 	  coverage_pct = n_unique_kmers / total_reference_kmers
+	  is_in_global     = "True" if the sample's counts were folded into
+	                     the global column (global_col).
+	  is_in_individual = "True" if per-sample rows were written to the
+	                     long-format file. Always "False" if writer==NULL.
+
+	Coverage band gating (cov_low, cov_high)
+	----------------------------------------
+	Two independent gates, both based on the sample's coverage_pct:
+
+	  coverage_pct  <  cov_low  -> in_global=True,  in_individual=False
+	    (sample contributes to the background/global column but is too
+	     sparse to be worth carrying as per-sample rows)
+
+	  cov_low <= coverage_pct <= cov_high
+	                            -> in_global=True,  in_individual=True
+	    (the "good band")
+
+	  coverage_pct  >  cov_high -> in_global=False, in_individual=False
+	    (sample looks too much like the reference itself — likely a
+	     near-duplicate that would skew the global background — drop
+	     entirely)
+
+	  Defaults that disable both gates: cov_low=0.0, cov_high=1.0.
+	  (Coverage is bounded by [0, 1] by definition.)
+
+	  total_reference_kmers is the denominator used to compute
+	  coverage_pct; it must match the value passed to summary_writer_open.
 */
 
 /* Opaque contexts. */
@@ -45,7 +73,11 @@ void            summary_writer_close(summary_writer *s);
 seen_registry *seen_registry_new(void);
 void           seen_registry_free(seen_registry *r);
 
-/* ── Public entry point ─────────────────────────────────────────────── */
+/* ── Public entry point ─────────────────────────────────────────────────
+   `writer` may be NULL — per-sample long-format rows are then discarded
+   regardless of cov_low (in_individual is always False in that case).
+   `summary` may also be NULL (no summary file written).
+*/
 void GEN_per_sample_kmer_counts_dual(const char *list_path,
                                      const char *sample_type,
                                      unsigned int global_col,
@@ -55,6 +87,9 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
                                      streaming_writer *writer,
                                      summary_writer  *summary,
                                      seen_registry   *seen,
+                                     double cov_low,
+                                     double cov_high,
+                                     unsigned long total_reference_kmers,
                                      FILE *progress,
                                      const char *skip_file);
 
