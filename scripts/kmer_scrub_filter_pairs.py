@@ -747,6 +747,18 @@ def main():
         print(df_global_counts)
         total_kmers = len(df_global_counts)
 
+        # create histogram plot
+        df_hist = pd.read_csv(args.counts_summary, sep='\t')
+        fig = px.histogram(
+            df_hist,
+            x='coverage_pct',
+            log_y = True,
+            histfunc = 'count',
+            template='simple_white',
+            title=f'{basename} — coverage_pct distribution',
+            )
+        fig.update_layout(width=800, height=500)
+        fig.write_image(os.path.join(args.output_dir, f'{basename}.histogram_scrub_db.svg'))
         
 
         
@@ -795,7 +807,7 @@ def main():
         
         kmer_pairs_from_presence(args.counts_individual, args.counts_summary, args.output_dir , basename = basename,
                                  df_keep=df_non_inform_singletons,
-                                 presence_t = 20, similarity_t=None,n_workers=args.threads)
+                                 presence_t = 10, similarity_t=None,n_workers=args.threads)
 
         # Count how often each kmer is in a pair
         # make them independent
