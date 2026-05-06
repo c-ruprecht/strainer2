@@ -853,7 +853,7 @@ def main():
                     else "pair",
             axis=1,
         )      
-        df_locations.to_csv(os.path.join(args.output_dir, f'{basename}.scrubbed_kmers.tsv.gz'),
+        df_locations.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
                                          sep='\t', index=False)
         df_locations[['#kmer']].to_csv(os.path.join(args.output_dir, f'{basename}.scrubbed_kmers'),
                                 sep='\t', index=False, header=None)
