@@ -795,7 +795,7 @@ def main():
         
         kmer_pairs_from_presence(args.counts_individual, args.counts_summary, args.output_dir , basename = basename,
                                  df_keep=df_non_inform_singletons,
-                                 presence_t=50, similarity_t=None,n_workers=args.threads)
+                                 presence_t = 20, similarity_t=None,n_workers=args.threads)
 
         # Count how often each kmer is in a pair
         # make them independent
