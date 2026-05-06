@@ -699,7 +699,7 @@ def main():
     parser.add_argument('--figures', action='store_true', default=False,
                         help='Save figures as SVG (default: False)')
     parser.add_argument('--threads', type = int)
-    parser.add_argument('--presence_t', type = int, help = 'maximal presence threshold for pair generation' default = 10)
+    parser.add_argument('--presence_t', type = int, help = 'maximal presence threshold for pair generation' ,default = 10)
     parser.add_argument('--percentage', type=float, default=0.01,
                         help='Percentile threshold for rare kmer selection (default: 0.05)')
     parser.add_argument('--percentile_union', type = float, default = 0.05, help = 'percentile passed for union of different kmer scrubs')
