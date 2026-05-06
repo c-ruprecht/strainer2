@@ -757,6 +757,7 @@ def main():
             histfunc = 'count',
             template='simple_white',
             title=f'{basename} — coverage_pct distribution',
+            range_x = [0,1],
             )
         fig.update_layout(width=800, height=500)
         fig.write_image(os.path.join(args.output_dir, f'{basename}.histogram_scrub_db.svg'))
