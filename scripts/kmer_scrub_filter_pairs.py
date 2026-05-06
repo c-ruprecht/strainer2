@@ -798,7 +798,7 @@ def main():
         print(df_loc_singles)
         # for now just to test independence
         #dict_drop = make_inform_kmers_independent(df_loc_singles, type = 'singleton')
-        #df_inform_singletons.filter()write_parquet(args.output_dir+f'{basename}.inform_kmer_singleton.parquet')
+        df_inform_singletons.write_parquet(args.output_dir+f'{basename}.inform_kmer_singleton.parquet')
 
         # export parquet inform kmers
         li_kmers = df_non_inform_singletons.get_column('#kmer').to_list()
