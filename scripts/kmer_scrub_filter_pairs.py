@@ -699,6 +699,7 @@ def main():
     parser.add_argument('--figures', action='store_true', default=False,
                         help='Save figures as SVG (default: False)')
     parser.add_argument('--threads', type = int)
+    parser.add_argument('--presence_t', type = int, help = 'maximal presence threshold for pair generation' default = 10)
     parser.add_argument('--percentage', type=float, default=0.01,
                         help='Percentile threshold for rare kmer selection (default: 0.05)')
     parser.add_argument('--percentile_union', type = float, default = 0.05, help = 'percentile passed for union of different kmer scrubs')
@@ -807,7 +808,7 @@ def main():
         
         kmer_pairs_from_presence(args.counts_individual, args.counts_summary, args.output_dir , basename = basename,
                                  df_keep=df_non_inform_singletons,
-                                 presence_t = 10, similarity_t=None,n_workers=args.threads)
+                                 presence_t = args.presence_t, similarity_t=None,n_workers=args.threads)
 
         # Count how often each kmer is in a pair
         # make them independent
