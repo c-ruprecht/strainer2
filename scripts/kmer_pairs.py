@@ -876,8 +876,7 @@ def main():
     
     # Gets all rows with kmer counts
     print('Creating pairs for all kmers with counts: ')
-    #df_w_count = df.filter(pl.col("count_kmer_singleton") > 0).drop("count_kmer_singleton")  
-    df_w_count = df
+    df_w_count = df.filter(pl.col("count_kmer_singleton") > 0).drop("count_kmer_singleton")  
     n = df_w_count.shape[0]
     g = len([c for c in df_w_count.columns if c != "#kmer"])
     print(f"N kmers after zero-filter: {n:,}", flush=True)

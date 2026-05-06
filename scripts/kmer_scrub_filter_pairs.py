@@ -21,7 +21,6 @@ import polars as pl
 import pandas as pd
 import pyarrow as pa
 import gc
-from kmer_pairs import drop_high_presence_strains, create_kmer_pairs_parallel 
 import glob
 
 import subprocess
@@ -42,129 +41,201 @@ from itertools import combinations
 import os
 from collections import defaultdict
 
+from collections import defaultdict
+from itertools import combinations
+from multiprocessing import Pool
+import os
+import glob
 
-def build_signatures_from_long(df_long, kmer_col="#kmer", strain_col="sample_id"):
-    """From long-format presence data, produce signature equivalence classes.
+import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 
-    Returns:
-      sig_df: Polars DataFrame with columns [sig_id, n_kmers, strain_set (list[int]), n_strains]
-      kmer_to_sig: Polars DataFrame [#kmer, sig_id]
-      strain_index: dict mapping strain name -> int (for strain_set encoding)
-    """
-    strains = df_long[strain_col].unique().sort().to_list()
-    strain_index = {s: i for i, s in enumerate(strains)}
-
-    # one row per kmer with its sorted list of strain indices = canonical signature
-    kmer_sigs = (
-        df_long
-        .with_columns(pl.col(strain_col).replace_strict(strain_index).alias("_sidx"))
-        .group_by(kmer_col)
-        .agg(pl.col("_sidx").sort().alias("strain_set"))
-        .with_columns(pl.col("strain_set").list.len().alias("n_strains"))
-    )
-
-    # group kmers by identical signatures
-    sig_df = (
-        kmer_sigs
-        .group_by("strain_set")
-        .agg([
-            pl.col(kmer_col).alias("kmers"),
-            pl.col(kmer_col).len().alias("n_kmers"),
-            pl.col("n_strains").first(),
-        ])
-        .with_row_index("sig_id")
-    )
-
-    kmer_to_sig = (
-        sig_df.explode("kmers")
-              .select(pl.col("kmers").alias(kmer_col), "sig_id")
-    )
-
-    print(f"  {kmer_sigs.height:,} k-mers → {sig_df.height:,} unique signatures "
-          f"({kmer_sigs.height / sig_df.height:.1f}x compression)")
-    return sig_df, kmer_to_sig, strain_index
 
 _PAIR_SCHEMA = pa.schema([
-("kmerA", pa.string()),
-("kmerB", pa.string()),
-("sig_a", pa.uint32()),
-("sig_b", pa.uint32()),
+    ("kmerA", pa.string()),
+    ("kmerB", pa.string()),
+    ("count", pa.int64()),
 ])
 
 
-def find_informative_pairs(sig_df, output_dir, basename, batch_size=1_000_000):
-    """Informative pair = two signatures with disjoint strain sets.
-    Expand each informative signature pair into all kmer × kmer products.
-    """
-    sigs = sig_df.sort("sig_id")
-    sig_sets = [frozenset(s) for s in sigs["strain_set"].to_list()]
-    sig_kmers = sigs["kmers"].to_list()
-    sig_ids = sigs["sig_id"].to_list()
-    n_sig = len(sig_sets)
+# ---------- worker globals (presence -> scrub_id sets) ----------
 
-    inform_path = os.path.join(output_dir, f"{basename}.inform_kmer_pairs.parquet")
-    writer = pq.ParquetWriter(inform_path, _PAIR_SCHEMA, compression="zstd")
+_SETS = None      # list[frozenset[int]] indexed by kmer position
+_KMERS = None     # list[str] of kmer sequences
 
-    a_buf, b_buf, sa_buf, sb_buf = [], [], [], []
+
+def _init_worker_disjoint(sets, kmers):
+    global _SETS, _KMERS
+    _SETS = sets
+    _KMERS = kmers
+
+def _process_disjoint_chunk(args):
+    chunk_id, i_indices, output_dir, basename, write_non_inform, batch_size = args
+    print(f"[worker {chunk_id}] starting, {len(i_indices)} anchors, writing to {output_dir}", flush=True)
+    n = len(_KMERS)
+
+    inform_path = os.path.join(
+        output_dir, f"{basename}.inform_kmer_pairs.part{chunk_id:04d}.parquet"
+    )
+    inform_w = pq.ParquetWriter(inform_path, _PAIR_SCHEMA, compression="zstd")
+
+    non_inform_w = None
+    if write_non_inform:
+        non_inform_path = os.path.join(
+            output_dir, f"{basename}.non_inform_kmer_pairs.part{chunk_id:04d}.parquet"
+        )
+        non_inform_w = pq.ParquetWriter(non_inform_path, _PAIR_SCHEMA, compression="zstd")
+
+    i_a, i_b, i_n = [], [], []
+    n_a, n_b, n_n = [], [], []
+
+    def flush(writer, cols):
+        if cols[0]:
+            writer.write_table(
+                pa.table({"kmerA": cols[0], "kmerB": cols[1], "count": cols[2]},
+                         schema=_PAIR_SCHEMA)
+            )
+            cols[0].clear(); cols[1].clear(); cols[2].clear()
+
+    inform_buf = [i_a, i_b, i_n]
+    non_inform_buf = [n_a, n_b, n_n]
     n_inform = 0
+    n_non_inform = 0
 
-    def flush():
-        nonlocal a_buf, b_buf, sa_buf, sb_buf
-        if not a_buf:
-            return
-        writer.write_table(pa.table(
-            {"kmerA": a_buf, "kmerB": b_buf, "sig_a": sa_buf, "sig_b": sb_buf},
-            schema=_PAIR_SCHEMA,
-        ))
-        a_buf, b_buf, sa_buf, sb_buf = [], [], [], []
+    for i in i_indices:
+        kA = _KMERS[i]
+        sA = _SETS[i]
+        for j in range(i + 1, n):
+            kB = _KMERS[j]
+            # disjoint => informative pair
+            if sA.isdisjoint(_SETS[j]):
+                a_, b_ = (kA, kB) if kA < kB else (kB, kA)
+                i_a.append(a_); i_b.append(b_); i_n.append(0)
+                n_inform += 1
+                if len(i_a) >= batch_size:
+                    flush(inform_w, inform_buf)
+            else:
+                n_non_inform += 1
+                if write_non_inform:
+                    c = len(sA & _SETS[j])
+                    a_, b_ = (kA, kB) if kA < kB else (kB, kA)
+                    n_a.append(a_); n_b.append(b_); n_n.append(c)
+                    if len(n_a) >= batch_size:
+                        flush(non_inform_w, non_inform_buf)
 
-    print(f"  Scanning {n_sig*(n_sig-1)//2:,} signature pairs", flush=True)
-    for i, j in combinations(range(n_sig), 2):
-        if sig_sets[i].isdisjoint(sig_sets[j]):
-            # expand to all kmer pairs in this signature × signature block
-            ka_list, kb_list = sig_kmers[i], sig_kmers[j]
-            sid_a, sid_b = sig_ids[i], sig_ids[j]
-            for ka in ka_list:
-                for kb in kb_list:
-                    a, b = (ka, kb) if ka < kb else (kb, ka)
-                    a_buf.append(a); b_buf.append(b)
-                    sa_buf.append(sid_a); sb_buf.append(sid_b)
-                    n_inform += 1
-                    if len(a_buf) >= batch_size:
-                        flush()
+    flush(inform_w, inform_buf)
+    inform_w.close()
+    if write_non_inform:
+        flush(non_inform_w, non_inform_buf)
+        non_inform_w.close()
 
-    flush()
-    writer.close()
-    print(f"  Informative pairs: {n_inform:,}", flush=True)
-    return n_inform
-_TRIP_SCHEMA = pa.schema([
-    ("kmerA", pa.string()), ("kmerB", pa.string()), ("kmerC", pa.string()),
-    ("sig_a", pa.uint32()), ("sig_b", pa.uint32()), ("sig_c", pa.uint32()),
-])
+    return chunk_id, n_inform, n_non_inform
 
 
+def create_disjoint_kmer_pairs_parallel(
+    df_presence, output_dir, basename,
+    n_workers=None,
+    kmer_column="#kmer",
+    list_column="list_scrub_id",
+    batch_size=1_000_000,
+    write_non_inform=False,
+):
+    """Parallel disjoint-pair generation from a presence-list dataframe.
 
-def drop_high_similarity_scrubs(input_path, total_counts, output_dir, threads=12, threshold=[0.01, 0.96]):
-    print(f'Checking for highly similar strains')
-    print(f'threshold: {threshold}')
-    print(f'Total unique kmers of target strain: {total_counts}')
-    print(f'threads: {threads}')
+    df_presence: Polars DataFrame with columns [kmer_column, list_column],
+                 where list_column is List[UInt32] of scrub_ids per kmer.
+                 Empty lists should already be filtered out upstream.
+    Output: same parquet structure as create_kmer_pairs_parallel — informative
+            pairs (disjoint scrub_id sets) get count=0; optional non-inform
+            parquet stores |intersection|.
 
-    df = pd.read_csv(input_path, sep = '\t')
-    print(df)
-    df_over = df.loc[(df['coverage_pct']>= threshold[1]) | (df['coverage_pct'] <= threshold[0])]
-    fig = px.histogram(df,
-                    x = 'coverage_pct',
-                    log_y = True,
-                    template = 'simple_white')
-    fig.add_vrect(x0= threshold[0],x1 = threshold[1],
-                  fillcolor="green", opacity=0.25, line_width=0,
-                  annotation_text=f"threshold:  {threshold}")
-    fig.write_image(os.path.join(output_dir, 'histogram_scrub_coverage.svg'))
-    print('Dropping strains over threshold')
-    print(df_over)
-    return df_over['sample_id']
+    Returns (n_inform, n_non_inform).
+    """
+    kmers = df_presence.get_column(kmer_column).to_list()
+    n = len(kmers)
+    if n < 2:
+        print("Fewer than 2 kmers — nothing to pair.", flush=True)
+        return 0, 0
 
+    # build per-kmer scrub_id frozensets (workers share via fork)
+    lists = df_presence.get_column(list_column).to_list()
+    sets = [frozenset(v) for v in lists]
+
+    n_workers = n_workers or max(1, os.cpu_count() - 1)
+    n_workers = min(n_workers, n - 1)
+
+    # balance anchors greedily by remaining work (same as your pair function)
+    workloads = [(i, n - i - 1) for i in range(n - 1)]
+    workloads.sort(key=lambda x: -x[1])
+    chunks = [[] for _ in range(n_workers)]
+    chunk_loads = [0] * n_workers
+    for i, load in workloads:
+        w = chunk_loads.index(min(chunk_loads))
+        chunks[w].append(i)
+        chunk_loads[w] += load
+
+    args_list = [
+        (cid, sorted(indices), output_dir, basename, write_non_inform, batch_size)
+        for cid, indices in enumerate(chunks) if indices
+    ]
+    print(
+        f"Disjoint pair generation: {n:,} kmers, "
+        f"{n*(n-1)//2:,} candidate pairs, {len(args_list)} workers",
+        flush=True,
+    )
+
+    with Pool(n_workers, initializer=_init_worker_disjoint, initargs=(sets, kmers)) as pool:
+        results = pool.map(_process_disjoint_chunk, args_list)
+
+    n_inform = sum(r[1] for r in results)
+    n_non_inform = sum(r[2] for r in results)
+    print(
+        f"Done. Informative (disjoint) pairs: {n_inform:,}  "
+        f"Non-informative pairs: {n_non_inform:,} (write_non_inform={write_non_inform})",
+        flush=True,
+    )
+    return n_inform, n_non_inform
+
+def kmer_pairs_from_presence(
+    presence_tsv, summary_tsv, output_dir, basename, df_keep,
+    presence_t=50, similarity_t=None,
+    n_workers=None, write_non_inform=False,
+):
+    # exclusion list from summary
+    df = pl.read_csv(summary_tsv, separator='\t')
+    if similarity_t is not None:
+        df_t = df.filter(pl.col('coverage_pct') < similarity_t)
+    else:
+        df_t = df.filter(pl.col('is_in_global') == False)
+    li_t = df_t.get_column('scrub_id').cast(pl.UInt32).to_list()
+
+    # read & clean presence
+    df_presence = (
+        pl.scan_csv(presence_tsv, separator='\t')
+          .filter(pl.col('list_scrub_id').str.count_matches(',') < presence_t - 1)
+          .with_columns(
+              pl.col('list_scrub_id')
+                .str.split(',')
+                .cast(pl.List(pl.UInt32))
+                .list.set_difference(li_t)
+          )
+          .filter(pl.col('list_scrub_id').list.len() > 0)
+          #.filter(pl.col('#kmer').is_in(li_kmers))
+          .collect(engine='streaming')
+    )
+    print(df_presence)
+    print(f"Presence rows after filtering: {df_presence.shape[0]:,}", flush=True)
+    if df_keep is not None:
+        df_presence = df_presence.join(df_keep, on='#kmer', how='semi')
+        print(f"After kmer subset filter: {df_presence.shape[0]:,}", flush=True)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    return create_disjoint_kmer_pairs_parallel(
+        df_presence, output_dir, basename,
+        n_workers=n_workers,
+        write_non_inform=write_non_inform,
+    )
 
 def load_genome(genome_path):
     opener = gzip.open if genome_path.endswith('.gz') else open
@@ -678,21 +749,11 @@ def main():
 
         
 
-
-        li_drop = drop_high_similarity_scrubs(input_path = args.counts_summary,
-                                    total_counts= len(df_global_counts),
-                                    threshold= [0.1,0.96],
-                                    output_dir = os.path.join(args.output_dir))
-
         
-        # Check for highly similar strains and drop
-        # This should move to kmer scrub to not advance global counts when a strain is too close          
-
         print(f'Total kmers: {len(df_global_counts)}')
         print('Remove kmers with count >1 from ref genome:')
         df_global_counts = df_global_counts.filter(pl.col("reference_count") == 1)
         print(f'Remaining kmers: {len(df_global_counts)}')
-         # remove all drug count entries to its minimum
         print('Removing all kmers present in drug scrub:')
         df_no_drugs = df_global_counts.filter(pl.col("drug_count") == pl.col("drug_count").min())
         print(f'Remaining kmers: {len(df_no_drugs)}')
@@ -705,13 +766,9 @@ def main():
         # Mapping kmers
         print(f'Loading genome: {args.genome}')
         records = load_genome(args.genome)
-        print(f'  {len(records)} contigs')
-        all_kmers = df_no_drugs['#kmer']
-        df_locations, _ = build_mapped_kmers_ahocorasick(records, all_kmers, terminal_dist=args.terminal_dist)
-        print(df_locations)
+        
 
         # merge positions and counts
-
         n_targets = total_kmers * args.percentage 
         
 
@@ -721,21 +778,30 @@ def main():
         print(df_inform_singletons)
 
         # singletons should also be made independent!
-        df_loc_singles = pd.merge(df_inform_singletons.to_pandas(), df_locations, on = '#kmer', how = 'left')
+        single_kmers = df_inform_singletons.get_column('#kmer').to_list()
+        df_loc_singles, _ = build_mapped_kmers_ahocorasick(records, single_kmers, terminal_dist=args.terminal_dist)
+        #df_loc_singles = pd.merge(df_inform_singletons.to_pandas(), df_locations, on = '#kmer', how = 'left')
+        
         print(df_loc_singles)
         # for now just to test independence
-        dict_drop = make_inform_kmers_independent(df_loc_singles, type = 'singleton')
-        print(dict_drop)
-        df_inform_singletons = 
+        #dict_drop = make_inform_kmers_independent(df_loc_singles, type = 'singleton')
+        #df_inform_singletons.filter()write_parquet(args.output_dir+f'{basename}.inform_kmer_singleton.parquet')
+
         # export parquet inform kmers
-        # drop 
+        li_kmers = df_non_inform_singletons.get_column('#kmer').to_list()
+        print('Creating pairs from non informative singletons')
+        print(df_non_inform_singletons)
+
+        
+        kmer_pairs_from_presence(args.counts_individual, args.counts_summary, args.output_dir , basename = basename,
+                                 df_keep=df_non_inform_singletons,
+                                 presence_t=50, similarity_t=None,n_workers=args.threads)
+
+        # Count how often each kmer is in a pair
+        # make them independent
 
         # start finding pairs
-        sys.exit()
-        print(f'targetting {n_targets} informative kmer pairs')
-
-        print(f'Non-informative singletons (need pair search): {len(df_non_inform_singletons):,}')
-
+        
         ### Build a greedy selection for n_target percentage
         #   maximal kmers to track 1% - singletons?
         #   keep better scored pairs, how to score: 
@@ -743,15 +809,26 @@ def main():
         #   Start point just dataframe sorted by counts union?
 
        
-            
-            
-        
 
+        # singletons
         singleton_kmers = set(df_inform_singletons["#kmer"].to_list())
-        pair_kmers = set(df_inform_pairs["kmerA"].to_list()) | set(df_inform_pairs["kmerB"].to_list())
+
+        # pair parts → unique kmers across both columns, computed lazily
+        pair_glob = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")
+
+        pair_kmers = set(
+            pl.scan_parquet(pair_glob)
+            .select(pl.concat([pl.col('kmerA'), pl.col('kmerB')]).unique().alias('#kmer'))
+            .collect(engine='streaming')
+            .get_column('#kmer')
+            .to_list()
+        )
+
         all_kmers = singleton_kmers | pair_kmers
-        print(f'Total kmers for strain_detect: {len(all_kmers)}')
-        
+        print(f"Singletons: {len(singleton_kmers):,}")
+        print(f"Pair kmers: {len(pair_kmers):,}")
+        print(f"Total kmers for strain_detect: {len(all_kmers):,}")
+        df_locations ,_ = build_mapped_kmers_ahocorasick(records, all_kmers, terminal_dist=args.terminal_dist)
 
         #annotate kmer
         # Annotate source

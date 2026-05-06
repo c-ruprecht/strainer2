@@ -10,52 +10,47 @@
 #include "kmer_scrub_streaming.h"
 
 /*
-	kmer_scrub_count_individual (single-pass variant)
+	kmer_scrub_count_individual (inverted-index variant)
 
 	Outputs:
 	  1) Global counts to stdout (TSV) — unchanged format:
 	       #kmer  reference_count  pangenome_count  metagenome_count  [drug_count]
 
-	  2) Per-sample counts as a long-format zstd-compressed TSV via -o (optional):
-	       kmer  sample_type  sample_id  count
+	  2) Inverted presence file via -o (optional), zstd-compressed TSV:
+	       #kmer  list_scrub_id
+	     where list_scrub_id is comma-separated u32 — the scrub_ids of
+	     all samples that hit that k-mer.
 
 	  3) Per-sample summary plain TSV via -S (optional):
-	       sample_type  sample_id  n_unique_kmers  coverage_pct
-	                              is_in_global  is_in_individual
+	       scrub_id  sample_type  sample_id  n_unique_kmers  coverage_pct
+	               is_in_global
 
-	Coverage band gate (-T LOW,HIGH, default 0.0,1.0 = disabled):
+	  scrub_id is sequential u32 (starting at 0), assigned in completion
+	  order. The same id appears in the presence file's list_scrub_id
+	  column.
 
-	    coverage  <  LOW   → in_global=True,  in_individual=False
-	      (sparse hit, contributes to background but not worth carrying
-	       per-sample)
+	Coverage threshold (-T): if coverage_pct > threshold, the sample's
+	counts are NOT folded into the global column (is_in_global=False).
+	The sample STILL gets a scrub_id, summary row, and presence appends.
+	Default 1.0 disables the gate.
 
-	    LOW <= coverage <= HIGH
-	                       → in_global=True,  in_individual=True
+	Architecture: single-pass per file. Workers do hot loop + scratch
+	sweep in parallel; a single writer thread assigns scrub_ids and
+	appends them to per-bucket id-lists (one queue record per sample).
+	The presence file is materialized in one serial sweep at the end.
 
-	    coverage  >  HIGH  → in_global=False, in_individual=False
-	      (looks like the reference itself; drop entirely so it doesn't
-	       skew the global background)
-
-	  -T accepts either "LOW,HIGH" (e.g. "0.1,0.96") or a single value
-	  which is interpreted as HIGH with LOW=0.0 (back-compat with the
-	  earlier single-threshold behavior).
-
-	Architecture: single-pass per file, hash bounded by O(n_kmers x (4 + T)).
-
-	Duplicate sample_id detection: if two input files yield the same
-	(sample_type, sample_id) pair (e.g. same basename), the second one
-	is skipped with a warning to stderr. Detection is process-global
-	across -A / -B / -C lists.
+	Diagnostic counters (writer-bound vs. worker-bound) are printed at
+	end. If the writer queue waits a lot for empty queue, workers are
+	the bottleneck (good). If workers wait a lot for full queue, the
+	writer is the bottleneck.
 */
 
 #define N_GLOBAL_COLS 4
-#define DEFAULT_COV_LOW  0.0
-#define DEFAULT_COV_HIGH 1.0
+#define DEFAULT_COVERAGE_THRESHOLD 1.0
 
 static void usage(void);
 static void print_hash_counts(BIO_hash seqHash, const char *C_file);
 static unsigned long count_seeded_kmers(BIO_hash seqHash);
-static int parse_cov_range(const char *arg, double *lo, double *hi);
 
 int main(int argc, char *argv[])
 {
@@ -71,8 +66,7 @@ int main(int argc, char *argv[])
 	const int default_hash_val = 1;
 	const int default_hash_increment = 1;
 	int num_threads = 4;
-	double cov_low  = DEFAULT_COV_LOW;
-	double cov_high = DEFAULT_COV_HIGH;
+	double cov_threshold = DEFAULT_COVERAGE_THRESHOLD;
 	int c;
 	FILE *progress = NULL;
 
@@ -86,14 +80,7 @@ int main(int argc, char *argv[])
 			case 'o': o_file = strdup(optarg); break;
 			case 'S': s_file = strdup(optarg); break;
 			case 't': num_threads = atoi(optarg); break;
-			case 'T':
-				if (parse_cov_range(optarg, &cov_low, &cov_high) != 0) {
-					fprintf(stderr,
-					        "error: -T expects 'LOW,HIGH' (e.g. 0.1,0.96) "
-					        "or a single HIGH value, got '%s'\n", optarg);
-					exit(EXIT_FAILURE);
-				}
-				break;
+			case 'T': cov_threshold = atof(optarg); break;
 			case 'u':
 			case 'h':
 			default: usage(); break;
@@ -104,15 +91,8 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 	if (num_threads < 1) num_threads = 1;
-	if (cov_low < 0.0 || cov_high < 0.0) {
-		fprintf(stderr, "error: -T values must be >= 0 (got %g,%g)\n",
-		        cov_low, cov_high);
-		exit(EXIT_FAILURE);
-	}
-	if (cov_low > cov_high) {
-		fprintf(stderr,
-		        "error: -T low (%g) must be <= high (%g)\n",
-		        cov_low, cov_high);
+	if (cov_threshold < 0.0) {
+		fprintf(stderr, "error: -T must be >= 0 (got %g)\n", cov_threshold);
 		exit(EXIT_FAILURE);
 	}
 
@@ -129,32 +109,27 @@ int main(int argc, char *argv[])
 
 	seqHash = BIO_initHash(DEFAULT_GENOME_HASH_SIZE);
 
-	/* seed the hash with reference k-mers (column 0) */
 	GEN_hash_sequences_set_count_vec(r_file, seed, seqHash,
 	                                 default_hash_val, default_hash_increment,
 	                                 0, size_of_hash_vec);
 
-	/* count seeded reference k-mers — denominator for coverage_pct */
 	unsigned long total_ref_kmers = count_seeded_kmers(seqHash);
 	fprintf(stderr, "total reference k-mers: %lu\n", total_ref_kmers);
-	fprintf(stderr,
-	        "coverage band: low=%g high=%g  "
-	        "(coverage<low → global only; coverage>high → drop)\n",
-	        cov_low, cov_high);
-	if (cov_low <= 0.0 && cov_high >= 1.0)
-		fprintf(stderr, "  (band fully open — no samples will be filtered)\n");
+	fprintf(stderr, "coverage threshold for global accumulation: %g%s\n",
+	        cov_threshold,
+	        cov_threshold >= 1.0 ? " (disabled — all samples included)" : "");
 
-	streaming_writer *w = NULL;
+	presence_writer *w = NULL;
 	if (o_file) {
-		w = streaming_writer_open(o_file, 0);
+		w = presence_writer_open(o_file, /*queue_capacity*/ 0);
 		if (!w) {
-			fprintf(stderr, "could not open per-sample output %s\n", o_file);
+			fprintf(stderr, "could not open presence writer %s\n", o_file);
 			exit(EXIT_FAILURE);
 		}
 	} else {
 		fprintf(stderr,
-		    "no -o given: per-sample counts will not be written "
-		    "(in_individual will always be False)\n");
+		        "no -o given: presence file will not be written "
+		        "(summary still emitted if -S given)\n");
 	}
 
 	summary_writer *summary = NULL;
@@ -166,7 +141,6 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* Shared dedup registry — process-global across -A/-B/-C. */
 	seen_registry *seen = seen_registry_new();
 	if (!seen) {
 		fprintf(stderr, "could not allocate seen_registry\n");
@@ -176,27 +150,33 @@ int main(int argc, char *argv[])
 	/* -A → pangenome (col 1) + ge rows */
 	GEN_per_sample_kmer_counts_dual(A_file, "ge", 1, seed, seqHash,
 	                                num_threads, w, summary, seen,
-	                                cov_low, cov_high, total_ref_kmers,
+	                                cov_threshold, total_ref_kmers,
 	                                progress, NULL);
 
 	/* -B → metagenome (col 2) + me rows */
 	GEN_per_sample_kmer_counts_dual(B_file, "me", 2, seed, seqHash,
 	                                num_threads, w, summary, seen,
-	                                cov_low, cov_high, total_ref_kmers,
+	                                cov_threshold, total_ref_kmers,
 	                                progress, NULL);
 
 	/* -C → drug (col 3) + dr rows; reference-skip preserved */
 	if (C_file)
 		GEN_per_sample_kmer_counts_dual(C_file, "dr", 3, seed, seqHash,
 		                                num_threads, w, summary, seen,
-		                                cov_low, cov_high, total_ref_kmers,
+		                                cov_threshold, total_ref_kmers,
 		                                progress, r_file);
 
-	if (w) streaming_writer_close(w);
+	/* Drain + join the writer thread, then materialize presence file. */
+	if (w) {
+		presence_writer_close(w);              /* joins writer thread */
+		presence_writer_flush(w, seqHash);     /* serial zstd dump */
+		presence_writer_print_diagnostics(w);
+		presence_writer_destroy(w);
+	}
 	if (summary) summary_writer_close(summary);
 	seen_registry_free(seen);
 
-	/* global counts to stdout (unchanged format) */
+	/* Global counts to stdout (unchanged format). */
 	print_hash_counts(seqHash, C_file);
 
 	BIO_destroyHashD(seqHash);
@@ -211,45 +191,6 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
-/* Parse "LOW,HIGH" (e.g. "0.1,0.96") or a single value treated as HIGH
-   with LOW defaulting to 0.0. Returns 0 on success, -1 on parse error.
-   *lo and *hi are only modified on success. */
-static int parse_cov_range(const char *arg, double *lo, double *hi)
-{
-	if (!arg || !*arg) return -1;
-
-	const char *comma = strchr(arg, ',');
-	char *end = NULL;
-
-	if (comma == NULL) {
-		/* single value → high only, low stays at default 0.0 */
-		double v = strtod(arg, &end);
-		if (end == arg || *end != '\0') return -1;
-		*lo = 0.0;
-		*hi = v;
-		return 0;
-	}
-
-	/* split on the comma */
-	size_t lo_len = (size_t)(comma - arg);
-	char lo_buf[64];
-	if (lo_len == 0 || lo_len >= sizeof lo_buf) return -1;
-	memcpy(lo_buf, arg, lo_len);
-	lo_buf[lo_len] = '\0';
-
-	double lv = strtod(lo_buf, &end);
-	if (end == lo_buf || *end != '\0') return -1;
-
-	const char *hi_str = comma + 1;
-	if (*hi_str == '\0') return -1;
-	double hv = strtod(hi_str, &end);
-	if (end == hi_str || *end != '\0') return -1;
-
-	*lo = lv;
-	*hi = hv;
-	return 0;
-}
-
 static void usage(void)
 {
 	fprintf(stderr,
@@ -258,33 +199,36 @@ static void usage(void)
 	    "                        -A <file listing genome filenames>\n"
 	    "                        -B <file listing metagenome filenames>\n"
 	    "                       [-C <file listing drug-strain genome filenames>]\n"
-	    "                       [-o <per-sample long-format output, .tsv.zst>]\n"
+	    "                       [-o <inverted presence file, .tsv.zst>]\n"
 	    "                       [-S <per-sample summary output, .tsv>]\n"
-	    "                       [-T <LOW,HIGH coverage band, default 0.0,1.0>]\n"
+	    "                       [-T <coverage threshold, default 1.0>]\n"
 	    "                       [-p <progress log file>]\n"
 	    "                       [-t <num threads, default 4>]\n"
 	    "\n"
-	    "  stdout: global counts (kmer, ref, pangenome, metagenome[, drug])\n"
-	    "  -o:     long-format zstd-compressed TSV (one row per kmer x sample).\n"
-	    "          If omitted, per-sample counts are not written; only stdout\n"
-	    "          globals (and -S, if given) are produced. Even when -o is set,\n"
-	    "          a sample is excluded from this file when its coverage falls\n"
-	    "          outside the LOW..HIGH band.\n"
-	    "          load with polars: pl.scan_csv('out.tsv.zst', separator='\\t')\n"
-	    "  -S:     plain TSV summary, one row per sample, columns:\n"
-	    "          sample_type, sample_id, n_unique_kmers, coverage_pct,\n"
-	    "          is_in_global, is_in_individual\n"
-	    "          coverage_pct = n_unique_kmers / total_reference_kmers\n"
-	    "  -T:     coverage band as 'LOW,HIGH' (e.g. '0.1,0.96'):\n"
-	    "            coverage <  LOW   → in global only (not individual)\n"
-	    "            in [LOW, HIGH]    → in both\n"
-	    "            coverage >  HIGH  → dropped from both\n"
-	    "          A single value is interpreted as HIGH with LOW=0.0\n"
-	    "          (back-compat with previous single-threshold behavior).\n"
-	    "          Default 0.0,1.0 disables the band.\n"
+	    "  stdout: global counts (#kmer, ref, pangenome, metagenome[, drug])\n"
+	    "  -o:     INVERTED presence index, zstd-compressed TSV.\n"
+	    "          Format: #kmer<TAB>list_scrub_id (comma-separated u32 list).\n"
+	    "          Only kmers with at least one sample hit are emitted.\n"
+	    "          load with polars:\n"
+	    "            pl.scan_csv('out.tsv.zst', separator='\\t')\n"
+	    "              .with_columns(pl.col('list_scrub_id').str.split(','))\n"
+	    "  -S:     plain TSV summary, columns:\n"
+	    "          scrub_id, sample_type, sample_id, n_unique_kmers,\n"
+	    "          coverage_pct, is_in_global\n"
+	    "          scrub_id is sequential u32 starting at 0, assigned in\n"
+	    "          sample-completion order. The same id appears in -o.\n"
+	    "  -T:     coverage threshold. If coverage_pct > T, the sample's\n"
+	    "          counts are NOT added to the global column (is_in_global\n"
+	    "          becomes False), but scrub_id is still allocated and\n"
+	    "          presence/summary rows still emitted. Default 1.0 disables.\n"
 	    "  Each input file is read exactly once. Memory bounded by\n"
-	    "  O(n_kmers x (4 + threads)). Duplicate (sample_type, sample_id)\n"
-	    "  pairs are skipped with a warning.\n");
+	    "  O(n_kmers x (4 + threads)) for the hash + O(total_kmer_appends x 4)\n"
+	    "  for the inverted index. Duplicate (sample_type, sample_id) pairs\n"
+	    "  are skipped with a warning.\n"
+	    "\n"
+	    "  Diagnostic counters (queue waits etc.) are printed at end of run\n"
+	    "  to stderr. If 'worker queue waits' is large, the writer is the\n"
+	    "  bottleneck. If 'writer queue waits' is large, the workers are.\n");
 	exit(1);
 }
 
