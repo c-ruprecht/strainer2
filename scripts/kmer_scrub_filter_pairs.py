@@ -829,13 +829,19 @@ def main():
         # pair parts → unique kmers across both columns, computed lazily
         pair_glob = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")
 
-        pair_kmers = set(
-            pl.scan_parquet(pair_glob)
-            .select(pl.concat([pl.col('kmerA'), pl.col('kmerB')]).unique().alias('#kmer'))
-            .collect(engine='streaming')
-            .get_column('#kmer')
-            .to_list()
-        )
+        unique_kmers = set()
+        for path in sorted(glob.glob(pair_glob)):
+            # read just one column at a time, dedupe per-part
+            df_part_a = pl.read_parquet(path, columns=['kmerA'])
+            unique_kmers.update(df_part_a.get_column('kmerA').unique().to_list())
+            del df_part_a
+            df_part_b = pl.read_parquet(path, columns=['kmerB'])
+            unique_kmers.update(df_part_b.get_column('kmerB').unique().to_list())
+            del df_part_b
+            gc.collect()
+
+        pair_kmers = unique_kmers
+        print(f"Pair kmers: {len(pair_kmers):,}")
 
         all_kmers = singleton_kmers | pair_kmers
         print(f"Singletons: {len(singleton_kmers):,}")
