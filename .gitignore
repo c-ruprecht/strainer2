@@ -8,5 +8,5 @@
 .snakemake/
 /scripts/dev
 /test
-scripts/__pycache__
-
+**/__pycache__/
+*.pyc

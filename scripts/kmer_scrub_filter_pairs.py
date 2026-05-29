@@ -564,7 +564,40 @@ def smooth_downsample(df, total_target, bin_size, mode = None):
         result = pd.concat(contig_results)
         print(f'  Total: {len(df)} -> {len(result)} kmers after smooth downsampling')
         return result.sort_values(['contig_id', 'kmer_position'])
+def find_overlap_kmer_fast(df, max=0.8):
+    dict_overlap = {}
     
+    for contig_id, contig_df in df.groupby('contig_id'):
+        kmers = contig_df['#kmer'].values
+        positions = contig_df['kmer_position'].values
+        is_rc = contig_df['reverse_complement'].values.astype(bool)
+        
+        same_thresh = 31 * max       # 24.8
+        cross_lo    = 31 * (1 - max) # 6.2
+        cross_hi    = 62 * max       # 49.6
+        
+        # dist[i,j] = pos[j] - pos[i]
+        dist = positions[None, :] - positions[:, None]
+        rc_i = is_rc[:, None]
+        rc_j = is_rc[None, :]
+        
+        same_strand = (rc_i == rc_j) & (np.abs(dist) < same_thresh)
+        
+        # fwd query (rc_i=False), rc candidate (rc_j=True): dist must be in (cross_lo, cross_hi)
+        fwd_rc = (~rc_i) & rc_j & (dist > cross_lo) & (dist < cross_hi)
+        
+        # rc query (rc_i=True), fwd candidate (rc_j=False): -dist must be in (cross_lo, cross_hi)
+        # i.e. dist in (-cross_hi, -cross_lo)
+        rc_fwd = rc_i & (~rc_j) & (dist > -cross_hi) & (dist < -cross_lo)
+        
+        overlap_matrix = same_strand | fwd_rc | rc_fwd
+        np.fill_diagonal(overlap_matrix, False)
+        
+        for i in range(len(kmers)):
+            dict_overlap[kmers[i]] = kmers[overlap_matrix[i]].tolist()
+    
+    return dict_overlap
+
 def find_overlap_kmer(df, max = 0.8):
     
     dict_overlap = {} 
@@ -991,7 +1024,7 @@ def main():
         df_locations = df_locations.loc[df_locations['terminal_kmer'] == False] 
 
         print('finding overlapping kmers for kmer selection')
-        dict_overlap = find_overlap_kmer(df_locations, max = 0.8)
+        dict_overlap = find_overlap_kmer_fast(df_locations, max = 0.8)
         
         print('selecting kmers')
         selected = max_independent_kmers_greedy_heap(dict_overlap=dict_overlap)
