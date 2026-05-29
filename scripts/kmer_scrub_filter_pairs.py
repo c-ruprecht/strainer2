@@ -22,12 +22,16 @@ import pandas as pd
 import pyarrow as pa
 import gc
 import glob
+import os
+import pyarrow as pa
+import pyarrow.parquet as pq
+import re
 
 import subprocess
 import math
 
 from collections import defaultdict
-from itertools import combinations
+from itertools import combinations, product
 
 import subprocess
 import os
@@ -226,6 +230,7 @@ def kmer_pairs_from_presence(
     )
     print(df_presence)
     print(f"Presence rows after filtering: {df_presence.shape[0]:,}", flush=True)
+    
     if df_keep is not None:
         df_presence = df_presence.join(df_keep, on='#kmer', how='semi')
         print(f"After kmer subset filter: {df_presence.shape[0]:,}", flush=True)
@@ -236,6 +241,67 @@ def kmer_pairs_from_presence(
         n_workers=n_workers,
         write_non_inform=write_non_inform,
     )
+
+def create_pairs_with_singletons(
+    singleton_kmer_set, pair_kmer_set,
+    output_dir, basename,
+    batch_size=1_000_000,
+    part_id=0,
+):
+    """Stream singleton-derived pairs to parquet (matches _PAIR_SCHEMA / count=0).
+
+    Group 1: all combinations among informative singletons.
+    Group 2: each singleton x each pair kmer.
+    Returns (path, n_pairs).
+    """
+    singletons = sorted(singleton_kmer_set)
+    pair_kmers = sorted(pair_kmer_set)
+    n_s, n_p = len(singletons), len(pair_kmers)
+    print(f"Combining {n_s} singletons among themselves and with {n_p} pair kmers",
+          flush=True)
+
+    path = os.path.join(output_dir,
+                        f"{basename}.inform_kmer_pairs.part{part_id:04d}.parquet")
+    
+    writer = pq.ParquetWriter(path, _PAIR_SCHEMA, compression="zstd")
+
+    a_col, b_col, c_col = [], [], []
+    n_pairs = 0
+
+    def flush():
+        if a_col:
+            writer.write_table(
+                pa.table({"kmerA": a_col, "kmerB": b_col, "count": c_col},
+                         schema=_PAIR_SCHEMA)
+            )
+            a_col.clear(); b_col.clear(); c_col.clear()
+
+    for i in range(n_s):
+        kA = singletons[i]
+        for j in range(i + 1, n_s):
+            kB = singletons[j]
+            a_, b_ = (kA, kB) if kA < kB else (kB, kA)
+            a_col.append(a_); b_col.append(b_); c_col.append(0)
+            n_pairs += 1
+            if len(a_col) >= batch_size:
+                flush()
+
+    pair_set = set(pair_kmers)
+    for kA in singletons:
+        skip = kA in pair_set
+        for kB in pair_kmers:
+            if skip and kA == kB:
+                continue
+            a_, b_ = (kA, kB) if kA < kB else (kB, kA)
+            a_col.append(a_); b_col.append(b_); c_col.append(0)
+            n_pairs += 1
+            if len(a_col) >= batch_size:
+                flush()
+
+    flush()
+    writer.close()
+    print(f"Wrote {n_pairs:,} singleton pairs -> {path}", flush=True)
+    return path, n_pairs
 
 def load_genome(genome_path):
     opener = gzip.open if genome_path.endswith('.gz') else open
@@ -499,6 +565,55 @@ def smooth_downsample(df, total_target, bin_size, mode = None):
         print(f'  Total: {len(df)} -> {len(result)} kmers after smooth downsampling')
         return result.sort_values(['contig_id', 'kmer_position'])
     
+def find_overlap_kmer(df, max = 0.8):
+    
+    dict_overlap = {} 
+
+    for contig_id, contig_df in df.groupby('contig_id'):
+
+        for pos_i, (_, row) in enumerate(contig_df.iterrows()):
+            if row['reverse_complement'] == True:
+                overlap_df = contig_df.loc[((contig_df['reverse_complement'] == True ) & 
+                                            (contig_df['kmer_position'] - row['kmer_position']  < 31 * max) & (contig_df['kmer_position'] - row['kmer_position']  > -31 * max))|
+                                            ((contig_df['reverse_complement'] == False ) & 
+                                             (row['kmer_position'] - contig_df['kmer_position'] < 62 * max) & (row['kmer_position'] - contig_df['kmer_position'] > 0 + 31*(1-max)))]
+                #remove self kmer
+                overlap_df = overlap_df.loc[overlap_df['#kmer'] != row['#kmer']]
+                dict_overlap[row['#kmer']] = overlap_df ['#kmer'].to_list()
+             
+            if row['reverse_complement'] == False:
+                overlap_df = contig_df.loc[((contig_df['reverse_complement'] == True ) & 
+                                            ((contig_df['kmer_position'] - row['kmer_position'] < 62 * max) & (contig_df['kmer_position'] - row['kmer_position'] > 0 + 31*(1-max))))|
+                                            ((contig_df['reverse_complement'] == False ) &
+                                            ((contig_df['kmer_position'] -  row['kmer_position'] < 31 * max) & (contig_df['kmer_position'] -  row['kmer_position'] > -31 * max)))]
+                
+                #remove self kmer
+                overlap_df = overlap_df.loc[overlap_df['#kmer'] != row['#kmer']]
+                dict_overlap[row['#kmer']] = overlap_df ['#kmer'].to_list()
+
+    return dict_overlap
+
+def max_independent_kmers_greedy(dict_overlap):
+    """Greedy minimum-degree independent set from an overlap dict.
+    dict_overlap: {kmer: [overlapping_kmers]}. Returns a list of selected kmers."""
+
+    adj = {k: set(v) for k, v in dict_overlap.items()}
+    for k, nbrs in list(adj.items()):
+        for nb in nbrs:
+            adj.setdefault(nb, set()).add(k)
+
+    selected = []
+    remaining = set(adj)
+    while remaining:
+        # pick node with fewest remaining neighbors
+        node = min(remaining, key=lambda k: len(adj[k] & remaining))
+        selected.append(node)
+        # remove node and all its neighbors from contention
+        remaining.discard(node)
+        remaining -= adj[node]
+    return selected
+
+
 def make_inform_kmers_independent(df, type = 'singleton'):
     
     if type == 'singleton':
@@ -699,7 +814,7 @@ def main():
     parser.add_argument('--figures', action='store_true', default=False,
                         help='Save figures as SVG (default: False)')
     parser.add_argument('--threads', type = int)
-    parser.add_argument('--presence_t', type = int, help = 'maximal presence threshold for pair generation' ,default = 10)
+    parser.add_argument('--presence_t', type = int, help = 'maximal presence threshold for pair generation' ,default = 50)
     parser.add_argument('--percentage', type=float, default=0.01,
                         help='Percentile threshold for rare kmer selection (default: 0.05)')
     parser.add_argument('--percentile_union', type = float, default = 0.05, help = 'percentile passed for union of different kmer scrubs')
@@ -786,45 +901,21 @@ def main():
         n_targets = total_kmers * args.percentage 
         
 
-        df_inform_singletons = df_no_drugs.filter((pl.col('metagenome_count') == 0 ) & (pl.col('pangenome_count') == 0))
+        df_inform_singletons = df_no_drugs.filter((pl.col('metagenome_count') == 0 ) & (pl.col('pangenome_count') == 0))        
         df_non_inform_singletons = df_no_drugs.filter(~(pl.col('metagenome_count') == 0 ) & ~(pl.col('pangenome_count') == 0))
-
         print(df_inform_singletons)
 
-        # singletons should also be made independent!
-        single_kmers = df_inform_singletons.get_column('#kmer').to_list()
-        df_loc_singles, _ = build_mapped_kmers_ahocorasick(records, single_kmers, terminal_dist=args.terminal_dist)
-        #df_loc_singles = pd.merge(df_inform_singletons.to_pandas(), df_locations, on = '#kmer', how = 'left')
-        
-        print(df_loc_singles)
-        # for now just to test independence
-        #dict_drop = make_inform_kmers_independent(df_loc_singles, type = 'singleton')
-        df_inform_singletons.write_parquet(os.path.join(args.output_dir, f'{basename}.inform_kmer_singleton.parquet'))
         # export parquet inform kmers
-        li_kmers = df_non_inform_singletons.get_column('#kmer').to_list()
         print('Creating pairs from non informative singletons')
-        print(df_non_inform_singletons)
-
-        
-        kmer_pairs_from_presence(args.counts_individual, args.counts_summary, args.output_dir , basename = basename,
+        kmer_pairs_from_presence(args.counts_individual, args.counts_summary, 
+                                 args.output_dir , 
+                                 basename = basename,
                                  df_keep=df_non_inform_singletons,
-                                 presence_t = args.presence_t, similarity_t=None,n_workers=args.threads)
-
-        # Count how often each kmer is in a pair
-        # make them independent
-
-        # start finding pairs
+                                 presence_t = args.presence_t, 
+                                 similarity_t=None, 
+                                 n_workers=args.threads)
         
-        ### Build a greedy selection for n_target percentage
-        #   maximal kmers to track 1% - singletons?
-        #   keep better scored pairs, how to score: 
-                #location: diff contig > same contig > distance from each other to maximize
-        #   Start point just dataframe sorted by counts union?
-
        
-
-        # singletons
-        singleton_kmers = set(df_inform_singletons["#kmer"].to_list())
 
         # pair parts → unique kmers across both columns, computed lazily
         pair_glob = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")
@@ -843,26 +934,66 @@ def main():
         pair_kmers = unique_kmers
         print(f"Pair kmers: {len(pair_kmers):,}")
 
+        # Add pairs from singletons
+        singleton_kmers = set(df_inform_singletons["#kmer"].to_list())
+
+        # get next id number for pairs 
+        existing = glob.glob(pair_glob)
+        part_re = re.compile(r"\.part(\d+)\.parquet$")
+        part_ids = [int(m.group(1)) for f in existing if (m := part_re.search(f))]
+        next_part_id = max(part_ids) + 1 if part_ids else 0
+
+        path, pairs = create_pairs_with_singletons(set(singleton_kmers), set(pair_kmers), 
+                                           output_dir = args.output_dir, 
+                                           basename = basename,
+                                           part_id = next_part_id)
+
         all_kmers = singleton_kmers | pair_kmers
-        print(f"Singletons: {len(singleton_kmers):,}")
-        print(f"Pair kmers: {len(pair_kmers):,}")
-        print(f"Total kmers for strain_detect: {len(all_kmers):,}")
+
+
+
+        
         df_locations ,_ = build_mapped_kmers_ahocorasick(records, all_kmers, terminal_dist=args.terminal_dist)
 
-        #annotate kmer
-        # Annotate source
-        df_locations["from_singleton"] = df_locations["#kmer"].isin(singleton_kmers)
-        df_locations["from_pair"] = df_locations["#kmer"].isin(pair_kmers)
-        df_locations["source"] = df_locations.apply(
-            lambda r: "both" if r["from_singleton"] and r["from_pair"]
-                    else "singleton" if r["from_singleton"]
-                    else "pair",
-            axis=1,
-        )      
-        df_locations.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
+
+        # Filter
+        # remove terminal kmers
+        print('dropping terminal kmers')
+        df_locations = df_locations.loc[df_locations['terminal_kmer'] == False] 
+
+        print('finding overlapping kmers')
+        dict_overlap = find_overlap_kmer(df_locations, max = 0.8)
+        print('selecting kmers')
+        selected = max_independent_kmers_greedy(dict_overlap=dict_overlap)
+
+        #  Export locations
+        df_locations['origin'] = df_locations['#kmer'].apply(lambda x: 'singleton' if x in singleton_kmers else 'pair')
+        print(f"Total kmers for strain_detect: {len(selected):,}")
+        df_locations.loc[df_locations['#kmer'].isin(selected)].to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
                                          sep='\t', index=False)
-        df_locations[['#kmer']].to_csv(os.path.join(args.output_dir, f'{basename}.scrubbed_kmers'),
-                                sep='\t', index=False, header=None)
+        
+        # write final pairs
+        sel_series = pl.Series(selected)
+
+        pair_glob = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")
+        final_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.final.parquet")
+
+        # stream the both-selected pairs straight to the final file (no full materialization)
+        (
+            pl.scan_parquet(pair_glob, low_memory=True)
+            .filter(pl.col("kmerA").is_in(sel_series) & pl.col("kmerB").is_in(sel_series))
+            .sink_parquet(final_path, compression="zstd")
+        )
+
+        # only delete the parts once the final file exists and is non-empty
+        if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
+            parts = glob.glob(pair_glob)
+            for p in parts:
+                os.remove(p)
+            print(f"Wrote {final_path} and removed {len(parts)} part files", flush=True)
+        else:
+            print("WARNING: final parquet missing or empty — keeping part files", flush=True)
+
 
 if __name__ == '__main__':
     main()

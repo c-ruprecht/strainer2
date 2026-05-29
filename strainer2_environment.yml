@@ -21,6 +21,7 @@ dependencies:
   - sourmash
   - sourmash_plugin_branchwater
   - polars
+  - pycirclize
   #- pip:
   #  - kaleido
 

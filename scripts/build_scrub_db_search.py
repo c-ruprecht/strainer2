@@ -10,6 +10,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 import gzip
+import time
+
 
 
 # ============================================================
@@ -27,8 +29,11 @@ def read_sourmash_gather(path):
 # Batch download by accession (flat .fna output)
 # ============================================================
 
-BATCH_SIZE = 500
+BATCH_SIZE = 200
 COMPLETED_FILE = "completed_accessions.txt"
+
+DOWNLOAD_RETRIES = 3      # default, overridable via --download_retries
+RETRY_BACKOFF = 10        # seconds, multiplied by attempt number
 
 
 def load_completed(out_dir):
@@ -45,8 +50,19 @@ def mark_completed(out_dir, accessions):
         fh.write("\n".join(accessions) + "\n")
 
 
-def download_batch(batch, batch_idx, out_dir):
-    """Download and extract one batch of accessions, flattening .fna into out_dir."""
+import re
+
+ACC_RE = re.compile(r"(GC[AF]_\d+\.\d+)")
+
+
+def download_batch(batch, batch_idx, out_dir, retries=DOWNLOAD_RETRIES):
+    """Download and extract one batch of accessions, flattening .fna into out_dir.
+
+    The `datasets download` call is retried up to `retries` times on transient
+    failure (non-zero exit or missing zip). Returns the set of accessions
+    actually extracted (parsed from .fna filenames), which may be a subset of
+    `batch` if NCBI silently skipped some.
+    """
     zip_path = os.path.join(out_dir, f"batch_{batch_idx:04d}.zip")
     acc_file = os.path.join(out_dir, f"batch_{batch_idx:04d}_accessions.txt")
     with open(acc_file, "w") as fh:
@@ -54,23 +70,43 @@ def download_batch(batch, batch_idx, out_dir):
 
     cmd = ["datasets", "download", "genome", "accession",
            "--inputfile", acc_file,
-           "--assembly-source", "genbank",
            "--include", "genome",
            "--filename", zip_path]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr, end="")
-    if result.returncode != 0:
-        raise RuntimeError(f"datasets download failed for batch {batch_idx} (exit {result.returncode})")
-    if not os.path.exists(zip_path):
-        raise RuntimeError(f"Expected zip not found: {zip_path}")
+
+    last_err = None
+    for attempt in range(1, retries + 1):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        if result.returncode == 0 and os.path.exists(zip_path):
+            break  # success
+        # transient failure: clean up a partial zip and retry
+        last_err = (f"exit {result.returncode}"
+                    if result.returncode != 0 else "zip not found")
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        if attempt < retries:
+            wait = RETRY_BACKOFF * attempt
+            print(f"[download] Batch {batch_idx} attempt {attempt}/{retries} failed "
+                  f"({last_err}); retrying in {wait}s", file=sys.stderr)
+            time.sleep(wait)
+    else:
+        # all attempts exhausted
+        os.remove(acc_file)
+        raise RuntimeError(
+            f"datasets download failed for batch {batch_idx} after {retries} "
+            f"attempts ({last_err})")
 
     tmp_extract = os.path.join(out_dir, f"_tmp_batch_{batch_idx:04d}")
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(tmp_extract)
 
+    arrived = set()
     for fna in Path(tmp_extract).rglob("*.fna"):
         dest = os.path.join(out_dir, fna.name)
+        m = ACC_RE.search(fna.name)
+        if m:
+            arrived.add(m.group(1))
         if not os.path.exists(dest):
             shutil.move(str(fna), dest)
         else:
@@ -79,10 +115,18 @@ def download_batch(batch, batch_idx, out_dir):
     shutil.rmtree(tmp_extract)
     os.remove(zip_path)
     os.remove(acc_file)
+    return arrived
 
 
-def download_by_accession(accessions, out_dir):
-    """Download a flat list of accessions into out_dir as .fna files, with resume."""
+
+def download_by_accession(accessions, out_dir, retries=DOWNLOAD_RETRIES):
+    """Download a flat list of accessions into out_dir as .fna files, with resume.
+
+    Only accessions that actually produced a .fna are marked completed, so a
+    silent partial download won't permanently skip the missing ones. Missing
+    accessions are appended to missing_accessions.txt per-batch so the list
+    survives an interrupted run.
+    """
     completed = load_completed(out_dir)
     remaining = [a for a in accessions if a not in completed]
     if not remaining:
@@ -92,12 +136,35 @@ def download_by_accession(accessions, out_dir):
         print(f"[download] Resuming: {len(completed)} already done, {len(remaining)} remaining.",
               file=sys.stderr)
 
+    miss_path = os.path.join(out_dir, "missing_accessions.txt")
     batches = [remaining[i:i + BATCH_SIZE] for i in range(0, len(remaining), BATCH_SIZE)]
+    grand_missing = 0
     for idx, batch in enumerate(batches):
         print(f"[download] Batch {idx + 1}/{len(batches)}: {len(batch)} accessions", file=sys.stderr)
-        download_batch(batch, idx, out_dir)
-        mark_completed(out_dir, batch)
-        print(f"[download] Batch {idx + 1}/{len(batches)} done.", file=sys.stderr)
+        arrived = download_batch(batch, idx, out_dir, retries = retries)
+
+        arrived_base = {a.rsplit(".", 1)[0] for a in arrived}
+        got = [a for a in batch
+               if a in arrived or a.rsplit(".", 1)[0] in arrived_base]
+        missing = [a for a in batch if a not in got]
+
+        if got:
+            mark_completed(out_dir, got)
+        if missing:
+            grand_missing += len(missing)
+            with open(miss_path, "a") as fh:   # append per-batch, durable across crashes
+                fh.write("\n".join(missing) + "\n")
+            print(f"[download] Batch {idx + 1}/{len(batches)}: "
+                  f"{len(got)} arrived, {len(missing)} MISSING", file=sys.stderr)
+        else:
+            print(f"[download] Batch {idx + 1}/{len(batches)} done ({len(got)}/{len(batch)}).",
+                  file=sys.stderr)
+
+    if grand_missing:
+        print(f"[download] {grand_missing} accessions could not be downloaded; "
+              f"see {miss_path}", file=sys.stderr)
+    else:
+        print("[download] All accessions downloaded successfully.", file=sys.stderr)
 
 
 # ============================================================
@@ -159,96 +226,7 @@ def accessions_in_zip(zip_path):
     return accs
 
 
-def build_genome_set(seed_accession, output_dir,
-                     ranks=("species", "genus", "family", "order"),
-                     limit=(1000, 500, 500, 500)):
-    """Cascade species -> genus -> family -> order for one seed.
 
-    Per-rank resume: if `{rank}_{taxid}.zip` already exists AND is valid, its
-    accessions are loaded into `collected` so downstream ranks exclude them,
-    and that rank is skipped. Corrupt zips are deleted and re-downloaded.
-
-    Full-cascade skip: if the species zip already exists for a prior seed in
-    the same species, skip the whole cascade (the lineage is identical).
-    """
-    assert len(ranks) == len(limit), "ranks and limit must be the same length"
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    lineage = get_accession_lineage(seed_accession, ranks=ranks)
-    print(f"[genome_set] {seed_accession} lineage: {lineage}", file=sys.stderr)
-
-    # Full-cascade skip if this species was already built by a previous seed
-    species_taxid = lineage.get("species")
-    if species_taxid is not None:
-        species_zip = output_dir / f"species_{species_taxid}.zip"
-        if species_zip.exists():
-            try:
-                zipfile.ZipFile(species_zip).close()  # verify it opens
-            except (zipfile.BadZipFile, OSError):
-                print(f"[genome_set] species {species_taxid} zip corrupt, "
-                      f"re-running cascade", file=sys.stderr)
-                species_zip.unlink()
-            else:
-                print(f"[genome_set] SKIP {seed_accession}: species {species_taxid} "
-                      f"already built by a previous seed", file=sys.stderr)
-                zips = []
-                for rank in ranks:
-                    taxid = lineage.get(rank)
-                    if taxid is None:
-                        continue
-                    zp = output_dir / f"{rank}_{taxid}.zip"
-                    if zp.exists():
-                        zips.append(zp)
-                return {"zips": zips, "accessions": set(), "lineage": lineage}
-
-    collected = set()
-    zip_paths = []
-
-    for rank, rank_limit in zip(ranks, limit):
-        taxid = lineage.get(rank)
-        if taxid is None:
-            print(f"[genome_set]   [{rank}] not in lineage, skipping", file=sys.stderr)
-            continue
-        if rank_limit <= 0:
-            print(f"[genome_set]   [{rank}] limit is 0, skipping", file=sys.stderr)
-            continue
-
-        zip_path = output_dir / f"{rank}_{taxid}.zip"
-
-        if zip_path.exists():
-            try:
-                got = accessions_in_zip(zip_path)
-            except (zipfile.BadZipFile, OSError) as e:
-                print(f"[genome_set]   [{rank} taxid={taxid}] corrupt zip ({e}), "
-                      f"re-downloading", file=sys.stderr)
-                zip_path.unlink()
-            else:
-                collected |= got
-                zip_paths.append(zip_path)
-                print(f"[genome_set]   [{rank} taxid={taxid}] cached ({len(got)} accessions)",
-                      file=sys.stderr)
-                continue
-
-        available = summary_accessions(taxid, limit=rank_limit + len(collected))
-        novel = [a for a in available if a not in collected]
-        take = novel[:rank_limit]
-        print(f"[genome_set]   [{rank} taxid={taxid}] {len(available)} avail, "
-              f"{len(novel)} novel, taking {len(take)} (limit={rank_limit})",
-              file=sys.stderr)
-
-        if not take:
-            continue
-
-        download_accessions(take, zip_path)
-        zip_paths.append(zip_path)
-        got = accessions_in_zip(zip_path)
-        collected |= got
-        print(f"[genome_set]   [{rank}] downloaded {len(got)} | total collected {len(collected)}",
-              file=sys.stderr)
-
-    return {"zips": zip_paths, "accessions": collected, "lineage": lineage}
 
 def extract_zip_to_taxon_folder(zip_path, genome_lists_dir):
     """Extract .fna files from one rank-keyed zip into genome_lists/{rank}_{taxid}/.
@@ -357,7 +335,7 @@ def sourmash_sketch(genome_dir, sketches_path, ksize=31, scaled=1000, threads=8)
     return sketches_path
 
 
-def sourmash_pairwise(sketches_path, pairwise_path, threads=8, write_all=True):
+def sourmash_pairwise(sketches_path, pairwise_path, thresh = 0.8, threads=8):#, write_all=True):
     """Run sourmash pairwise on a sketches zip. Returns the resulting DataFrame."""
     print(f"[pairwise] Computing pairwise similarities -> {pairwise_path}", file=sys.stderr)
 
@@ -366,9 +344,11 @@ def sourmash_pairwise(sketches_path, pairwise_path, threads=8, write_all=True):
         sketches_path,
         "-o", pairwise_path,
         "-c", str(threads),
+        #"-t", str(thresh), 
+        "--ani",
+        "--write-all"
     ]
-    if write_all:
-        cmd.append("--write-all")
+  
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.stdout:
@@ -432,11 +412,15 @@ def compare_pairs_from_df(df, genome_compare_bin, genome_dir,
 
     print(f"[kmer_compare] Running genome_compare on {len(tasks)} query genomes "
           f"({len(df)} total pairs, {n_workers} workers)", file=sys.stderr)
-
+    
     results = {}
+    total_queries = len(tasks)
     with multiprocessing.Pool(n_workers) as pool:
-        for a_file, fracs in pool.imap_unordered(_compare_pairs, tasks):
+        for i, (a_file, fracs) in enumerate(pool.imap_unordered(_compare_pairs, tasks), 1):
             results[a_file] = fracs
+            if i % 100 == 0:
+                print(f"[kmer_compare] {i}/{total_queries} query genomes done",
+                      file=sys.stderr)
 
     rows = []
     for a_file, fracs in results.items():
@@ -455,10 +439,8 @@ def compare_pairs_from_df(df, genome_compare_bin, genome_dir,
 def kmer_compare(df_pairwise, genome_compare_bin, genome_dir,
                  min_jaccard=0.7, strain_mode=True, n_workers=4):
     """Filter sourmash pairs by jaccard, then run exact k-mer containment."""
-    if "jaccard" in df_pairwise.columns:
-        jac_col = "jaccard"
-    elif "similarity" in df_pairwise.columns:
-        jac_col = "similarity"
+    if "average_containment" in df_pairwise.columns:
+        jac_col = "average_containment"
     else:
         raise ValueError(
             f"Cannot find jaccard/similarity column in pairwise CSV. "
@@ -648,101 +630,75 @@ def gzip_all_genomes(scrub_db_path, n_workers=8):
 
     print(f"[gzip] Done: {len(all_files)} files", file=sys.stderr)
 
-#python scripts/build_scrub_db_claude.py --drug /metrica/codebase/strainer2-fork/scripts/dev/sourmash_gather_drug.csv --target_samples /metrica/codebase/strainer2-fork/scripts/dev/targetsample_sourmash_gather.csv --scrub_db_path /metrica/scratch/strainer_dev/scrub_db_denovo --threads 30 --genome_compare src/genome_compare --rank_limits "1,1,1,1"
-def _fetch_lineage(acc):
-    """Worker for parallel lineage fetching. Returns (accession, lineage_or_None)."""
-    try:
-        return acc, get_accession_lineage(acc)
-    except Exception as e:
-        return acc, None
 
-
-def fetch_lineages_parallel(accessions, n_workers=8):
-    """Fetch lineages for many accessions concurrently.
-
-    NCBI rate limits: 5 req/s without an API key, 10 req/s with one. Cap
-    n_workers accordingly — 8 is safe for short bursts, drop to 5 if you see
-    429s.
-    """
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-
-    lineages = {}
-    failed = []
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_fetch_lineage, acc): acc for acc in accessions}
-        for i, fut in enumerate(as_completed(futures), 1):
-            acc, lineage = fut.result()
-            if lineage is None:
-                failed.append(acc)
-            else:
-                lineages[acc] = lineage
-            if i % 200 == 0:
-                print(f"[lineage] {i}/{len(accessions)} fetched "
-                      f"({len(failed)} failed so far)", file=sys.stderr)
-
-    if failed:
-        print(f"[lineage] {len(failed)} accessions failed lineage lookup", file=sys.stderr)
-    return lineages
 
 
 def main():
     parser = argparse.ArgumentParser(description='Build a scrub k-mer database.')
     parser.add_argument('--drug',
-                        help='A sourmash search CSV for all drug lists.')
-    parser.add_argument('--target_samples',
-                        help='A sourmash search CSV for target metagenome samples.')
-    parser.add_argument('--kmer_ident', type=float, default=0.96,
+                        help='A sourmash search or gather CSV for all strains in the drug.')
+    parser.add_argument('--kmer_ident', type=float, default = 0.96,
                         help='k-mer coverage threshold for dereplication.')
-    parser.add_argument('--min_jaccard', type=float, default=0.8,
+    parser.add_argument('--min_jaccard', type=float, default = 0.80,
                         help='Min jaccard from sourmash pairwise to trigger exact kmer compare.')
     parser.add_argument('--scrub_db_path', required=True,
                         help='Output directory for the scrub database.')
     parser.add_argument('--threads', type=int, default=8)
     parser.add_argument('--genome_compare', required=True,
                         help='Path to the strainer genome_compare binary.')
-    parser.add_argument('--rank_limits', nargs=4, type=int,
-                        default=[1000, 500, 100, 100],
-                        metavar=("SPECIES", "GENUS", "FAMILY", "ORDER"),
-                        help='Limits for species genus family order.')
-    parser.add_argument('--lineage_workers', type=int, default=8,
-                        help='Parallel workers for NCBI lineage fetches (keep <=10).')
+    parser.add_argument('--download_retries', type=int, default=DOWNLOAD_RETRIES,
+                        help='Retries per batch on transient NCBI download failure.')
+    parser.add_argument('--force', action='store_true')
+    
     args = parser.parse_args()
 
     os.makedirs(args.scrub_db_path, exist_ok=True)
-    rank_limits = tuple(args.rank_limits)
 
     # ---------- DOWNLOAD PHASE ----------
 
-    target_dir = os.path.join(args.scrub_db_path, "target_samples")
+    target_dir = os.path.join(args.scrub_db_path, "genomes")
     os.makedirs(target_dir, exist_ok=True)
     df_drug = pd.read_csv(args.drug)
-    df_targets = pd.read_csv(args.target_samples)
-    col = "match_name" if "match_name" in df_targetsamples.columns else "name"
-    target_accessions = [df_targets[col].str.split(' ').str[0].unique(), df_drug[col].str.split(' ').str[0].unique()]
+    col = "match_name" if "match_name" in df_drug.columns else "name"
+    target_accessions =  df_drug[col].str.split(' ').str[0].unique()
     print(f"[target_samples] {len(target_accessions)} accessions to download",
             file=sys.stderr)
-    download_by_accession(target_accessions, target_dir)
-
-
+    
+    download_by_accession(target_accessions, target_dir, retries=args.download_retries)
+    
     sketches_path = os.path.join(args.scrub_db_path, "sketches.zip")
-    sourmash_sketch(genome_dir=target_dir, sketches_path=sketches_path,
-                    ksize=31, scaled=1000, threads=args.threads)
-
-    pairwise_path = os.path.join(args.scrub_db_path, "pairwise.csv")
-    df_pairwise = sourmash_pairwise(sketches_path=sketches_path,
-                                    pairwise_path=pairwise_path,
-                                    threads=args.threads)
+    if args.force or not os.path.exists(sketches_path):
+        sourmash_sketch(genome_dir=target_dir, sketches_path=sketches_path,
+                        ksize=31, scaled=1000, threads=args.threads)
+    
+    
+    pairwise_path =  os.path.join(args.scrub_db_path, "pairwise.csv")
+    if args.force or not os.path.exists(pairwise_path):
+        df_pairwise = sourmash_pairwise(sketches_path=sketches_path,
+                                        pairwise_path=pairwise_path,
+                                        thresh=args.min_jaccard,
+                                        threads=args.threads)
+    else:
+        print(f"[pairwise] Reusing existing {pairwise_path} (use --force to recompute)",
+              file=sys.stderr)
+        df_pairwise = pd.read_csv(pairwise_path)
 
     kmer_results_path = os.path.join(args.scrub_db_path, "kmer_compare.csv")
-    df_kmer = kmer_compare(df_pairwise=df_pairwise,
-                           genome_compare_bin=args.genome_compare,
-                           genome_dir=target_dir,
-                           min_jaccard=args.min_jaccard,
-                           strain_mode=True,
-                           n_workers=args.threads)
+    if args.force or not os.path.exists(kmer_results_path):
+        df_kmer = kmer_compare(df_pairwise=df_pairwise,
+                            genome_compare_bin=args.genome_compare,
+                            genome_dir=target_dir,
+                            min_jaccard=args.min_jaccard,
+                            strain_mode=True,
+                            n_workers=args.threads)
+    else:
+        print(f"[pairwise] Reusing existing {pairwise_path} (use --force to recompute)",
+              file=sys.stderr)
+        df_kmer = pd.read_csv(kmer_results_path)
 
     if df_kmer.empty:
         print("[dereplicate] No close pairs found.", file=sys.stderr)
+    
     else:
         df_kmer.to_csv(kmer_results_path, index=False)
         dups = df_kmer[df_kmer["kmer_coverage"] >= args.kmer_ident]
@@ -752,45 +708,47 @@ def main():
         df_drop, li_droplist = greedy_choice(df_kmer, percentage=args.kmer_ident)
         df_drop.to_csv(os.path.join(args.scrub_db_path, "representative_genomes.tsv"),
                        sep="\t")
+        df_drop, li_droplist = greedy_choice(df_kmer, percentage=args.kmer_ident)
+        df_drop.to_csv(os.path.join(args.scrub_db_path, "representative_genomes.tsv"),
+                       sep="\t")
+
+        # Write the drop list (genomes flagged as redundant)
+        drop_path = os.path.join(args.scrub_db_path, "drop_list.txt")
+        with open(drop_path, "w") as fh:
+            fh.write("\n".join(li_droplist) + "\n")
+        print(f"[dereplicate] Wrote {len(li_droplist)} dropped genomes to {drop_path}",
+              file=sys.stderr)
+
+        # Compute the keep set: every downloaded .fna minus the dropped ones
+        all_fna = {p.name for p in Path(target_dir).glob("*.fna")}
+        drop_set = set(li_droplist)
+        keep = sorted(all_fna - drop_set)
+
+        keep_path = os.path.join(args.scrub_db_path, "keep_list.txt")
+        with open(keep_path, "w") as fh:
+            fh.write("\n".join(keep) + "\n")
+        print(f"[dereplicate] {len(all_fna)} total genomes, {len(drop_set)} dropped, "
+              f"{len(keep)} kept -> {keep_path}", file=sys.stderr)
 
         print("[dereplicate] Removing redundant assemblies from taxonomy subfolders",
               file=sys.stderr)
-        n_deleted = 0
-        for name in li_droplist:
-            for src in origin.get(name, []):
-                fpath = src / name
-                if fpath.exists():
-                    fpath.unlink()
-                    n_deleted += 1
-        print(f"[dereplicate] Deleted {n_deleted} file instance(s) across all taxonomy folders.",
-              file=sys.stderr)
+        
+        # adding in representatives that are not in any
+        # read back all downloaded files
+
+        #n_deleted = 0
+        #for name in li_droplist:
+        #    for src in origin.get(name, []):
+        #        fpath = src / name
+        #        if fpath.exists():
+        #            fpath.unlink()
+        #            n_deleted += 1
+        #print(f"[dereplicate] Deleted {n_deleted} file instance(s) across all taxonomy folders.",
+        #      file=sys.stderr)
 
 
     # ---------- GZIP PHASE ----------
     gzip_all_genomes(args.scrub_db_path, n_workers=min(args.threads, 16))
-
-    # ---------- MAPPING PHASE ----------
-    #all_lineages = dict(drug_lineages)
-
-    #if args.target_samples:
-    #    df_ts = 
-    #    col = "match_name" if "match_name" in df_ts.columns else "name"
-    #    target_accessions = df_ts[col].str.split(' ').str[0].unique()
-    #    missing = [a for a in target_accs if a not in all_lineages]
-    #    if missing:
-    #        print(f"[mapping] Fetching lineages for {len(missing)} target sample matches "
-    #              f"({args.lineage_workers} workers)", file=sys.stderr)
-    #        fetched = fetch_lineages_parallel(missing, n_workers=args.lineage_workers)
-    #        all_lineages.update(fetched)
-
-    #build_query_to_taxa_map(
-    #    scrub_db_path=args.scrub_db_path,
-    #    drug_csv=args.drug,
-    #    target_samples_csv=args.target_samples,
-    #    seed_lineages=all_lineages,
-    #)
-
-    #print("[build] Done.", file=sys.stderr)
 
 
 if __name__ == '__main__':

@@ -6,7 +6,7 @@ import polars as pl
 import glob
 import gc
 import argparse
-from kmer_pairs import get_singleton_hits, get_pair_hits_streaming, get_triple_hits_streaming
+from kmer_pairs import get_singleton_hits, get_pair_hits_streaming
 import warnings
 warnings.filterwarnings("ignore", module="kaleido")
 
@@ -24,7 +24,7 @@ def read_kmer_hits(path_to_kmer_hits, path_to_genome_map):
     df_merge = pd.merge(df_kmer_hits, df_locations, on = ['#kmer'], how = 'left')
     df_merge = df_merge.set_index(df_locations.columns.to_list()).stack()
     df_merge = df_merge.reset_index()
-    df_merge = df_merge.rename(columns={'level_10': 'sample', 0: 'count'})
+    df_merge = df_merge.rename(columns={'level_8': 'sample', 0: 'count'})
     df_merge['strain'] = str(path_to_genome_map).split('/')[-1].split('.rare_kmers_mapped.')[0]
     return df_merge, dict_total_reads
 
@@ -83,7 +83,9 @@ def main():
     location = args.location
     hits = args.hits
     output_dir = args.output_dir
+    print(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+
     df_hits_stack, dict_total_reads = read_kmer_hits(hits, location)
     print(df_hits_stack.columns, dict_total_reads)
     df_hits_stack['total_kmers_evaluated'] = df_hits_stack['sample'].map(dict_total_reads)
@@ -111,37 +113,25 @@ def main():
     df_samples = df_samples.filter(pl.col("#kmer") != "total_evaluated")
     pair_cols = ["#kmer"] + [col for col in df_samples.columns if col != "#kmer" and df_samples[col].sum() > 1]
     df_samples = df_samples.select(pair_cols)
+    
     print('Samples with kmer counts: ' + str(len(pair_cols)))
     ### Singletons
-    df_singletons = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_singleton.parquet"))
-    print(f'getting singleton coverage: {len(df_singletons)}')
-    df_cov_s = get_singleton_hits(df_samples, df_singletons)
+    #df_singletons = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_singleton.parquet"))
+    #print(f'getting singleton coverage: {len(df_singletons)}')
+    #df_cov_s = get_singleton_hits(df_samples, df_singletons)
 
     ### Pairs
     print('getting pair coverage')
     #df_kmer_pairs = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_pairs.parquet"))
     #df_cov_p = get_pair_hits(df_samples, df_kmer_pairs)
-    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.part*.parquet")
+    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.final.parquet")
+
     if glob.glob(pair_glob):
         df_cov_p = get_pair_hits_streaming(df_samples, pair_glob)
     
-    ### Triples
-    print('getting triplicate coverage')
-    triplet_glob = os.path.join(args.inform_kmers, "*.inform_triplets.part*.parquet")
-    if glob.glob(triplet_glob):
-        df_cov_t = get_triple_hits_streaming(df_samples, triplet_glob)
-    else:
-        print('  no triplet files found, skipping')
-        sample_cols = [c for c in df_samples.columns if c != "#kmer"]
-        df_cov_t = pl.DataFrame({
-            "sample": sample_cols,
-            "inform_triples_total": [0] * len(sample_cols),
-            "inform_triples_observed": [0] * len(sample_cols),
-            "inform_triples_count_mean": [0.0] * len(sample_cols),
-            "inform_triples_coverage": [0.0] * len(sample_cols),
-        }) 
+    
 
-    df_cov_inform = df_cov_s.join(df_cov_p, on="sample", how="left").join(df_cov_t, on = 'sample', how = 'left').to_pandas()
+    df_cov_inform = df_cov_p.to_pandas() #df_cov_s.join(df_cov_p, on="sample", how="left").join(df_cov_t, on = 'sample', how = 'left').to_pandas()
     
     df_cov_depth = df_cov_depth.set_index('sample')
     df_cov_inform = df_cov_inform.set_index('sample')
@@ -154,37 +144,31 @@ def main():
                 log_x=True, template='simple_white',
                 hover_data=['sample'], width=600)
 
-    fig1 = px.scatter(df_cov_depth, x='inform_singletons_count_mean', y='inform_singletons_coverage',
-                    log_x=True, template='simple_white',
-                    hover_data=['sample'], range_y=[0,1], width=600)
+    
     fig2 = px.scatter(df_cov_depth, x='inform_pairs_count_mean', y='inform_pairs_coverage',
                     log_x=True, template='simple_white',
                     hover_data=['sample'], range_y=[0,1], width=600)
-    fig3 = px.scatter(df_cov_depth, x='inform_triples_count_mean', y='inform_triples_coverage',
-                    log_x=True, template='simple_white',
-                    hover_data=['sample'], range_y=[0,1], width=600)
+
    
     # label + color each series
     fig.data[0].update(name='single kmers',    marker_color='#1f77b4', showlegend=True)
-    fig1.data[0].update(name='informative singletons', marker_color='#ff7f0e', showlegend=True)
+    #fig1.data[0].update(name='informative singletons', marker_color='#ff7f0e', showlegend=True)
     fig2.data[0].update(name='informative pairs', marker_color="#14ad4f", showlegend=True)
-    fig3.data[0].update(name='informative triplets', marker_color="#df1a6c", showlegend=True)
+    #fig3.data[0].update(name='informative triplets', marker_color="#df1a6c", showlegend=True)
 
     
 
     # add traces from fig1, fig2, fig3 onto fig
-    for trace in fig1.data:
-        fig.add_trace(trace)
+    
     for trace in fig2.data:
         fig.add_trace(trace)
-    for trace in fig3.data:
-        fig.add_trace(trace)
+
 
     fig.update_layout(legend_title_text='metric', xaxis_title='depth', yaxis_title='coverage')
     fig.write_image(output_dir + '/coverage-depth-combined.svg')
     fig = px.scatter(df_cov_depth,
                      x = 'sample',
-                     y = ['coverage_all_kmer','inform_singletons_coverage', 'inform_pairs_coverage','inform_triples_coverage'],
+                     y = ['coverage_all_kmer','inform_pairs_coverage'],
                      template = 'simple_white')
     fig.update_layout(height=800)                  # taller figure (default ~450)
     fig.update_xaxes(tickfont=dict(size=9)) 
