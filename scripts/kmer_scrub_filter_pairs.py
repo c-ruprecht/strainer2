@@ -592,6 +592,53 @@ def find_overlap_kmer(df, max = 0.8):
                 dict_overlap[row['#kmer']] = overlap_df ['#kmer'].to_list()
 
     return dict_overlap
+def max_independent_kmers_greedy_heap(dict_overlap):
+    import heapq
+    
+    # original one-directional degree BEFORE symmetry expansion
+    original_degree = {k: len(v) for k, v in dict_overlap.items()}
+    
+    # expand to symmetric adj
+    adj = {k: set(v) for k, v in dict_overlap.items()}
+    for k, nbrs in list(adj.items()):
+        for nb in nbrs:
+            adj.setdefault(nb, set()).add(k)
+
+    degree = {k: len(v) for k, v in adj.items()}  # live symmetric degree
+
+    counter = 0
+    heap = []
+    for k in dict_overlap.keys():
+        heapq.heappush(heap, (degree[k], original_degree[k], counter, k))
+        counter += 1
+
+    selected = []
+    excluded = set()
+
+    while heap:
+        d, od, _, node = heapq.heappop(heap)
+
+        if node in excluded:
+            continue
+        if d != degree[node]:
+            heapq.heappush(heap, (degree[node], original_degree[node], counter, node))
+            counter += 1
+            continue
+
+        selected.append(node)
+        excluded.add(node)
+
+        for nb in adj[node]:
+            if nb in excluded:
+                continue
+            excluded.add(nb)
+            for nb2 in adj[nb]:
+                if nb2 not in excluded:
+                    degree[nb2] -= 1
+                    heapq.heappush(heap, (degree[nb2], original_degree[nb2], counter, nb2))
+                    counter += 1
+
+    return selected
 
 def max_independent_kmers_greedy(dict_overlap):
     """Greedy minimum-degree independent set from an overlap dict.
@@ -936,35 +983,18 @@ def main():
 
         # Add pairs from singletons
         singleton_kmers = set(df_inform_singletons["#kmer"].to_list())
-
-        # get next id number for pairs 
-        existing = glob.glob(pair_glob)
-        part_re = re.compile(r"\.part(\d+)\.parquet$")
-        part_ids = [int(m.group(1)) for f in existing if (m := part_re.search(f))]
-        next_part_id = max(part_ids) + 1 if part_ids else 0
-
-        path, pairs = create_pairs_with_singletons(set(singleton_kmers), set(pair_kmers), 
-                                           output_dir = args.output_dir, 
-                                           basename = basename,
-                                           part_id = next_part_id)
-
         all_kmers = singleton_kmers | pair_kmers
-
-
-
         
+        # map positions
         df_locations ,_ = build_mapped_kmers_ahocorasick(records, all_kmers, terminal_dist=args.terminal_dist)
-
-
-        # Filter
-        # remove terminal kmers
         print('dropping terminal kmers')
         df_locations = df_locations.loc[df_locations['terminal_kmer'] == False] 
 
-        print('finding overlapping kmers')
+        print('finding overlapping kmers for kmer selection')
         dict_overlap = find_overlap_kmer(df_locations, max = 0.8)
+        
         print('selecting kmers')
-        selected = max_independent_kmers_greedy(dict_overlap=dict_overlap)
+        selected = max_independent_kmers_greedy_heap(dict_overlap=dict_overlap)
 
         #  Export locations
         df_locations['origin'] = df_locations['#kmer'].apply(lambda x: 'singleton' if x in singleton_kmers else 'pair')
@@ -972,27 +1002,46 @@ def main():
         df_locations.loc[df_locations['#kmer'].isin(selected)].to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
                                          sep='\t', index=False)
         
-        # write final pairs
-        sel_series = pl.Series(selected)
+        # split selected kmers into two sets
+        selected_pair_kmers = set(selected) & set(pair_kmers)
+        selected_singletons = set(selected) & set(singleton_kmers)
+        print(f"Selected pair kmers: {len(selected_pair_kmers):,}")
+        print(f"Selected singletons: {len(selected_singletons):,}")
 
-        pair_glob = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")
-        final_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.final.parquet")
-
-        # stream the both-selected pairs straight to the final file (no full materialization)
+        # write filtered file
+        filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.filtered.parquet")
+        sel_pl = pl.Series(sorted(selected_pair_kmers))
         (
             pl.scan_parquet(pair_glob, low_memory=True)
-            .filter(pl.col("kmerA").is_in(sel_series) & pl.col("kmerB").is_in(sel_series))
-            .sink_parquet(final_path, compression="zstd")
+            .filter(pl.col("kmerA").is_in(sel_pl) & pl.col("kmerB").is_in(sel_pl))
+            .sink_parquet(filtered_path, compression="zstd")
         )
-
-        # only delete the parts once the final file exists and is non-empty
-        if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
+        # only delete the parts once the selected file exists and is non-empty
+        if os.path.exists(filtered_path) and os.path.getsize(filtered_path) > 0:
             parts = glob.glob(pair_glob)
             for p in parts:
                 os.remove(p)
-            print(f"Wrote {final_path} and removed {len(parts)} part files", flush=True)
+            print(f"Wrote {filtered_path} and removed {len(parts)} part files", flush=True)
         else:
             print("WARNING: final parquet missing or empty — keeping part files", flush=True)
+
+        # Create pairs from singletons
+        singleton_path, _ = create_pairs_with_singletons(
+            selected_singletons, selected_pair_kmers,
+            output_dir=args.output_dir, basename=basename,
+            part_id=9999  # or next_part_id
+        )
+
+        # 3. merge both files into one final file
+        final_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.final.parquet")
+        (pl.scan_parquet([filtered_path, singleton_path], low_memory=True)
+            .sink_parquet(final_path, compression="zstd"))
+        
+
+        os.remove(filtered_path)
+        os.remove(singleton_path)
+        
+        
 
 
 if __name__ == '__main__':
