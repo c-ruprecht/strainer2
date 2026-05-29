@@ -564,38 +564,43 @@ def smooth_downsample(df, total_target, bin_size, mode = None):
         result = pd.concat(contig_results)
         print(f'  Total: {len(df)} -> {len(result)} kmers after smooth downsampling')
         return result.sort_values(['contig_id', 'kmer_position'])
-def find_overlap_kmer_fast(df, max=0.8):
+def find_overlap_kmer_fast(df, max=0.8, chunk_size=10_000):
     dict_overlap = {}
-    
+    same_thresh = 31 * max
+    cross_lo    = 31 * (1 - max)
+    cross_hi    = 62 * max
+
     for contig_id, contig_df in df.groupby('contig_id'):
-        kmers = contig_df['#kmer'].values
+        kmers     = contig_df['#kmer'].values
         positions = contig_df['kmer_position'].values
-        is_rc = contig_df['reverse_complement'].values.astype(bool)
+        is_rc     = contig_df['reverse_complement'].values.astype(bool)
+        n = len(kmers)
         
-        same_thresh = 31 * max       # 24.8
-        cross_lo    = 31 * (1 - max) # 6.2
-        cross_hi    = 62 * max       # 49.6
-        
-        # dist[i,j] = pos[j] - pos[i]
-        dist = positions[None, :] - positions[:, None]
-        rc_i = is_rc[:, None]
-        rc_j = is_rc[None, :]
-        
-        same_strand = (rc_i == rc_j) & (np.abs(dist) < same_thresh)
-        
-        # fwd query (rc_i=False), rc candidate (rc_j=True): dist must be in (cross_lo, cross_hi)
-        fwd_rc = (~rc_i) & rc_j & (dist > cross_lo) & (dist < cross_hi)
-        
-        # rc query (rc_i=True), fwd candidate (rc_j=False): -dist must be in (cross_lo, cross_hi)
-        # i.e. dist in (-cross_hi, -cross_lo)
-        rc_fwd = rc_i & (~rc_j) & (dist > -cross_hi) & (dist < -cross_lo)
-        
-        overlap_matrix = same_strand | fwd_rc | rc_fwd
-        np.fill_diagonal(overlap_matrix, False)
-        
-        for i in range(len(kmers)):
-            dict_overlap[kmers[i]] = kmers[overlap_matrix[i]].tolist()
-    
+        overlap_lists = [[] for _ in range(n)]
+
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            
+            # dist[i,j] = pos[j] - pos[i], i in chunk, j in all
+            dist = positions[None, :] - positions[start:end, None]  # (chunk, n)
+            rc_i = is_rc[start:end, None]
+            rc_j = is_rc[None, :]
+
+            same_strand = (rc_i == rc_j) & (np.abs(dist) < same_thresh)
+            fwd_rc = (~rc_i) &  rc_j & (dist >  cross_lo) & (dist <  cross_hi)
+            rc_fwd =   rc_i  & (~rc_j) & (dist > -cross_hi) & (dist < -cross_lo)
+
+            overlap_matrix = same_strand | fwd_rc | rc_fwd
+            # zero out self
+            for local_i in range(end - start):
+                overlap_matrix[local_i, start + local_i] = False
+
+            for local_i in range(end - start):
+                overlap_lists[start + local_i] = kmers[overlap_matrix[local_i]].tolist()
+
+        for i in range(n):
+            dict_overlap[kmers[i]] = overlap_lists[i]
+
     return dict_overlap
 
 def find_overlap_kmer(df, max = 0.8):
