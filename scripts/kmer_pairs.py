@@ -703,20 +703,8 @@ def get_singleton_hits(df_samples, df_informative, kmer_column="#kmer"):
     return pl.DataFrame(rows)
 
 
-
-
-def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer"):
-    """Stream informative pairs from parquet part files and compute per-sample
-    coverage without materializing the full pair frame.
-
-    pairs_glob: glob pattern like
-        "/path/to/output/{basename}.inform_kmer_pairs.part*.parquet"
-        (a single parquet path also works — glob will return [path])
-
-    A pair is 'observed' in a sample when both kmers have count > 0 there.
-    The per-sample mean is taken over all n_total pairs (zeros included),
-    matching get_triple_hits_streaming's convention.
-    """
+def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer",
+                            batch_size=250_000):
     part_files = sorted(glob.glob(pairs_glob))
     if not part_files:
         raise FileNotFoundError(f"No pair part files matched {pairs_glob}")
@@ -728,34 +716,38 @@ def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer"):
     n_total = 0
 
     for path in part_files:
-        df_part = pl.read_parquet(path)
-        n_total += len(df_part)
-        if len(df_part) == 0:
-            continue
+        pf = pq.ParquetFile(path)
+        for batch in pf.iter_batches(batch_size=batch_size,
+                                     columns=["kmerA", "kmerB"]):
+            df_part = pl.from_arrow(batch)
+            n_total += len(df_part)
+            if len(df_part) == 0:
+                continue
 
-        # restrict the sample matrix to kmers touched by this part
-        part_kmers = pl.concat([df_part["kmerA"], df_part["kmerB"]]).unique()
-        df_hits = df_samples.filter(pl.col(kmer_column).is_in(part_kmers.implode()))
+            part_kmers = pl.concat([df_part["kmerA"], df_part["kmerB"]]).unique()
+            df_hits = df_samples.filter(pl.col(kmer_column).is_in(part_kmers.implode()))
 
-        df_A = df_hits.rename({kmer_column: "kmerA", **{s: f"{s}__A" for s in sample_cols}})
-        df_B = df_hits.rename({kmer_column: "kmerB", **{s: f"{s}__B" for s in sample_cols}})
+            df_A = df_hits.rename({kmer_column: "kmerA", **{s: f"{s}__A" for s in sample_cols}})
+            df_B = df_hits.rename({kmer_column: "kmerB", **{s: f"{s}__B" for s in sample_cols}})
 
-        df_pair = (
-            df_part.select(["kmerA", "kmerB"])
-            .join(df_A, on="kmerA", how="inner")
-            .join(df_B, on="kmerB", how="inner")
-        )
+            df_pair = (
+                df_part.select(["kmerA", "kmerB"])
+                .join(df_A, on="kmerA", how="inner")
+                .join(df_B, on="kmerB", how="inner")
+            )
 
-        for s in sample_cols:
-            pair_count = pl.min_horizontal(pl.col(f"{s}__A"), pl.col(f"{s}__B"))
-            stats = df_pair.select([
-                (pair_count > 0).sum().alias("observed"),
-                pair_count.sum().alias("sum_count"),
-            ]).row(0, named=True)
-            observed[s] += stats["observed"] or 0
-            sum_count[s] += stats["sum_count"] or 0
+            # single pass: all samples at once instead of n_samples selects
+            exprs = []
+            for s in sample_cols:
+                pc = pl.min_horizontal(pl.col(f"{s}__A"), pl.col(f"{s}__B"))
+                exprs.append((pc > 0).sum().alias(f"o__{s}"))
+                exprs.append(pc.sum().alias(f"c__{s}"))
+            stats = df_pair.select(exprs).row(0, named=True)
+            for s in sample_cols:
+                observed[s] += stats[f"o__{s}"] or 0
+                sum_count[s] += stats[f"c__{s}"] or 0
 
-        del df_part, df_hits, df_A, df_B, df_pair
+            del df_part, df_hits, df_A, df_B, df_pair
 
     rows = [{
         "sample": s,
