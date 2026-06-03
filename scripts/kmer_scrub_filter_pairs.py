@@ -247,6 +247,7 @@ def create_pairs_with_singletons(
     output_dir, basename,
     batch_size=1_000_000,
     part_id=0,
+    self_singletons = False,
 ):
     """Stream singleton-derived pairs to parquet (matches _PAIR_SCHEMA / count=0).
 
@@ -275,17 +276,17 @@ def create_pairs_with_singletons(
                          schema=_PAIR_SCHEMA)
             )
             a_col.clear(); b_col.clear(); c_col.clear()
-
-    for i in range(n_s):
-        kA = singletons[i]
-        for j in range(i + 1, n_s):
-            kB = singletons[j]
-            a_, b_ = (kA, kB) if kA < kB else (kB, kA)
-            a_col.append(a_); b_col.append(b_); c_col.append(0)
-            n_pairs += 1
-            if len(a_col) >= batch_size:
-                flush()
-
+    if self_singletons == True:
+        for i in range(n_s):
+            kA = singletons[i]
+            for j in range(i + 1, n_s):
+                kB = singletons[j]
+                a_, b_ = (kA, kB) if kA < kB else (kB, kA)
+                a_col.append(a_); b_col.append(b_); c_col.append(0)
+                n_pairs += 1
+                if len(a_col) >= batch_size:
+                    flush()
+                    
     pair_set = set(pair_kmers)
     for kA in singletons:
         skip = kA in pair_set
