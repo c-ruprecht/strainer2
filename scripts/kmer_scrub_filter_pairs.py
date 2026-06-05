@@ -261,8 +261,7 @@ def create_pairs_with_singletons(
     print(f"Combining {n_s} singletons among themselves and with {n_p} pair kmers",
           flush=True)
 
-    path = os.path.join(output_dir,
-                        f"{basename}.inform_kmer_pairs.part{part_id:04d}.parquet")
+    path = os.path.join(output_dir, f"{basename}.inform_kmer_pairs.singletons.parquet")
     
     writer = pq.ParquetWriter(path, _PAIR_SCHEMA, compression="zstd")
 
@@ -1047,8 +1046,8 @@ def main():
         print(f"Selected pair kmers: {len(selected_pair_kmers):,}")
         print(f"Selected singletons: {len(selected_singletons):,}")
 
-        # write filtered file
-        filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.filtered.parquet")
+        # write pairs file
+        filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.pairs.parquet")
         sel_pl = pl.Series(sorted(selected_pair_kmers))
         (
             pl.scan_parquet(pair_glob, low_memory=True)
@@ -1072,9 +1071,9 @@ def main():
         )
 
         # 3. merge both files into one final file
-        final_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.final.parquet")
-        (pl.scan_parquet([filtered_path, singleton_path], low_memory=True)
-            .sink_parquet(final_path, compression="zstd"))
+        #final_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.final.parquet")
+        #(pl.scan_parquet([filtered_path, singleton_path], low_memory=True)
+        #    .sink_parquet(final_path, compression="zstd"))
         
 
         os.remove(filtered_path)

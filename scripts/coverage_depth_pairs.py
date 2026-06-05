@@ -124,14 +124,24 @@ def main():
     print('getting pair coverage')
     #df_kmer_pairs = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_pairs.parquet"))
     #df_cov_p = get_pair_hits(df_samples, df_kmer_pairs)
-    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.final.parquet")
-
+    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.*.parquet")
     if glob.glob(pair_glob):
         df_cov_p = get_pair_hits_streaming(df_samples, pair_glob)
     
+    print('getting only pair coverage')
     
+    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.pair.parquet")
+    if glob.glob(pair_glob):
+        df_cov_pp = get_pair_hits_streaming(df_samples, pair_glob)
+        # add pair_ prefix to all columns but sample
+    print('getting only singleton coverage')
+    
+    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.singleton.parquet")
+    if glob.glob(pair_glob):
+        df_cov_sp = get_pair_hits_streaming(df_samples, pair_glob)
+        # add singleton_ prefix to all columns but sample
 
-    df_cov_inform = df_cov_p.to_pandas() #df_cov_s.join(df_cov_p, on="sample", how="left").join(df_cov_t, on = 'sample', how = 'left').to_pandas()
+    df_cov_inform = df_cov_p.join(df_cov_p, on="sample", how="left").join(df_cov_pp, on = 'sample', how = 'left').join(df_cov_sp, on = 'sample', how = 'left').to_pandas()
     
     df_cov_depth = df_cov_depth.set_index('sample')
     df_cov_inform = df_cov_inform.set_index('sample')

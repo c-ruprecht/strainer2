@@ -78,20 +78,19 @@ def main():
     df_hits_stack, dict_total_reads = read_kmer_hits(hits, location)
 
     df_hits_stack['total_kmers_evaluated'] = df_hits_stack['sample'].map(dict_total_reads)
-    df_hits_stack['count_per10B_kmers'] = round(df_hits_stack['count']/df_hits_stack['total_kmers_evaluated']*10**10,1)
     df_hits_stack
 
 
     df_cov_depth = df_hits_stack.groupby(['strain','sample']).agg(**{'total_unique_kmers': ('#kmer', 'nunique'),
-                                                            'total_kmers_with_count': ('count_per10B_kmers', lambda x: sum(x>0)),
-                                                            'count_mean_per10B_kmers': ('count_per10B_kmers', 'mean'),
-                                                            'count_mean_excl0_per10B_kmers': ('count_per10B_kmers', lambda x: x[x>0].mean())})
+                                                            'total_kmers_with_count': ('count', lambda x: sum(x>0)),
+                                                            'count_mean': ('count', 'mean')})
 
     df_cov_depth['coverage'] = df_cov_depth['total_kmers_with_count']/df_cov_depth['total_unique_kmers']
     df_cov_depth = df_cov_depth.reset_index()
     df_cov_depth.sort_values(['coverage'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
+    
     #print(df_cov_depth.loc[df_cov_depth['coverage']>0.02]['sample'].unique())
-    visualize_count_map(df_hits_stack, df_cov_depth, outdir = output_dir, min_coverage=0.1)
+    #visualize_count_map(df_hits_stack, df_cov_depth, outdir = output_dir, min_coverage=0.1)
 
 
     fig = px.scatter(df_cov_depth,

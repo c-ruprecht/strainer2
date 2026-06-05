@@ -705,6 +705,8 @@ def get_singleton_hits(df_samples, df_informative, kmer_column="#kmer"):
 
 def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer",
                             batch_size=250_000):
+    # gets a kmer count by using the lower of the two kmers
+    # mean is that count / total kmer pairs
     part_files = sorted(glob.glob(pairs_glob))
     if not part_files:
         raise FileNotFoundError(f"No pair part files matched {pairs_glob}")
