@@ -94,7 +94,7 @@ def main():
 
 
     fig = px.scatter(df_cov_depth,
-                    x='count_mean_per10B_kmers',
+                    x='count_mean',
                     y = 'coverage',
                     log_x= True,
                     template= 'simple_white',

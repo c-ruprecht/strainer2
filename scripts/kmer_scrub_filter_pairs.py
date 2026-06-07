@@ -1075,9 +1075,6 @@ def main():
         #(pl.scan_parquet([filtered_path, singleton_path], low_memory=True)
         #    .sink_parquet(final_path, compression="zstd"))
         
-
-        os.remove(filtered_path)
-        os.remove(singleton_path)
         
         
 
