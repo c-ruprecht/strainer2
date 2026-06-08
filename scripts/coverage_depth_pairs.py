@@ -192,7 +192,7 @@ def main():
 
     fig = px.scatter(df_cov_depth,
                      x = 'sample',
-                     y = ['combined_coverage_all_kmer','combined_inform_pairs_coverage'],
+                     y = ['coverage_all_kmer','combined_inform_pairs_coverage'],
                      template = 'simple_white')
     fig.update_layout(height=800)                  # taller figure (default ~450)
     fig.update_xaxes(tickfont=dict(size=9)) 
