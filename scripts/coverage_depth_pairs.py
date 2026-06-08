@@ -160,6 +160,8 @@ def main():
     print(df_cov_depth)
     
     df_cov_depth = df_cov_depth.reset_index()
+    df_cov_depth.sort_values(['coverage_all_kmer'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
+
     fig = px.scatter(df_cov_depth, x='count_mean', y='coverage_all_kmer',
                 log_x=True, template='simple_white',
                 hover_data=['sample'], width=600)
@@ -186,6 +188,8 @@ def main():
 
     fig.update_layout(legend_title_text='metric', xaxis_title='depth', yaxis_title='coverage')
     fig.write_image(output_dir + '/coverage-depth-combined.svg')
+    
+
     fig = px.scatter(df_cov_depth,
                      x = 'sample',
                      y = ['combined_coverage_all_kmer','combined_inform_pairs_coverage'],
@@ -194,7 +198,6 @@ def main():
     fig.update_xaxes(tickfont=dict(size=9)) 
     fig.write_image(output_dir + '/coverage-per-sample.svg')
 
-    df_cov_depth.sort_values(['coverage_all_kmer'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
 
 
 if __name__ == '__main__':
