@@ -142,13 +142,18 @@ def main():
         df_cov_sp = get_pair_hits_streaming(df_samples, pair_glob)
         # add singleton_ prefix to all columns but sample
 
-    df_cov_inform = df_cov_p.join(df_cov_p, on="sample", how="left").join(df_cov_pp, on = 'sample', how = 'left').join(df_cov_sp, on = 'sample', how = 'left').to_pandas()
+    df_cov_inform = (add_prefix(df_cov_p,  "combined_")
+                    .join(add_prefix(df_cov_pp, "pairs_"),      on="sample", how="left")
+                    .join(add_prefix(df_cov_sp, "singletons_"), on="sample", how="left")
+                    .to_pandas()
+            )
+    #df_cov_inform = df_cov_p.join(df_cov_p, on="sample", how="left").join(df_cov_pp, on = 'sample', how = 'left').join(df_cov_sp, on = 'sample', how = 'left').to_pandas()
     
     df_cov_depth = df_cov_depth.set_index('sample')
     df_cov_inform = df_cov_inform.set_index('sample')
     df_cov_depth = pd.concat([df_cov_depth, df_cov_inform], axis = 1)
 
-
+    print(df_cov_depth)
     
     df_cov_depth = df_cov_depth.reset_index()
     fig = px.scatter(df_cov_depth, x='count_mean', y='coverage_all_kmer',
@@ -156,7 +161,7 @@ def main():
                 hover_data=['sample'], width=600)
 
     
-    fig2 = px.scatter(df_cov_depth, x='inform_pairs_count_mean', y='inform_pairs_coverage',
+    fig2 = px.scatter(df_cov_depth, x='combined_inform_pairs_count_mean', y='combined_inform_pairs_coverage',
                     log_x=True, template='simple_white',
                     hover_data=['sample'], range_y=[0,1], width=600)
 
