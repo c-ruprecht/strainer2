@@ -83,11 +83,12 @@ def main():
     location = args.location
     hits = args.hits
     output_dir = args.output_dir
-    print(output_dir)
+    #print(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
     df_hits_stack, dict_total_reads = read_kmer_hits(hits, location)
-    print(df_hits_stack.columns, dict_total_reads)
+    #print(df_hits_stack.columns, dict_total_reads)
+
     df_hits_stack['total_kmers_evaluated'] = df_hits_stack['sample'].map(dict_total_reads)
     df_hits_stack['count_per10B_kmers'] = round(df_hits_stack['count']/df_hits_stack['total_kmers_evaluated']*10**10,1)
     df_hits_stack
@@ -130,13 +131,13 @@ def main():
     
     print('getting only pair coverage')
     
-    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.pair.parquet")
+    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.pairs.parquet")
     if glob.glob(pair_glob):
         df_cov_pp = get_pair_hits_streaming(df_samples, pair_glob)
         # add pair_ prefix to all columns but sample
     print('getting only singleton coverage')
     
-    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.singleton.parquet")
+    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.singletons.parquet")
     if glob.glob(pair_glob):
         df_cov_sp = get_pair_hits_streaming(df_samples, pair_glob)
         # add singleton_ prefix to all columns but sample
