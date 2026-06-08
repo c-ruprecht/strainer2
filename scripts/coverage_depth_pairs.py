@@ -142,6 +142,10 @@ def main():
         df_cov_sp = get_pair_hits_streaming(df_samples, pair_glob)
         # add singleton_ prefix to all columns but sample
 
+    # add prefix to non sample columns
+    def add_prefix(df, prefix):
+        return df.rename({c: f"{prefix}{c}" for c in df.columns if c != "sample"})
+    
     df_cov_inform = (add_prefix(df_cov_p,  "combined_")
                     .join(add_prefix(df_cov_pp, "pairs_"),      on="sample", how="left")
                     .join(add_prefix(df_cov_sp, "singletons_"), on="sample", how="left")
