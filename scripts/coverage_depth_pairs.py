@@ -86,40 +86,12 @@ def main():
     #print(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    df_hits_stack, dict_total_reads = read_kmer_hits(hits, location)
-    #print(df_hits_stack.columns, dict_total_reads)
-
-    df_hits_stack['total_kmers_evaluated'] = df_hits_stack['sample'].map(dict_total_reads)
-    df_hits_stack['count_per10B_kmers'] = round(df_hits_stack['count']/df_hits_stack['total_kmers_evaluated']*10**10,1)
-    df_hits_stack
-
-
-    df_cov_depth = df_hits_stack.groupby(['strain','sample']).agg(**{'total_unique_kmers': ('#kmer', 'nunique'),
-                                                            'total_kmers_with_count': ('count_per10B_kmers', lambda x: sum(x>0)),
-                                                            'count_mean': ('count', 'mean'),
-                                                            
-                                                            })
-
-    df_cov_depth['coverage_all_kmer'] = df_cov_depth['total_kmers_with_count']/df_cov_depth['total_unique_kmers']
-    df_cov_depth = df_cov_depth.reset_index()
-    df_cov_depth['total_kmers_evaluated'] = df_cov_depth['sample'].map(dict_total_reads)
-
-    #df_cov_depth.sort_values(['coverage_kmer_single'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
-    #print(df_cov_depth.loc[df_cov_depth['coverage']>0.02]['sample'].unique())
-    #visualize_count_map(df_hits_stack, df_cov_depth, outdir = output_dir, min_coverage=0.1)
-
-
     # Get informative kmer coverage
     df_samples = pl.read_csv(args.hits, separator="\t")
     df_samples = df_samples.filter(pl.col("#kmer") != "total_evaluated")
     pair_cols = ["#kmer"] + [col for col in df_samples.columns if col != "#kmer" and df_samples[col].sum() > 1]
     df_samples = df_samples.select(pair_cols)
     
-    print('Samples with kmer counts: ' + str(len(pair_cols)))
-    ### Singletons
-    #df_singletons = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_singleton.parquet"))
-    #print(f'getting singleton coverage: {len(df_singletons)}')
-    #df_cov_s = get_singleton_hits(df_samples, df_singletons)
 
     ### Pairs
     print('getting pair coverage')
@@ -162,41 +134,41 @@ def main():
     df_cov_depth = df_cov_depth.reset_index()
     df_cov_depth.sort_values(['coverage_all_kmer'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
 
-    fig = px.scatter(df_cov_depth, x='count_mean', y='coverage_all_kmer',
-                log_x=True, template='simple_white',
-                hover_data=['sample'], width=600)
+    #fig = px.scatter(df_cov_depth, x='count_mean', y='coverage_all_kmer',
+    #            log_x=True, template='simple_white',
+    #            hover_data=['sample'], width=600)
 
     
-    fig2 = px.scatter(df_cov_depth, x='combined_inform_pairs_count_mean', y='combined_inform_pairs_coverage',
-                    log_x=True, template='simple_white',
-                    hover_data=['sample'], range_y=[0,1], width=600)
+    #fig2 = px.scatter(df_cov_depth, x='combined_inform_pairs_count_mean', y='combined_inform_pairs_coverage',
+    #                log_x=True, template='simple_white',
+    #                hover_data=['sample'], range_y=[0,1], width=600)
 
    
     # label + color each series
-    fig.data[0].update(name='single kmers',    marker_color='#1f77b4', showlegend=True)
+    #fig.data[0].update(name='single kmers',    marker_color='#1f77b4', showlegend=True)
     #fig1.data[0].update(name='informative singletons', marker_color='#ff7f0e', showlegend=True)
-    fig2.data[0].update(name='informative pairs', marker_color="#14ad4f", showlegend=True)
+    #fig2.data[0].update(name='informative pairs', marker_color="#14ad4f", showlegend=True)
     #fig3.data[0].update(name='informative triplets', marker_color="#df1a6c", showlegend=True)
 
     
 
     # add traces from fig1, fig2, fig3 onto fig
     
-    for trace in fig2.data:
-        fig.add_trace(trace)
+    #for trace in fig2.data:
+    #    fig.add_trace(trace)
 
 
-    fig.update_layout(legend_title_text='metric', xaxis_title='depth', yaxis_title='coverage')
-    fig.write_image(output_dir + '/coverage-depth-combined.svg')
+    #fig.update_layout(legend_title_text='metric', xaxis_title='depth', yaxis_title='coverage')
+    #fig.write_image(output_dir + '/coverage-depth-combined.svg')
     
 
-    fig = px.scatter(df_cov_depth,
-                     x = 'sample',
-                     y = ['coverage_all_kmer','combined_inform_pairs_coverage'],
-                     template = 'simple_white')
-    fig.update_layout(height=800)                  # taller figure (default ~450)
-    fig.update_xaxes(tickfont=dict(size=9)) 
-    fig.write_image(output_dir + '/coverage-per-sample.svg')
+    #fig = px.scatter(df_cov_depth,
+    #                 x = 'sample',
+    #                 y = ['coverage_all_kmer','combined_inform_pairs_coverage'],
+    #                 template = 'simple_white')
+    #fig.update_layout(height=800)                  # taller figure (default ~450)
+    #fig.update_xaxes(tickfont=dict(size=9)) 
+    #fig.write_image(output_dir + '/coverage-per-sample.svg')
 
 
 

@@ -217,7 +217,7 @@ def kmer_pairs_from_presence(
     # read & clean presence
     df_presence = (
         pl.scan_csv(presence_tsv, separator='\t')
-          .filter(pl.col('list_scrub_id').str.count_matches(',') < presence_t - 1)
+          .filter(pl.col('list_scrub_id').str.count_matches(',') < presence_t - 1) # a list of "1,2,3,4,5" = 4x ,  presence t 5 - 1 = max list length 4 ids
           .with_columns(
               pl.col('list_scrub_id')
                 .str.split(',')
