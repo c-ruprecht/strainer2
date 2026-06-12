@@ -123,17 +123,12 @@ def main():
                     .join(add_prefix(df_cov_sp, "singletons_"), on="sample", how="left")
                     .to_pandas()
             )
-    #df_cov_inform = df_cov_p.join(df_cov_p, on="sample", how="left").join(df_cov_pp, on = 'sample', how = 'left').join(df_cov_sp, on = 'sample', how = 'left').to_pandas()
     
-    df_cov_depth = df_cov_depth.set_index('sample')
-    df_cov_inform = df_cov_inform.set_index('sample')
-    df_cov_depth = pd.concat([df_cov_depth, df_cov_inform], axis = 1)
-
-    print(df_cov_depth)
+    print(df_cov_inform)
     
-    df_cov_depth = df_cov_depth.reset_index()
-    df_cov_depth.sort_values(['coverage_all_kmer'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
+    df_cov_inform.sort_values(['coverage_all_kmer'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
 
+    # Potentially add back figures
     #fig = px.scatter(df_cov_depth, x='count_mean', y='coverage_all_kmer',
     #            log_x=True, template='simple_white',
     #            hover_data=['sample'], width=600)
