@@ -126,7 +126,7 @@ def main():
     
     print(df_cov_inform)
     
-    df_cov_inform.sort_values(['coverage_all_kmer'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
+    df_cov_inform.sort_values(['combined_pairs_coverage'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
 
     # Potentially add back figures
     #fig = px.scatter(df_cov_depth, x='count_mean', y='coverage_all_kmer',
