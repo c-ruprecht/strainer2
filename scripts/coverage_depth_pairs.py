@@ -6,7 +6,7 @@ import polars as pl
 import glob
 import gc
 import argparse
-from kmer_pairs import get_singleton_hits, get_pair_hits_streaming
+from kmer_pairs import get_pair_hits_streaming
 import warnings
 warnings.filterwarnings("ignore", module="kaleido")
 
