@@ -350,6 +350,7 @@ def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer",
     if not part_files:
         raise FileNotFoundError(f"No pair part files matched {pairs_glob}")
 
+    strain_name = os.path.basename(part_files[0]).split(".inform_kmer_pairs.singletons.parquet")[0]
 
     sample_cols = [c for c in df_samples.columns if c != kmer_column]
     # get mean and standard deviation of counts per sample from hits
@@ -433,6 +434,7 @@ def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer",
 
     # return dataframe
     rows = [{
+        "strain": strain_name,
         "sample": s,
         "total_unique_kmers": total_unique_kmers,
         "observed_unique_kmers": dict_sum[s],

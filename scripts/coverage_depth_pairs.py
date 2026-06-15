@@ -126,6 +126,7 @@ def main():
     
     print(df_cov_inform)
     
+    #df_cov_inform['strain'] = str(args.hits).split('/')[-1].split('.')[0]
     df_cov_inform.sort_values(['combined_pairs_coverage'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
 
     # Potentially add back figures
