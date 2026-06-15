@@ -153,7 +153,7 @@ def main():
                         help='k-mer coverage threshold for dereplication.')
     parser.add_argument('--output_dir', required=True,
                         help='Output directory for the scrub database.')
-    parser.add_argument('--genome_compare', required=True,
+    parser.add_argument('--genome_compare', required=False,
                         help='Path to the strainer genome_compare binary.')
     parser.add_argument('--threads', required=False, default = 12,
                         help='Path to the strainer genome_compare binary.')
@@ -179,27 +179,38 @@ def main():
     # create primary clusteron max_containment ani
     cluster_df = cluster_genomes_by_ani(
         df_pairwise,
-        ani_threshold=0.80,
+        ani_threshold=args.min_sourmash,
         ani_column="max_containment_ani",
     )
-    cluster_df.sort_values(['cluster'], ascending = True).to_csv(os.path.join(args.output_dir, 'primary_clusters.csv'))
     # Inspect cluster sizes
     print(cluster_df["cluster"].value_counts().head(10))
+    # --- Write per-cluster genome lists ---
+    genome_paths = pd.read_csv(args.genome_list, header=None, names=["path"])
+    genome_paths["genome"] = genome_paths["path"].str.rsplit("/").str[-1]
+    name_to_path = genome_paths.set_index("genome")["path"].to_dict()
 
-    # For each cluster run kmer compare
+    cluster_lists_dir = os.path.join(args.output_dir, "cluster_lists")
+    os.makedirs(cluster_lists_dir, exist_ok=True)
 
-    # create genome_a genome_b sort columns, groupby mean
+    for cluster_id, grp in cluster_df.groupby("cluster"):
+        paths = []
+        for genome_name in grp["genome"]:
+            path = name_to_path.get(genome_name)
+            if path is None:
+                print(f"[warn] No path found for genome '{genome_name}' in cluster {cluster_id}",
+                      file=sys.stderr)
+                continue
+            paths.append(path)
 
-    # Create secondary clusters
+        list_path = os.path.join(cluster_lists_dir, f"pr_cluster_{cluster_id}.txt")
+        with open(list_path, "w") as f:
+            f.write("\n".join(paths) + "\n")
 
-    # pick based on checkm2, also need to include initial removal
+    print(f"[cluster_lists] Written to {cluster_lists_dir}", file=sys.stderr)
+    
+    #write as last step for snakemake
+    cluster_df.sort_values(['cluster'], ascending = True).to_csv(os.path.join(args.output_dir, 'primary_clusters.csv'))
 
-    kmer_results_path = os.path.join(args.output_dir, "kmer_compare.csv")
-    df_kmer = kmer_compare(df_pairwise=df_pairwise,
-                           genome_compare_bin=args.genome_compare,
-                           genome_dir=target_dir,
-                           min_jaccard=args.min_jaccard,
-                           strain_mode=True,
-                           n_workers=args.threads)
+
 if __name__ == '__main__':
     main()

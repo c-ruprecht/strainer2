@@ -23,6 +23,7 @@ dependencies:
   - polars
   - pycirclize
   - scikit-learn
+  - skani
   #- pip:
   #  - kaleido
 
