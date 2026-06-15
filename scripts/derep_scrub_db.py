@@ -54,32 +54,19 @@ def sourmash_sketch(genome_list, sketches_path,outdir, ksize=31, scaled=1000, th
     return sketches_path
 
 
-def sourmash_pairwise(sketches_path, pairwise_path, threads=8, write_all=True):
-    """Run sourmash pairwise on a sketches zip. Returns the resulting DataFrame."""
-    print(f"[pairwise] Computing pairwise similarities -> {pairwise_path}", file=sys.stderr)
-
+def sourmash_pairwise(sketches_path, pairwise_path, threshold=0.15, threads=8):
     cmd = [
         "sourmash", "scripts", "pairwise",
         sketches_path,
         "-o", pairwise_path,
-        "--threshold", "0",
+        "--threshold", str(threshold),   # was 0  -> ~0.15 (≈94% ANI floor)
         "--ani",
         "-c", str(threads),
-    ]
-    if write_all:
-        cmd.append("--write-all")
-
+    ]                                      # drop --write-all entirely
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.stdout:
-        print(result.stdout, file=sys.stderr, end="")
-    if result.stderr:
-        print(result.stderr, file=sys.stderr, end="")
     if result.returncode != 0:
         raise RuntimeError(f"sourmash pairwise failed (exit {result.returncode})")
-
-    df = pd.read_csv(pairwise_path)
-    print(f"[pairwise] Done: {len(df)} comparisons", file=sys.stderr)
-    return df
+    return pairwise_path   # return the path; don't pd.read_csv the whole thing
 
 
 
@@ -171,11 +158,11 @@ def main():
                     ksize=31, scaled=1000, threads=args.threads)
 
     pairwise_path = os.path.join(args.output_dir, "sourmash-pairwise.csv")
-    df_pairwise = sourmash_pairwise(sketches_path=sketches_path,
+    sourmash_pairwise(sketches_path=sketches_path,
                                     pairwise_path=pairwise_path,
                                     threads=args.threads)
     
-
+    df_pairwise = pd.read_csv(pairwise_path)
     # create primary clusteron max_containment ani
     cluster_df = cluster_genomes_by_ani(
         df_pairwise,
