@@ -11,6 +11,7 @@ import gzip
 import numpy as np
 import numpy as np
 from collections import defaultdict
+import re
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -350,7 +351,8 @@ def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer",
     if not part_files:
         raise FileNotFoundError(f"No pair part files matched {pairs_glob}")
 
-    strain_name = os.path.basename(part_files[0]).split(".inform_kmer_pairs.singletons.parquet")[0]
+    strain_name = re.match(r"(.+)\.inform_kmer_pairs\..+\.parquet", os.path.basename(part_files[0])).group(1)
+
 
     sample_cols = [c for c in df_samples.columns if c != kmer_column]
     # get mean and standard deviation of counts per sample from hits
