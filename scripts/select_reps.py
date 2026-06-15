@@ -16,6 +16,25 @@ from scipy.sparse import csr_matrix
 from sklearn.cluster import DBSCAN
 
 
+def path_to_name(p: str) -> str:
+    """Normalize a genome path OR a CheckM2 'Name' to a bare identifier.
+
+    Strips the directory, then a trailing `.gz`, then a single genome extension.
+    Used on BOTH sides of the CheckM2 join so e.g.
+        /.../MGYG000064733.fasta.gz   (glist / skani path)
+        MGYG000064733.fasta           (CheckM2 Name, .gz already stripped)
+    both reduce to `MGYG000064733`.
+    """
+    name = Path(str(p)).name
+    if name.endswith(".gz"):
+        name = name[:-3]
+    for ext in (".fna", ".fasta", ".fa"):
+        if name.endswith(ext):
+            name = name[: -len(ext)]
+            break
+    return name
+
+
 def load_skani(skani_tsv: str) -> pd.DataFrame:
     df = pd.read_csv(skani_tsv, sep="\t")
     # skani may produce empty files for singleton clusters
@@ -38,15 +57,22 @@ def load_checkm2(checkm2_tsv: str) -> pd.DataFrame:
         "Completeness": "completeness",
         "Contamination": "contamination",
     })
-    return df[["genome_name", "completeness", "contamination"]]
+    # Normalize the CheckM2 Name with the SAME function used on genome paths,
+    # so the merge key is comparable on both sides.
+    df["key"] = df["genome_name"].apply(path_to_name)
 
+    # Collapse duplicate keys (e.g. both X.fna and X.fasta were scored), keeping the
+    # most-complete / least-contaminated row so a stale duplicate can't win selection.
+    n_before = len(df)
+    df = (
+        df.sort_values(["completeness", "contamination"], ascending=[False, True])
+          .drop_duplicates("key", keep="first")
+    )
+    if len(df) < n_before:
+        print(f"[checkm2] Collapsed {n_before - len(df)} duplicate-key rows",
+              file=sys.stderr)
 
-def path_to_name(p: str) -> str:
-    name = Path(p).name
-    for ext in [".fna.gz", ".fa.gz", ".fasta.gz", ".fna", ".fa", ".fasta"]:
-        if name.endswith(ext):
-            return name[: -len(ext)]
-    return Path(p).stem
+    return df[["key", "genome_name", "completeness", "contamination"]]
 
 
 def cluster_genomes(
@@ -129,18 +155,22 @@ def select_representatives(
     Pick highest score per cluster; ties broken alphabetically by path.
     """
     cluster_df = cluster_df.copy()
-    cluster_df["genome_name"] = cluster_df["genome_path"].apply(path_to_name)
+    cluster_df["key"] = cluster_df["genome_path"].apply(path_to_name)
 
-    merged = cluster_df.merge(checkm2_df, on="genome_name", how="left")
+    merged = cluster_df.merge(checkm2_df, on="key", how="left")
 
-    missing_comp = merged["completeness"].isna().sum()
-    missing_cont = merged["contamination"].isna().sum()
-    if missing_comp > 0:
-        print(f"[warn] {missing_comp} genomes missing CheckM2 completeness — set to 0",
+    missing = merged["completeness"].isna()
+    n_missing = int(missing.sum())
+    if n_missing:
+        examples = merged.loc[missing, "genome_path"].head(5).tolist()
+        print(f"[warn] {n_missing}/{len(merged)} genomes had no CheckM2 match by key.",
               file=sys.stderr)
-    if missing_cont > 0:
-        print(f"[warn] {missing_cont} genomes missing CheckM2 contamination — set to 100",
-              file=sys.stderr)
+        for e in examples:
+            print(f"          {e}  ->  key={path_to_name(e)}", file=sys.stderr)
+        if n_missing == len(merged):
+            print("        ALL genomes unmatched -> this is a naming mismatch, not "
+                  "missing data. Compare the keys above against CheckM2 'Name'.",
+                  file=sys.stderr)
 
     merged["completeness"] = merged["completeness"].fillna(0.0)
     merged["contamination"] = merged["contamination"].fillna(100.0)
