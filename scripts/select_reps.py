@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
-from sklearn.cluster import DBSCAN
+from scipy.sparse.csgraph import connected_components
 
 
 def path_to_name(p: str) -> str:
@@ -51,7 +51,7 @@ def load_skani(skani_tsv: str) -> pd.DataFrame:
 
 
 def load_checkm2(checkm2_tsv: str) -> pd.DataFrame:
-    df = pd.read_csv(checkm2_tsv, sep="\t")
+    df = pd.read_csv(checkm2_tsv, sep="\t", low_memory=False)
     df = df.rename(columns={
         "Name": "genome_name",
         "Completeness": "completeness",
@@ -82,64 +82,64 @@ def cluster_genomes(
     genome_list_path: str = None,
 ) -> pd.DataFrame:
     """
-    DBSCAN clustering on skani ANI (0-100 scale).
+    Single-linkage (connected-components) clustering on skani ANI (0-100 scale).
 
-    If skani TSV is empty (singleton cluster — skani produces no rows when
-    only one genome is present), fall back to reading paths from genome_list_path
-    so the genome still gets assigned to a cluster.
+    The node universe is the genome_list for this primary cluster (the genomes fed
+    to skani), NOT the skani rows. skani only emits rows for pairs it finds similar,
+    so genomes with no qualifying hit — and entire clusters where every pair fails
+    the ANI/AF cut — would otherwise disappear from the output (or crash on a 0x0
+    matrix). Seeding from the list makes those genomes fall out as their own
+    singleton clusters, so every input genome is either a representative or assigned
+    to one.
     """
-    if df.empty:
-        if genome_list_path is None:
+    # --- node universe: every genome in this primary cluster ---
+    all_genomes = []
+    if genome_list_path is not None:
+        with open(genome_list_path) as fh:
+            all_genomes = [ln.strip() for ln in fh if ln.strip()]
+
+    # Fall back to whatever skani mentions only if no list was provided.
+    if not all_genomes:
+        if df.empty:
             print("[cluster] Empty skani input and no genome_list — returning empty.",
                   file=sys.stderr)
             return pd.DataFrame(columns=["genome_path", "cluster"])
-        genomes = []
-        with open(genome_list_path) as fh:
-            for line in fh:
-                p = line.strip()
-                if p:
-                    genomes.append(p)
-        print(f"[cluster] Singleton cluster: {len(genomes)} genome(s) from list",
-              file=sys.stderr)
-        return pd.DataFrame({"genome_path": genomes, "cluster": [0] * len(genomes)})
+        all_genomes = list(pd.unique(df[["query_name", "match_name"]].values.ravel()))
 
-    # Drop self-hits
-    df = df[df["query_name"] != df["match_name"]].copy()
+    idx = {g: i for i, g in enumerate(all_genomes)}
+    n = len(all_genomes)
 
-    if af_threshold > 0:
-        df = df[
-            (df["af_ref"] >= af_threshold) &
-            (df["af_query"] >= af_threshold)
-        ].copy()
+    # --- edges: qualifying skani pairs (self-hits dropped, AF + ANI filtered) ---
+    qi = np.empty(0, dtype=int)
+    mi = np.empty(0, dtype=int)
+    if not df.empty:
+        e = df[df["query_name"] != df["match_name"]]
+        if af_threshold > 0:
+            e = e[(e["af_ref"] >= af_threshold) & (e["af_query"] >= af_threshold)]
+        e = e[e["ani"] >= ani_threshold]
 
-    genomes = pd.unique(df[["query_name", "match_name"]].values.ravel())
-    n = len(genomes)
-    genome_idx = {g: i for i, g in enumerate(genomes)}
+        qi = e["query_name"].map(idx).to_numpy()
+        mi = e["match_name"].map(idx).to_numpy()
+        keep = ~(pd.isna(qi) | pd.isna(mi))
+        n_unmapped = int((~keep).sum())
+        if n_unmapped:
+            print(f"[cluster] {n_unmapped} skani edges referenced paths not in the "
+                  f"genome_list — dropped (path mismatch between list and skani output?)",
+                  file=sys.stderr)
+        qi = qi[keep].astype(int)
+        mi = mi[keep].astype(int)
 
-    df_filt = df[df["ani"] >= ani_threshold].copy()
-    df_filt["dist"] = (100.0 - df_filt["ani"]) / 100.0
+    # One direction is enough; connected_components(directed=False) symmetrises.
+    graph = csr_matrix((np.ones(len(qi), dtype=np.uint8), (qi, mi)), shape=(n, n))
+    n_clusters, labels = connected_components(graph, directed=False, connection="weak")
 
-    i_idx = df_filt["query_name"].map(genome_idx).values
-    j_idx = df_filt["match_name"].map(genome_idx).values
-    dists = df_filt["dist"].values
-
-    rows = np.concatenate([i_idx, j_idx])
-    cols = np.concatenate([j_idx, i_idx])
-    data = np.concatenate([dists, dists])
-
-    sparse_dist = csr_matrix((data, (rows, cols)), shape=(n, n))
-
-    eps = (100.0 - ani_threshold) / 100.0
-    db = DBSCAN(eps=eps, min_samples=1, metric="precomputed")
-    labels = db.fit_predict(sparse_dist)
-
-    cluster_df = pd.DataFrame({"genome_path": genomes, "cluster": labels})
+    cluster_df = pd.DataFrame({"genome_path": all_genomes, "cluster": labels})
 
     sizes = cluster_df["cluster"].value_counts()
     print(f"[cluster] Genomes   : {n}", file=sys.stderr)
-    print(f"[cluster] Clusters  : {cluster_df['cluster'].nunique()}", file=sys.stderr)
+    print(f"[cluster] Clusters  : {n_clusters}", file=sys.stderr)
     print(f"[cluster] Largest   : {sizes.iloc[0]} genomes", file=sys.stderr)
-    print(f"[cluster] Singletons: {(sizes == 1).sum()}", file=sys.stderr)
+    print(f"[cluster] Singletons: {int((sizes == 1).sum())}", file=sys.stderr)
 
     return cluster_df
 
