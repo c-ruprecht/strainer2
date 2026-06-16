@@ -36,17 +36,29 @@ def path_to_name(p: str) -> str:
 
 
 def load_skani(skani_tsv: str) -> pd.DataFrame:
-    df = pd.read_csv(skani_tsv, sep="\t")
-    # skani may produce empty files for singleton clusters
+    # Only the first 5 columns are used downstream. skani's trailing
+    # Ref_name / Query_name columns are free-text FASTA headers that can contain
+    # stray tabs or be empty, giving ragged field counts that silently mis-align a
+    # normal pd.read_csv (this is what made cluster 4 fail but not the others).
+    # Read the five fields we need positionally and ignore everything after them.
+    cols = ["query_name", "match_name", "ani", "af_ref", "af_query"]
+    rows = []
+    with open(skani_tsv) as fh:
+        if not fh.readline():            # discard + handle empty file
+            return pd.DataFrame(columns=cols)
+        for line in fh:
+            if not line.strip():
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 5:               # genuinely malformed -> skip
+                continue
+            rows.append(f[:5])           # keep only Ref_file, Query_file, ANI, AF_ref, AF_query
+
+    df = pd.DataFrame(rows, columns=cols)
     if df.empty:
         return df
-    df = df.rename(columns={
-        "Ref_file": "query_name",
-        "Query_file": "match_name",
-        "ANI": "ani",
-        "Align_fraction_ref": "af_ref",
-        "Align_fraction_query": "af_query",
-    })
+    for c in ("ani", "af_ref", "af_query"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
