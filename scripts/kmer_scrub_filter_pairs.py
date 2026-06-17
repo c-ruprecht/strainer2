@@ -1034,6 +1034,8 @@ def main():
         print('selecting kmers')
         selected = max_independent_kmers_greedy_heap(dict_overlap=dict_overlap)
 
+
+
         #  Export locations
         df_locations['origin'] = df_locations['#kmer'].apply(lambda x: 'singleton' if x in singleton_kmers else 'pair')
         print(f"Total kmers for strain_detect: {len(selected):,}")
@@ -1063,21 +1065,15 @@ def main():
         else:
             print("WARNING: final parquet missing or empty — keeping part files", flush=True)
 
-        # Create pairs from singletons
+        # Create pairs with singletons
+
         singleton_path, _ = create_pairs_with_singletons(
             selected_singletons, selected_pair_kmers,
             output_dir=args.output_dir, basename=basename,
-            part_id=9999  # or next_part_id
+            self_singletons=True,
+            max_singletons = 20000,
         )
-
-        # 3. merge both files into one final file
-        #final_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.final.parquet")
-        #(pl.scan_parquet([filtered_path, singleton_path], low_memory=True)
-        #    .sink_parquet(final_path, compression="zstd"))
         
-        
-        
-
 
 if __name__ == '__main__':
     main()

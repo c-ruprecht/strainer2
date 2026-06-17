@@ -12,6 +12,7 @@ import numpy as np
 import numpy as np
 from collections import defaultdict
 import re
+import random
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -27,6 +28,11 @@ def get_test_dataset():
     strain_rows = [
         ["A1",    []],
         ["A2",    []],
+        ["A3",    []],
+        ["A4",    []],
+        ["A5",    []],
+        ["A6",    []],
+        ["A7",    []],
         ["P1",    [1, 2, 3]],
         ["P2",    [4, 5, 6]],
         ["P3",    [4, 5]],
@@ -40,6 +46,11 @@ def get_test_dataset():
     # global kmer counts
     rows_counts = [["A1",    1,0,0,0],
                     ["A2",    1,0,0,0],
+                    ["A3",    1,0,0,0],
+                    ["A4",    1,0,0,0],
+                    ["A5",    1,0,0,0],
+                    ["A6",    1,0,0,0],
+                    ["A7",    1,0,0,0],
                     ["P1",    1,2,2,0],
                     ["P2",    1,2,2,0],
                     ["P3",    1,2,2,0],
@@ -70,6 +81,11 @@ def get_test_dataset():
         # kmer    S1   S2   S3   S4   S5
         ["A1",    1000,    10, 1000,   0,   0, 0],   # singleton observed in S1, S2
         ["A2",     1, 10,   1000,   0,   0, 0],
+        ["A3",     1, 10,   1000,   0,   0, 0],
+        ["A4",     1, 10,   1000,   0,   0, 0],
+        ["A5",     1, 10,   1000,   0,   0, 0],
+        ["A6",     1, 10,   1000,   0,   0, 0],
+        ["A7",     1, 10,   1000,   0,   0, 0],
         ["P1",      1,   10,      0,   10,  10, 0],   # (P1,P2) pair observed in S2 (both>0)? need P2>0 too
         ["P2",      1,   10,      0,   10,  20, 0],
         ["P3",      1,   10,      0,   0,     0, 0],   # (P3,P4) pair observed in S4
@@ -285,8 +301,8 @@ def create_pairs_with_singletons(
     singleton_kmer_set, pair_kmer_set,
     output_dir, basename,
     batch_size=1_000_000,
-    part_id=0,
     self_singletons = False,
+    max_singletons = 20000
 ):
     """Stream singleton-derived pairs to parquet (matches _PAIR_SCHEMA / count=0).
 
@@ -314,17 +330,8 @@ def create_pairs_with_singletons(
                          schema=_PAIR_SCHEMA)
             )
             a_col.clear(); b_col.clear(); c_col.clear()
-    if self_singletons == True:
-        for i in range(n_s):
-            kA = singletons[i]
-            for j in range(i + 1, n_s):
-                kB = singletons[j]
-                a_, b_ = (kA, kB) if kA < kB else (kB, kA)
-                a_col.append(a_); b_col.append(b_); c_col.append(0)
-                n_pairs += 1
-                if len(a_col) >= batch_size:
-                    flush()
-                    
+    
+    # match all singletons with all pair kmers
     pair_set = set(pair_kmers)
     for kA in singletons:
         skip = kA in pair_set
@@ -336,6 +343,23 @@ def create_pairs_with_singletons(
             n_pairs += 1
             if len(a_col) >= batch_size:
                 flush()
+    
+    # get self kmers
+    if self_singletons == True:
+        # get length singletons and randomly subselect if over x
+        if n_s > max_singletons:
+            singletons = random.sample(singletons, max_singletons)
+        for i in range(len(singletons)):
+            kA = singletons[i]
+            for j in range(i + 1, len(singletons)):
+                kB = singletons[j]
+                a_, b_ = (kA, kB) if kA < kB else (kB, kA)
+                a_col.append(a_); b_col.append(b_); c_col.append(0)
+                n_pairs += 1
+                if len(a_col) >= batch_size:
+                    flush()
+                    
+
 
     flush()
     writer.close()
@@ -529,7 +553,8 @@ def main():
         singleton_path, _ = create_pairs_with_singletons(
             singleton_kmers, pair_kmers,
             output_dir=args.output_dir, basename=basename,
-            part_id=9999  # or next_part_id
+            self_singletons=True,
+            max_singletons=5
         )
     
     
