@@ -70,18 +70,11 @@ def visualize_count_map(df_hits_stack, df_coverage, outdir, min_coverage = 0.02)
 
 def main():
     parser = argparse.ArgumentParser(description='Calcualting coverage and depth with kmer locations')
-    parser.add_argument('--location', help='a target strain .rare_kmers_mapped.tsv.gz file')
     parser.add_argument('--hits', help='a target_strain .kmer_hits.tsv.gz')
-    parser.add_argument('--inform_kmer_singles')
-    parser.add_argument('--inform_kmer_pairs', help = 'parquet file of kmer pair counts')
     parser.add_argument('--inform_kmers')
     parser.add_argument('--output_dir', help='directory where output is saved')
-    parser.add_argument('--figures', help = 'if ommited no visualization will be produced')
-    parser.add_argument('--min_coverage', help = 'minimal coverage for which figurs will be created. default 0.1 ')
     args = parser.parse_args()
 
-    location = args.location
-    hits = args.hits
     output_dir = args.output_dir
     #print(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -89,8 +82,9 @@ def main():
     # Get informative kmer coverage
     df_samples = pl.read_csv(args.hits, separator="\t")
     df_samples = df_samples.filter(pl.col("#kmer") != "total_evaluated")
-    pair_cols = ["#kmer"] + [col for col in df_samples.columns if col != "#kmer" and df_samples[col].sum() > 1]
-    df_samples = df_samples.select(pair_cols)
+    # drop this to check if missing samples reappear
+    #pair_cols = ["#kmer"] + [col for col in df_samples.columns if col != "#kmer" and df_samples[col].sum() > 1]
+    #df_samples = df_samples.select(pair_cols)
     
 
     ### Pairs
