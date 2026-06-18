@@ -270,7 +270,7 @@ def kmer_pairs_from_presence(
         # read & clean presence
         df_presence = (
             pl.scan_csv(presence_tsv, separator='\t')
-            .filter(pl.col('list_scrub_id').str.count_matches(',') <= presence_t - 1) # a list of "1,2,3,4,5" = 4x ,  presence t 5 - 1 = max list length 4 ids
+            .filter(pl.col('list_scrub_id').str.count_matches(',') <= presence_t - 1) 
             .with_columns(
                 pl.col('list_scrub_id')
                     .str.split(',')
@@ -291,10 +291,12 @@ def kmer_pairs_from_presence(
         print(f"After kmer subset filter: {df_presence.shape[0]:,}", flush=True)
     
     # random subsample when df_presence is too big
-    if len(df_presence) > 50000:
-        print('too many potential pairs: >50k')
-        print('random subselection to 50k')
-        df_presence = df_presence.sample(n=50000,  seed=42, shuffle=True)
+    max_for_pairs = 20000
+    if len(df_presence) > max_for_pairs:
+        print(f'too many potential pairs: >{max_for_pairs}')
+        print('random subselection')
+        df_presence = df_presence.sample(n=max_for_pairs,  seed=42, shuffle=True)
+        # maybe this should be sorted by presence list length
 
 
     os.makedirs(output_dir, exist_ok=True)
@@ -536,7 +538,6 @@ def main():
         # Add pairs from singletons
         singleton_kmers = set(df_inform_singletons["#kmer"].to_list())
         all_kmers = singleton_kmers | pair_kmers
-        
         print(all_kmers)
         # write pairs file
         filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.pairs.parquet")
@@ -556,7 +557,11 @@ def main():
         else:
             print("WARNING: final parquet missing or empty — keeping part files", flush=True)
 
-        # Create pairs from singletons
+        # downselect to random subset 
+        max_singletons = 50000
+        if singleton_kmers > max_singletons:
+            singleton_kmers = set(df_inform_singletons.sample(n=max_for_singlletons,  seed=42, shuffle=True)["#kmer"].to_list())
+
         singleton_path, _ = create_pairs_with_singletons(
             singleton_kmers, pair_kmers,
             output_dir=args.output_dir, basename=basename,
@@ -571,7 +576,6 @@ def main():
         if inform_parts:
             print('All kmer pairs created')
             print(pl.read_parquet(inform_parts))
-        #
 
         print('Creating coverage outputs')
         df_cov_p = get_pair_hits_streaming(df_samples,os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.*.parquet"))

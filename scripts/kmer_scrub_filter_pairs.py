@@ -26,7 +26,7 @@ import os
 import pyarrow as pa
 import pyarrow.parquet as pq
 import re
-
+import random
 import subprocess
 import math
 
@@ -797,20 +797,26 @@ def main():
         print('selecting kmers')
         selected = max_independent_kmers_greedy_heap(dict_overlap=dict_overlap)
 
-
-
-        #  Export locations
-        df_locations['origin'] = df_locations['#kmer'].apply(lambda x: 'singleton' if x in singleton_kmers else 'pair')
-        print(f"Total kmers for strain_detect: {len(selected):,}")
-        df_locations.loc[df_locations['#kmer'].isin(selected)].to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
-                                         sep='\t', index=False)
-        
         # split selected kmers into two sets
         selected_pair_kmers = set(selected) & set(pair_kmers)
         selected_singletons = set(selected) & set(singleton_kmers)
         print(f"Selected pair kmers: {len(selected_pair_kmers):,}")
         print(f"Selected singletons: {len(selected_singletons):,}")
 
+        # downselect to random subset if too many rare singletons found
+        max_singletons = 50000
+        if len(selected_singletons) > max_singletons:
+            selected_singletons = set(random.Random(42).sample(sorted(selected_singletons), max_singletons)) 
+            # ensure selection is correct for export
+            selected = list(selected_pair_kmers | selected_singletons)
+
+        #  Export locations
+        df_locations['origin'] = df_locations['#kmer'].apply(lambda x: 'singleton' if x in selected_singletons else 'pair')
+        print(f"Total kmers for strain_detect: {len(selected):,}")
+        df_locations.loc[df_locations['#kmer'].isin(selected)].to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
+                                         sep='\t', index=False)
+        
+        
         # write pairs file
         filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.pairs.parquet")
         sel_pl = pl.Series(sorted(selected_pair_kmers))
