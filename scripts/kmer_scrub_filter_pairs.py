@@ -656,6 +656,7 @@ def main():
                         help='Save figures as SVG (default: False)')
     parser.add_argument('--threads', type = int)
     parser.add_argument('--presence_t', type = int, help = 'maximal presence threshold for pair generation' ,default = 50)
+    parser.add_argument('--pair_mode', type = str, default = "sxs", help = ' Either set to "sxs" for including singeltons x singletons pair generation or "sxp"')
     parser.add_argument('--percentage', type=float, default=0.01,
                         help='Percentile threshold for rare kmer selection (default: 0.05)')
     parser.add_argument('--percentile_union', type = float, default = 0.05, help = 'percentile passed for union of different kmer scrubs')
@@ -710,11 +711,13 @@ def main():
             df_hist,
             x='coverage_pct',
             log_y = True,
+            color = 'sample_type',
             histfunc = 'count',
             template='simple_white',
             title=f'{basename} — coverage_pct distribution',
             range_x = [0,1],
             )
+        fig.add_vline(x=0.96, line_width=3, line_dash="dash", line_color="grey")
         fig.update_layout(width=800, height=500)
         fig.write_image(os.path.join(args.output_dir, f'{basename}.histogram_scrub_db.svg'))
         
@@ -743,8 +746,9 @@ def main():
         
 
         df_inform_singletons = df_no_drugs.filter((pl.col('metagenome_count') == 0 ) & (pl.col('pangenome_count') == 0))        
-        df_non_inform_singletons = df_no_drugs.filter(~(pl.col('metagenome_count') == 0 ) & ~(pl.col('pangenome_count') == 0))
+        df_non_inform_singletons = df_no_drugs.filter(~((pl.col('metagenome_count') == 0) & (pl.col('pangenome_count') == 0)))
         print(df_inform_singletons)
+        print(df_non_inform_singletons)
 
         # export parquet inform kmers
         print('Creating pairs from non informative singletons')
@@ -822,14 +826,19 @@ def main():
             print("WARNING: final parquet missing or empty — keeping part files", flush=True)
 
         # Create pairs with singletons
-
-        singleton_path, _ = create_pairs_with_singletons(
-            selected_singletons, selected_pair_kmers,
-            output_dir=args.output_dir, basename=basename,
-            self_singletons=True,
-            max_singletons = 20000,
-        )
-        
+        if args.pair_mode == "sxp":
+            singleton_path, _ = create_pairs_with_singletons(
+                selected_singletons, selected_pair_kmers,
+                output_dir=args.output_dir, basename=basename,
+                self_singletons=True,
+                max_singletons = 20000,
+            )
+        if args.pair_mode == "sxs":
+            singleton_path, _ = create_pairs_with_singletons(
+                selected_singletons, selected_pair_kmers,
+                output_dir=args.output_dir, basename=basename,
+                self_singletons=False,
+            )
 
 if __name__ == '__main__':
     main()
