@@ -290,6 +290,13 @@ def kmer_pairs_from_presence(
         print(df_presence)
         print(f"After kmer subset filter: {df_presence.shape[0]:,}", flush=True)
     
+    # random subsample when df_presence is too big
+    if len(df_presence) > 50000:
+        print('too many potential pairs: >50k')
+        print('random subselection to 50k')
+        df_presence = df_presence.sample(n=50000,  seed=42, shuffle=True)
+
+
     os.makedirs(output_dir, exist_ok=True)
     return create_disjoint_kmer_pairs_parallel(
         df_presence, output_dir, basename,
