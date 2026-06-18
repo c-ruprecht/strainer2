@@ -727,8 +727,9 @@ def main():
         print('Remove kmers with count >1 from ref genome:')
         df_global_counts = df_global_counts.filter(pl.col("reference_count") == 1)
         print(f'Remaining kmers: {len(df_global_counts)}')
+        
         print('Removing all kmers present in drug scrub:')
-        df_no_drugs = df_global_counts.filter(pl.col("drug_count") == pl.col("drug_count").min())
+        df_no_drugs = df_global_counts.filter(pl.col("drug_count") == 0)
         print(f'Remaining kmers: {len(df_no_drugs)}')
 
         # you can then just grab the 0 counts here much faster
@@ -746,7 +747,9 @@ def main():
         
 
         df_inform_singletons = df_no_drugs.filter((pl.col('metagenome_count') == 0 ) & (pl.col('pangenome_count') == 0))        
+        # get all non unique singletons
         df_non_inform_singletons = df_no_drugs.filter(~((pl.col('metagenome_count') == 0) & (pl.col('pangenome_count') == 0)))
+
         print(df_inform_singletons)
         print(df_non_inform_singletons)
 
