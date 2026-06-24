@@ -101,7 +101,6 @@ def cluster_genomes(
     so genomes with no qualifying hit — and entire clusters where every pair fails
     the ANI/AF cut — would otherwise disappear from the output (or crash on a 0x0
     matrix). Seeding from the list makes those genomes fall out as their own
-    singleton clusters, so every input genome is either a representative or assigned
     to one.
     """
     # --- node universe: every genome in this primary cluster ---

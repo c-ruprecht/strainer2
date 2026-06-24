@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 import numpy as np
 import pandas as pd
@@ -14,9 +15,51 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
 
-def sourmash_sketch(genome_list, sketches_path, outdir, ksize=31, scaled=1000, threads=8):
-    """Build a manysketch CSV from the genome list and run sourmash manysketch."""
+def _verify_sketch_zip(zip_path, expected=None):
+    """Sanity-check a sketch zip before trusting it downstream.
 
+    branchwater's manysketch writer does not set ZIP64/large_file, so a single zip
+    silently corrupts once it crosses ~4 GB or 65,535 entries: the file exists but its
+    central directory is unusable and sourmash / pairwise then read garbage. Catch it
+    here while it is cheap (reading only the central directory), rather than failing
+    70% of the way into a multi-hour pairwise.
+    """
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(
+            f"{zip_path} is not a readable zip ({exc}); "
+            "likely a ZIP64/large_file write overflow."
+        )
+    if "SOURMASH-MANIFEST.csv" not in names:
+        raise RuntimeError(f"{zip_path} has no SOURMASH-MANIFEST.csv (corrupt write?).")
+    n_sigs = sum(1 for x in names if x.endswith(".sig.gz"))
+    if expected is not None and n_sigs != expected:
+        # md5-identical sketches are deduplicated, so a small shortfall is normal;
+        # a large one means a truncated / overflowed write -> worth a loud warning.
+        print(
+            f"[warn] {zip_path}: manifest lists {n_sigs} sketches but {expected} "
+            "genomes were requested. A small gap is expected if any sketches share an "
+            "md5; a large gap suggests a truncated or ZIP64-overflowed write.",
+            file=sys.stderr,
+        )
+    return n_sigs
+
+
+def sourmash_sketch(genome_list, sketches_path, outdir, ksize=31, scaled=1000,
+                    threads=8, chunk_size=50000):
+    """Sketch the genome list into a single, ZIP64-valid sketches.zip.
+
+    We cannot let branchwater's manysketch write one big zip directly: its writer
+    omits ZIP64/large_file, so any archive over ~4 GB (or 65,535 entries) is written
+    corrupt -- exactly what bites a full UHGG run (~289k genomes). Instead we
+    manysketch in <= chunk_size-genome shards (each comfortably under both limits),
+    verify every shard, then concatenate them with `sourmash sig cat`, whose Python
+    zipfile backend writes proper ZIP64. The result is one ordinary sketches.zip that
+    pairwise consumes unchanged. (branchwater READS ZIP64 zips fine -- only its writer
+    is the problem -- so the concatenated zip is safe downstream.)
+    """
     df = pd.read_csv(genome_list, header=None)
     df.columns = ['genome_filename']
     df['name'] = df['genome_filename'].str.rsplit('/').str[-1]
@@ -27,28 +70,68 @@ def sourmash_sketch(genome_list, sketches_path, outdir, ksize=31, scaled=1000, t
     if len(df) - df['name'].nunique() > 0:
         print('Duplicate name entries in genome list')
 
-    csv_path = os.path.join(outdir, "manysketch.csv")
-    df[['name', 'genome_filename', 'protein_filename']].to_csv(csv_path, index=None)
+    df = df[['name', 'genome_filename', 'protein_filename']].reset_index(drop=True)
 
-    print(f"[sketch] Sketching {len(df)} genomes (k={ksize}, scaled={scaled}) -> {sketches_path}",
+    chunks_dir = os.path.join(outdir, "sketch_chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+
+    n_total = len(df)
+    n_chunks = (n_total + chunk_size - 1) // chunk_size
+    shard_zips = []
+
+    print(f"[sketch] {n_total} genomes -> {n_chunks} shard(s) of <= {chunk_size} "
+          f"(k={ksize}, scaled={scaled})", file=sys.stderr)
+
+    for i in range(n_chunks):
+        sub = df.iloc[i * chunk_size:(i + 1) * chunk_size]
+        csv_path = os.path.join(chunks_dir, f"manysketch_{i:04d}.csv")
+        zip_path = os.path.join(chunks_dir, f"sketches_{i:04d}.zip")
+        sub.to_csv(csv_path, index=None)
+
+        print(f"[sketch] shard {i + 1}/{n_chunks}: {len(sub)} genomes -> {zip_path}",
+              file=sys.stderr)
+
+        cmd = [
+            "sourmash", "scripts", "manysketch",
+            csv_path,
+            "--param-str", f"dna,k={ksize},scaled={scaled}",
+            "-o", zip_path,
+            "-c", str(threads),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.stdout:
+            print(result.stdout, file=sys.stderr, end="")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"sourmash manysketch failed on shard {i} (exit {result.returncode})")
+
+        _verify_sketch_zip(zip_path, expected=len(sub))
+        shard_zips.append(zip_path)
+
+    # Concatenate shards into one ZIP64-valid zip. `sig cat` streams signature-by-
+    # signature (O(1) memory) and writes via Python's zipfile, which handles
+    # >4 GB / >65,535 entries correctly -- unlike branchwater's writer.
+    if len(shard_zips) == 1:
+        # A single shard is already a complete, valid zip; just put it in place.
+        if os.path.abspath(shard_zips[0]) != os.path.abspath(sketches_path):
+            shutil.move(shard_zips[0], sketches_path)
+    else:
+        print(f"[sketch] concatenating {n_chunks} shards -> {sketches_path}",
+              file=sys.stderr)
+        cat_cmd = ["sourmash", "sig", "cat", *shard_zips, "-o", sketches_path]
+        result = subprocess.run(cat_cmd, capture_output=True, text=True)
+        if result.stdout:
+            print(result.stdout, file=sys.stderr, end="")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        if result.returncode != 0:
+            raise RuntimeError(f"sourmash sig cat failed (exit {result.returncode})")
+
+    _verify_sketch_zip(sketches_path, expected=n_total)
+    print(f"[sketch] Done: {sketches_path} ({n_total} genomes, {n_chunks} shards)",
           file=sys.stderr)
-
-    cmd = [
-        "sourmash", "scripts", "manysketch",
-        csv_path,
-        "--param-str", f"dna,k={ksize},scaled={scaled}",
-        "-o", sketches_path,
-        "-c", str(threads),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.stdout:
-        print(result.stdout, file=sys.stderr, end="")
-    if result.stderr:
-        print(result.stderr, file=sys.stderr, end="")
-    if result.returncode != 0:
-        raise RuntimeError(f"sourmash manysketch failed (exit {result.returncode})")
-
-    print(f"[sketch] Done: {sketches_path}", file=sys.stderr)
     return sketches_path
 
 
@@ -209,6 +292,11 @@ def main():
                         help='Threads for sourmash / compression.')
     parser.add_argument('--ksize', type=int, default=31)
     parser.add_argument('--scaled', type=int, default=1000)
+    parser.add_argument('--sketch_chunk_size', type=int, default=50000,
+                        help='Genomes per manysketch shard. Keeps each intermediate '
+                             'zip well under the ~4 GB / 65,535-entry ZIP64 limit that '
+                             "branchwater's manysketch writer mishandles, then shards "
+                             'are concatenated into one valid sketches.zip.')
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -219,12 +307,13 @@ def main():
     name_to_path = genome_paths.set_index("genome")["path"].to_dict()
     all_genomes = genome_paths["genome"].tolist()
 
-    # --- sketch ---
+    # --- sketch (sharded -> single ZIP64-valid sketches.zip) ---
     sketches_path = os.path.join(args.output_dir, "sketches.zip")
     sourmash_sketch(genome_list=args.genome_list,
                     outdir=args.output_dir,
                     sketches_path=sketches_path,
-                    ksize=args.ksize, scaled=args.scaled, threads=args.threads)
+                    ksize=args.ksize, scaled=args.scaled, threads=args.threads,
+                    chunk_size=args.sketch_chunk_size)
 
     # --- pairwise: projected + ANI-prefiltered + zstd, via FIFO (no big CSV lands) ---
     pairwise_path = os.path.join(args.output_dir, "sourmash-pairwise.csv.zst")
