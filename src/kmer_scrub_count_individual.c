@@ -86,7 +86,7 @@ int main(int argc, char *argv[])
 			default: usage(); break;
 		}
 
-	if (!r_file || !A_file || !B_file) {
+	if (!r_file || !A_file) {
 		usage();
 		return 1;
 	}
@@ -154,7 +154,8 @@ int main(int argc, char *argv[])
 	                                progress, NULL);
 
 	/* -B → metagenome (col 2) + me rows */
-	GEN_per_sample_kmer_counts_dual(B_file, "me", 2, seed, seqHash,
+	if (B_file)
+		GEN_per_sample_kmer_counts_dual(B_file, "me", 2, seed, seqHash,
 	                                num_threads, w, summary, seen,
 	                                cov_threshold, total_ref_kmers,
 	                                progress, NULL);
@@ -197,7 +198,7 @@ static void usage(void)
 	    "Usage: kmer_scrub_count_individual\n"
 	    "                        -r <reference genome>\n"
 	    "                        -A <file listing genome filenames>\n"
-	    "                        -B <file listing metagenome filenames>\n"
+	    "                       [-B <file listing metagenome filenames>]\n"
 	    "                       [-C <file listing drug-strain genome filenames>]\n"
 	    "                       [-o <inverted presence file, .tsv.zst>]\n"
 	    "                       [-S <per-sample summary output, .tsv>]\n"

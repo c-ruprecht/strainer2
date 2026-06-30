@@ -1,15 +1,15 @@
 import pandas as pd
 import argparse
 import json
-import multiprocessing
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
+import threading
 import zipfile
 from pathlib import Path
 import gzip
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 
 # ============================================================
@@ -24,11 +24,13 @@ def read_sourmash_gather(path):
 
 
 # ============================================================
-# Batch download by accession (flat .fna output)
+# Batch download by accession (flat .fna.gz output, parallel)
 # ============================================================
 
 BATCH_SIZE = 500
 COMPLETED_FILE = "completed_accessions.txt"
+
+_completed_lock = threading.Lock()
 
 
 def load_completed(out_dir):
@@ -45,8 +47,23 @@ def mark_completed(out_dir, accessions):
         fh.write("\n".join(accessions) + "\n")
 
 
+def _gzip_into(src_fna, dest_gz):
+    """Compress src_fna -> dest_gz via the gzip CLI (fast), Python fallback."""
+    try:
+        with open(dest_gz, "wb") as out:
+            subprocess.run(["gzip", "-1", "-c", str(src_fna)], stdout=out, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        with open(src_fna, "rb") as s, gzip.open(dest_gz, "wb", compresslevel=1) as d:
+            shutil.copyfileobj(s, d, length=16 * 1024 * 1024)
+
+
 def download_batch(batch, batch_idx, out_dir):
-    """Download and extract one batch of accessions, flattening .fna into out_dir."""
+    """Download one batch, extract, and gzip each .fna into out_dir.
+
+    Returns the number of .fna.gz files written. Self-contained so it can run
+    in a thread pool: every batch uses a globally-unique index for its zip,
+    accession list, and temp extract dir, so nothing collides across workers.
+    """
     zip_path = os.path.join(out_dir, f"batch_{batch_idx:04d}.zip")
     acc_file = os.path.join(out_dir, f"batch_{batch_idx:04d}_accessions.txt")
     with open(acc_file, "w") as fh:
@@ -54,7 +71,6 @@ def download_batch(batch, batch_idx, out_dir):
 
     cmd = ["datasets", "download", "genome", "accession",
            "--inputfile", acc_file,
-           "--assembly-source", "genbank",
            "--include", "genome",
            "--filename", zip_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -69,20 +85,29 @@ def download_batch(batch, batch_idx, out_dir):
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(tmp_extract)
 
+    n = 0
     for fna in Path(tmp_extract).rglob("*.fna"):
-        dest = os.path.join(out_dir, fna.name)
+        dest = os.path.join(out_dir, fna.name + ".gz")
         if not os.path.exists(dest):
-            shutil.move(str(fna), dest)
+            _gzip_into(fna, dest)
+            n += 1
         else:
-            print(f"[warn] skipping duplicate: {fna.name}", file=sys.stderr)
+            print(f"[warn] skipping duplicate: {fna.name}.gz", file=sys.stderr)
 
     shutil.rmtree(tmp_extract)
     os.remove(zip_path)
     os.remove(acc_file)
+    return n
 
 
-def download_by_accession(accessions, out_dir):
-    """Download a flat list of accessions into out_dir as .fna files, with resume."""
+def download_by_accession(accessions, out_dir, download_workers=3):
+    """Download a flat list of accessions into out_dir as .fna.gz files.
+
+    Batches download (and gzip) in parallel via a thread pool. Both the
+    `datasets` subprocess and the `gzip` CLI release the GIL, so threads
+    overlap network and compression without pickling overhead. Resume is
+    supported via the completed-accessions marker file.
+    """
     completed = load_completed(out_dir)
     remaining = [a for a in accessions if a not in completed]
     if not remaining:
@@ -93,11 +118,25 @@ def download_by_accession(accessions, out_dir):
               file=sys.stderr)
 
     batches = [remaining[i:i + BATCH_SIZE] for i in range(0, len(remaining), BATCH_SIZE)]
-    for idx, batch in enumerate(batches):
-        print(f"[download] Batch {idx + 1}/{len(batches)}: {len(batch)} accessions", file=sys.stderr)
-        download_batch(batch, idx, out_dir)
-        mark_completed(out_dir, batch)
-        print(f"[download] Batch {idx + 1}/{len(batches)} done.", file=sys.stderr)
+    print(f"[download] {len(batches)} batches, {download_workers} parallel workers",
+          file=sys.stderr)
+
+    def worker(idx, batch):
+        got = download_batch(batch, idx, out_dir)
+        with _completed_lock:
+            mark_completed(out_dir, batch)
+        return idx, len(batch), got
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=download_workers) as pool:
+        futures = [pool.submit(worker, idx, b) for idx, b in enumerate(batches)]
+        for fut in as_completed(futures):
+            idx, requested, got = fut.result()
+            done += 1
+            print(f"[download] {done}/{len(batches)} (batch {idx}: {got}/{requested} genomes)",
+                  file=sys.stderr)
+
+    print(f"[download] All {len(batches)} batches complete.", file=sys.stderr)
 
 
 # ============================================================
@@ -250,6 +289,7 @@ def build_genome_set(seed_accession, output_dir,
 
     return {"zips": zip_paths, "accessions": collected, "lineage": lineage}
 
+
 def extract_zip_to_taxon_folder(zip_path, genome_lists_dir):
     """Extract .fna files from one rank-keyed zip into genome_lists/{rank}_{taxid}/.
     Corrupt zips are logged, deleted, and skipped (returns 0)."""
@@ -319,29 +359,9 @@ def build_scrub_genome_lists(seed_accessions, genome_lists_dir,
     return seed_lineages
 
 
-def gzip_all_genomes(scrub_db_path):
-    """Gzip every .fna in target_samples/ and genome_lists/*/ subfolders."""
-    scrub_db_path = Path(scrub_db_path)
-    dirs = [scrub_db_path / "target_samples"]
-    gl = scrub_db_path / "genome_lists"
-    if gl.exists():
-        dirs.extend(d for d in gl.iterdir() if d.is_dir() and not d.name.startswith("_"))
-
-    for d in dirs:
-        if not d.exists():
-            continue
-        files = list(d.glob("*.fna"))
-        if not files:
-            continue
-        print(f"[gzip] Compressing {len(files)} files in {d}", file=sys.stderr)
-        for f in files:
-            gz = f.with_suffix(f.suffix + ".gz")
-            if gz.exists():
-                f.unlink()
-                continue
-            with open(f, "rb") as src, gzip.open(gz, "wb", compresslevel=6) as dst:
-                shutil.copyfileobj(src, dst)
-            f.unlink()
+# ============================================================
+# Parallel gzip (for the cascade genome_lists/ dirs)
+# ============================================================
 
 def _gzip_one(fna_path):
     """Worker: gzip a single file in place, remove the original. Returns bytes saved."""
@@ -353,8 +373,7 @@ def _gzip_one(fna_path):
     orig_size = fna_path.stat().st_size
     # Use `gzip` CLI if available (faster than Python's gzip module) else fall back
     try:
-        subprocess.run(["gzip", "-1", str(fna_path)], check=True,
-                       capture_output=True)
+        subprocess.run(["gzip", "-1", str(fna_path)], check=True, capture_output=True)
     except (FileNotFoundError, subprocess.CalledProcessError):
         with open(fna_path, "rb") as src, gzip.open(gz, "wb", compresslevel=1) as dst:
             shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
@@ -363,9 +382,11 @@ def _gzip_one(fna_path):
 
 
 def gzip_all_genomes(scrub_db_path, n_workers=8):
-    """Gzip every .fna in target_samples/ and genome_lists/*/ in parallel."""
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    """Gzip every .fna in target_samples/ and genome_lists/*/ in parallel.
 
+    Only needed for the cascade path; the accession-download path now gzips
+    inline per batch.
+    """
     scrub_db_path = Path(scrub_db_path)
     dirs = [scrub_db_path / "target_samples"]
     gl = scrub_db_path / "genome_lists"
@@ -395,12 +416,16 @@ def gzip_all_genomes(scrub_db_path, n_workers=8):
 
     print(f"[gzip] Done: {len(all_files)} files", file=sys.stderr)
 
-#python scripts/build_scrub_db_claude.py --drug /metrica/codebase/strainer2-fork/scripts/dev/sourmash_gather_drug.csv --target_samples /metrica/codebase/strainer2-fork/scripts/dev/targetsample_sourmash_gather.csv --scrub_db_path /metrica/scratch/strainer_dev/scrub_db_denovo --threads 30 --genome_compare src/genome_compare --rank_limits "1,1,1,1"
+
+# ============================================================
+# Lineage fetching
+# ============================================================
+
 def _fetch_lineage(acc):
     """Worker for parallel lineage fetching. Returns (accession, lineage_or_None)."""
     try:
         return acc, get_accession_lineage(acc)
-    except Exception as e:
+    except Exception:
         return acc, None
 
 
@@ -411,8 +436,6 @@ def fetch_lineages_parallel(accessions, n_workers=8):
     n_workers accordingly — 8 is safe for short bursts, drop to 5 if you see
     429s.
     """
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-
     lineages = {}
     failed = []
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
@@ -432,31 +455,28 @@ def fetch_lineages_parallel(accessions, n_workers=8):
     return lineages
 
 
+# ============================================================
+# Main
+# ============================================================
+
 def main():
-    parser = argparse.ArgumentParser(description='Build a scrub k-mer database.')
-    parser.add_argument('--sourmash',
-                        help='A sourmash search CSV for all drug lists.')
-    parser.add_argument('--outdir')
-    parser.add_argument('--threads', type=int, default=8)
+    parser = argparse.ArgumentParser(description='Download genomes by accession from a sourmash CSV.')
+    parser.add_argument('--sourmash', required=True,
+                        help='A sourmash gather/search CSV; match_name/name column holds accessions.')
+    parser.add_argument('--outdir', required=True)
+    parser.add_argument('--download_workers', type=int, default=6,
+                        help='Parallel datasets-download batches. Keep modest (4-8): '
+                             'the bottleneck is bandwidth and NCBI rate limits, not CPU.')
     args = parser.parse_args()
 
-    os.makedirs(args.scrub_db_path, exist_ok=True)
+    # ---------- DOWNLOAD PHASE (gzips inline per batch) ----------
+    os.makedirs(args.outdir, exist_ok=True)
+    df = pd.read_csv(args.sourmash)
+    col = "match_name" if "match_name" in df.columns else "name"
+    accessions = df[col].str.split(' ').str[0].unique()
 
-    # ---------- DOWNLOAD PHASE ----------
-
-    target_dir = args.outdir
-    os.makedirs(target_dir, exist_ok=True)
-    df_drug = pd.read_csv(args.sourmash)
-    col = "match_name" if "match_name" in df_drug.columns else "name"
-    target_accessions = df_drug[col].str.split(' ').str[0].unique()
-    
-    print(f"[target_samples] {len(target_accessions)} accessions to download",
-            file=sys.stderr)
-    download_by_accession(target_accessions, target_dir)
-
-
-    # ---------- GZIP PHASE ----------
-    gzip_all_genomes(args.scrub_db_path, n_workers=min(args.threads, 16))
+    print(f"[download] {len(accessions)} unique accessions to download", file=sys.stderr)
+    download_by_accession(accessions, args.outdir, download_workers=args.download_workers)
 
 
 if __name__ == '__main__':
