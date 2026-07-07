@@ -652,11 +652,10 @@ def main():
     parser.add_argument('--counts_summary')
     parser.add_argument('--output-dir', default='.', help='Output directory (default: current directory)')
     parser.add_argument('--basename', default=None, help='Output basename (default: derived from genome filename)')
-    parser.add_argument('--figures', action='store_true', default=False,
-                        help='Save figures as SVG (default: False)')
+    parser.add_argument('--figures', action='store_true', default=False, help='Save figures as SVG (default: False)')
     parser.add_argument('--threads', type = int)
-    parser.add_argument('--presence_t', type = int, help = 'maximal presence threshold for pair generation' ,default = 50)
-    parser.add_argument('--pair_mode', type = str, default = "sxs", help = ' Either set to "sxs" for including singeltons x singletons pair generation or "sxp"')
+    parser.add_argument('--presence_t', type = int, help = 'maximal presence threshold for pair generation' ,default = 10)
+    parser.add_argument('--pair_mode', type = str, default = "sxp", help = ' Either set to "sxs" for including singeltons x singletons pair generation or "sxp"')
     parser.add_argument('--percentage', type=float, default=0.01,
                         help='Percentile threshold for rare kmer selection (default: 0.05)')
     parser.add_argument('--percentile_union', type = float, default = 0.05, help = 'percentile passed for union of different kmer scrubs')
@@ -664,8 +663,7 @@ def main():
     parser.add_argument('--terminal-dist', type=int, default=300,  help='Distance from contig ends to flag terminal kmers (default: 300)')
     parser.add_argument('--map_scrubbed_kmers_only', action='store_true', help = 'Takes a file of rare kmers as a list, one kmer per line that will be mapped to a target genome')
     parser.add_argument('--independent', action='store_true', help = 'reduces bin size to 31 to and only allows 1 kmer per bin')
-    parser.add_argument('--force', action='store_true',
-                        help='Recompute outputs even if they already exist')
+    parser.add_argument('--force', action='store_true', help='Recompute outputs even if they already exist')
     args = parser.parse_args()
     if args.map_scrubbed_kmers_only:
         strain = strain_name_from_path(args.genome)
@@ -728,23 +726,23 @@ def main():
         df_global_counts = df_global_counts.filter(pl.col("reference_count") == 1)
         print(f'Remaining kmers: {len(df_global_counts)}')
         
-        print('Removing all kmers present in drug scrub:')
-        df_no_drugs = df_global_counts.filter(pl.col("drug_count") == 0)
+        if "drug_count" in df_global_counts.columns:
+            print('Removing all kmers present in drug scrub:')
+            df_no_drugs = df_global_counts.filter(pl.col("drug_count") == 0)
+        else:
+            print("No drug scrub performed")
+            df_no_drugs = df_global_counts
         print(f'Remaining kmers: {len(df_no_drugs)}')
 
         # you can then just grab the 0 counts here much faster
         print('Getting all kmers with counts')
 
-        #mapping positions
-        print('Mapping positions of remaining kmers')
-        # Mapping kmers
+
         print(f'Loading genome: {args.genome}')
         records = load_genome(args.genome)
         
 
-        # merge positions and counts
-        n_targets = total_kmers * args.percentage 
-        
+
 
         df_inform_singletons = df_no_drugs.filter((pl.col('metagenome_count') == 0 ) & (pl.col('pangenome_count') == 0))        
         # get all non unique singletons

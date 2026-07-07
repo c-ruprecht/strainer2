@@ -81,7 +81,14 @@ def main():
 
     # Get informative kmer coverage
     df_samples = pl.read_csv(args.hits, separator="\t")
+    
+    #get toal evaulated kmers
+    row = df_samples.filter(pl.col("#kmer") == "total_evaluated").drop("#kmer")
+    dict_total_reads = row.row(0, named=True)
+
+
     df_samples = df_samples.filter(pl.col("#kmer") != "total_evaluated")
+
     # drop this to check if missing samples reappear
     #pair_cols = ["#kmer"] + [col for col in df_samples.columns if col != "#kmer" and df_samples[col].sum() > 1]
     #df_samples = df_samples.select(pair_cols)
@@ -118,47 +125,13 @@ def main():
                     .to_pandas()
             )
     
+    #merge in total reads
+    df_cov_inform['total_kmers_evaluated'] = df_cov_inform['sample'].map(dict_total_reads)
+
     print(df_cov_inform)
     
-    #df_cov_inform['strain'] = str(args.hits).split('/')[-1].split('.')[0]
     df_cov_inform.sort_values(['combined_pairs_coverage'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
 
-    # Potentially add back figures
-    #fig = px.scatter(df_cov_depth, x='count_mean', y='coverage_all_kmer',
-    #            log_x=True, template='simple_white',
-    #            hover_data=['sample'], width=600)
-
-    
-    #fig2 = px.scatter(df_cov_depth, x='combined_inform_pairs_count_mean', y='combined_inform_pairs_coverage',
-    #                log_x=True, template='simple_white',
-    #                hover_data=['sample'], range_y=[0,1], width=600)
-
-   
-    # label + color each series
-    #fig.data[0].update(name='single kmers',    marker_color='#1f77b4', showlegend=True)
-    #fig1.data[0].update(name='informative singletons', marker_color='#ff7f0e', showlegend=True)
-    #fig2.data[0].update(name='informative pairs', marker_color="#14ad4f", showlegend=True)
-    #fig3.data[0].update(name='informative triplets', marker_color="#df1a6c", showlegend=True)
-
-    
-
-    # add traces from fig1, fig2, fig3 onto fig
-    
-    #for trace in fig2.data:
-    #    fig.add_trace(trace)
-
-
-    #fig.update_layout(legend_title_text='metric', xaxis_title='depth', yaxis_title='coverage')
-    #fig.write_image(output_dir + '/coverage-depth-combined.svg')
-    
-
-    #fig = px.scatter(df_cov_depth,
-    #                 x = 'sample',
-    #                 y = ['coverage_all_kmer','combined_inform_pairs_coverage'],
-    #                 template = 'simple_white')
-    #fig.update_layout(height=800)                  # taller figure (default ~450)
-    #fig.update_xaxes(tickfont=dict(size=9)) 
-    #fig.write_image(output_dir + '/coverage-per-sample.svg')
 
 
 
