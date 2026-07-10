@@ -653,7 +653,7 @@ def main():
     parser.add_argument('--output-dir', default='.', help='Output directory (default: current directory)')
     parser.add_argument('--basename', default=None, help='Output basename (default: derived from genome filename)')
     parser.add_argument('--figures', action='store_true', default=False, help='Save figures as SVG (default: False)')
-    parser.add_argument('--threads', type = int)
+    parser.add_argument('--threads', type = int,default = 32)
     parser.add_argument('--presence_t', type = int, help = 'maximal presence threshold for pair generation' ,default = 10)
     parser.add_argument('--pair_mode', type = str, default = "sxp", help = ' Either set to "sxs" for including singeltons x singletons pair generation or "sxp"')
     parser.add_argument('--percentage', type=float, default=0.01,
@@ -664,7 +664,12 @@ def main():
     parser.add_argument('--map_scrubbed_kmers_only', action='store_true', help = 'Takes a file of rare kmers as a list, one kmer per line that will be mapped to a target genome')
     parser.add_argument('--independent', action='store_true', help = 'reduces bin size to 31 to and only allows 1 kmer per bin')
     parser.add_argument('--force', action='store_true', help='Recompute outputs even if they already exist')
+    #classic strainer to pairs arguments
+    parser.add_argument('--create_classic_pairs', action='store_true', help = 'Takes a file of rare kmers as a list, one kmer per line that will be mapped to a target genome')
+    parser.add_argument('--scrubbed_kmers' , help = 'Output of kmer_scrub_filter.py redirected to file.')
     args = parser.parse_args()
+
+
     if args.map_scrubbed_kmers_only:
         strain = strain_name_from_path(args.genome)
         basename = args.basename if args.basename else strain
@@ -685,6 +690,143 @@ def main():
 
         df.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
                         sep='\t', index=False, compression='gzip')
+    
+    # add entry point for classic strainer kmers
+    if args.create_classic_pairs:
+        
+        if args.genome:
+            strain = strain_name_from_path(args.genome)
+        basename = args.basename if args.basename else strain
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        # create histogram plot for scrub db
+        df_hist = pd.read_csv(args.counts_summary, sep='\t')
+        fig = px.histogram(
+            df_hist,
+            x='coverage_pct',
+            log_y = True,
+            color = 'sample_type',
+            histfunc = 'count',
+            template='simple_white',
+            title=f'{basename} — coverage_pct distribution',
+            range_x = [-0.01,1.1],
+            )
+        fig.add_vline(x=0.96, line_width=3, line_dash="dash", line_color="grey")
+        fig.update_layout(width=800, height=500)
+        fig.write_image(os.path.join(args.output_dir, f'{basename}.histogram_scrub_db.svg'))
+
+        print('Creating pairs from classic kmer scrub count file')
+        # read scrubbed kmers
+        li_kmer_scrubs = [l.strip() for l in open(args.scrubbed_kmers) if l.strip() and not l.startswith("#")]
+        print(f'Scrubbed kmer counts: {len(li_kmer_scrubs)}')
+
+        #
+        df_global_counts = pl.read_csv(args.counts_global, 
+                                       separator= '\t', 
+                                       schema_overrides={'reference_count': pl.UInt32,
+                                                        'pangenome_count': pl.UInt32,
+                                                        'metagenome_count': pl.UInt32,
+                                                        'drug_count': pl.UInt32,}
+                                        )
+        # Create waterfall plot scrub
+        df_gl = (df_global_counts.to_pandas().drop(columns=['reference_count']).set_index('#kmer'))
+        row_sums = df_gl.sum(axis=1)
+        count_hist = (row_sums.value_counts()
+              .sort_index()
+              .rename_axis('total_count')
+              .reset_index(name='n_kmers'))
+        
+        print(count_hist)
+        fig = px.scatter(count_hist,
+                     y = 'n_kmers',
+                     x = 'total_count',
+                     log_y = True,
+                     template = 'simple_white',
+                     range_x  = [-0.1, 5000],
+                     title = f'{basename}')
+        fig.add_hline(y = count_hist.loc[count_hist['total_count']==0]['n_kmers'][0],line_width=3, line_dash="dash", line_color="grey")
+        fig.write_image(os.path.join(args.output_dir, f'{basename}.scrub_counts.svg'))
+
+        # create inform singletons from scrubbed files
+        df_scrub_kmers = df_global_counts.filter(pl.col("#kmer").is_in(li_kmer_scrubs))
+        print(df_scrub_kmers)
+
+        
+        df_inform_singletons = df_scrub_kmers.filter((pl.col('metagenome_count') == 0 ) & (pl.col('pangenome_count') == 0))        
+        df_non_inform_singletons = df_scrub_kmers.filter(~((pl.col('metagenome_count') == 0) & (pl.col('pangenome_count') == 0)))
+
+        print(df_inform_singletons)
+        print(df_non_inform_singletons)
+
+        # export parquet inform kmers
+        print('Creating pairs from non informative singletons')
+        kmer_pairs_from_presence(args.counts_individual, args.counts_summary, 
+                                 args.output_dir , 
+                                 basename = basename,
+                                 df_keep=df_non_inform_singletons,
+                                 presence_t = 1000, # set to just make pairs whereever possible
+                                 similarity_t=None, 
+                                 n_workers=args.threads,
+                                 max_for_pairs = 100000)
+        
+        # pair parts → unique kmers across both columns, computed lazily
+        pair_glob = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")
+
+        unique_kmers = set()
+        for path in sorted(glob.glob(pair_glob)):
+            # read just one column at a time, dedupe per-part
+            df_part_a = pl.read_parquet(path, columns=['kmerA'])
+            unique_kmers.update(df_part_a.get_column('kmerA').unique().to_list())
+            del df_part_a
+            df_part_b = pl.read_parquet(path, columns=['kmerB'])
+            unique_kmers.update(df_part_b.get_column('kmerB').unique().to_list())
+            del df_part_b
+            gc.collect()
+
+        pair_kmers = unique_kmers
+        singleton_kmers = set(df_inform_singletons["#kmer"].to_list())
+
+        print(f"Pair kmers: {len(pair_kmers)}")
+        # create pairs without regard for file sizes
+        if args.pair_mode == "sxs":
+            singleton_path, _ = create_pairs_with_singletons(singleton_kmers, pair_kmers,
+                                                            output_dir=args.output_dir, basename=basename,
+                                                            self_singletons=True,
+                                                            max_singletons = 100000)
+        if args.pair_mode == "sxp":
+            singleton_path, _ = create_pairs_with_singletons(singleton_kmers, pair_kmers,
+                                                            output_dir=args.output_dir, basename=basename,
+                                                            self_singletons=False,
+                                                            max_singletons = 100000)
+        # Cleaning files
+        pair_parts = sorted(glob.glob(pair_glob))
+        filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.pairs.parquet")
+        if pair_parts:
+            (pl.scan_parquet(pair_parts)          # pass the expanded list, not the glob string
+            .sink_parquet(filtered_path, compression="zstd"))
+        else:
+            #write an empty file so downstream readers still find it
+            pl.DataFrame(schema={"kmerA": pl.Utf8,"kmerB": pl.Utf8,"count": pl.Int64}).write_parquet(filtered_path, compression="zstd")
+        
+        # only delete the parts once the selected file exists and is non-empty
+        if os.path.exists(filtered_path) and os.path.getsize(filtered_path) > 0:
+            parts = glob.glob(pair_glob)
+            for p in parts:
+                os.remove(p)
+            print(f"Wrote {filtered_path} and removed {len(parts)} part files", flush=True)
+        else:
+            print("WARNING: final parquet missing or empty — keeping part files", flush=True)
+        
+        # map and export
+        all_kmers = singleton_kmers | pair_kmers
+        if args.genome:
+            records = load_genome(args.genome)
+            df_locations ,_ = build_mapped_kmers_ahocorasick(records, all_kmers, terminal_dist = args.terminal_dist)
+            df_locations['origin'] = df_locations['#kmer'].apply(lambda x: 'singleton' if x in singleton_kmers else 'pair')
+            df_locations.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'), sep='\t', index=False, compression='gzip')
+        else:
+            pd.DataFrame(sorted(all_kmers), columns=['#kmer']).to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'), sep='\t', index=False, compression='gzip')
+    # Standard pair generation 
     else:
         
         strain = strain_name_from_path(args.genome)

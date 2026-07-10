@@ -127,10 +127,33 @@ def main():
     
     #merge in total reads
     df_cov_inform['total_kmers_evaluated'] = df_cov_inform['sample'].map(dict_total_reads)
-
-    print(df_cov_inform)
+    #renames:
+    drop_cols = ['pairs_strain', 'pairs_total_unique_kmers',
+                  'pairs_observed_unique_kmers',	'pairs_unique_kmer_coverage','pairs_unique_kmer_count_mean',
+                  'pairs_unique_kmer_count_std', 'singletons_strain','singletons_total_unique_kmers',
+                  'singletons_observed_unique_kmers',	'singletons_unique_kmer_coverage',	'singletons_unique_kmer_count_mean'	,
+                  'singletons_unique_kmer_count_std',
+                  'combined_unique_kmer_count_std']
     
-    df_cov_inform.sort_values(['combined_pairs_coverage'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
+    df_cov_inform = df_cov_inform.rename(columns = {'combined_strain': 'strain',
+                                                    'combined_total_unique_kmers': 'total_unique_kmers',
+                                                    'combined_observed_unique_kmers': 'observed_unique_kmers',
+                                                    'combined_unique_kmer_coverage': 'unique_kmer_coverage',
+                                                    'combined_unique_kmer_count_mean':'unique_kmer_count_mean'})
+    print(df_cov_inform)
+    df_cov_inform.drop(columns = drop_cols, inplace = True)
+    print(df_cov_inform.columns)
+
+       
+    sort_cols = ['strain', 'sample', 'total_kmers_evaluated','total_unique_kmers','observed_unique_kmers',
+                 'unique_kmer_count_mean','unique_kmer_coverage', 'combined_pairs_coverage', 'singletons_pairs_coverage', 'pairs_pairs_coverage',
+                  'combined_pairs_total', 'singletons_pairs_total','pairs_pairs_total',
+                 'combined_pairs_observed', 'singletons_pairs_observed', 'pairs_pairs_observed',
+                 'combined_pairs_count_mean-min', 'combined_pairs_count_mean-mean', 'combined_pairs_count_mean-max',
+                 'singletons_pairs_count_mean-min', 'singletons_pairs_count_mean-mean', 'singletons_pairs_count_mean-max', 
+                 'pairs_pairs_count_mean-min', 'pairs_pairs_count_mean-mean','pairs_pairs_count_mean-max'
+                 ]
+    df_cov_inform[sort_cols].sort_values(['combined_pairs_coverage'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
 
 
 

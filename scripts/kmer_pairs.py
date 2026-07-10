@@ -250,7 +250,7 @@ def kmer_pairs_from_presence(
     presence_tsv, summary_tsv, output_dir, basename, df_keep,
     presence_t=50, similarity_t=None,
     n_workers=None, write_non_inform=False,
-    testmode = None
+    testmode = None, max_for_pairs = 20000
 ):
     # exclusion list from summary
     if testmode:
@@ -289,9 +289,11 @@ def kmer_pairs_from_presence(
         df_presence = df_presence.join(df_keep, on='#kmer', how='semi')
         print(df_presence)
         print(f"After kmer subset filter: {df_presence.shape[0]:,}", flush=True)
-    
+        # if this is lenght = 0 need to stop here and return
+        if len(df_presence) == 0:
+            print('HELP')
     # random subsample when df_presence is too big
-    max_for_pairs = 20000
+    max_for_pairs = max_for_pairs
     if len(df_presence) > max_for_pairs:
         print(f'too many potential pairs: >{max_for_pairs}')
         print('random subselection')
@@ -402,10 +404,7 @@ def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer",
     dict_std  = {s: global_stats[f"std__{s}"]  for s in sample_cols}
     dict_sum = {s: global_stats[f"sum__{s}"]  for s in sample_cols}
     total_unique_kmers = len(df_samples)
-    print('mean sample dict')
-    print(dict_mean)
-    print('deviaton sample dict')
-    print(dict_std)
+
 
 
     observed = {s: 0 for s in sample_cols}
