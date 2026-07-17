@@ -1,6 +1,6 @@
-CFLAGS = -O2 -Wall -Wextra -Wshadow -Wcast-qual -g
-
+CFLAGS = -std=gnu17 -O2 -Wall -Wextra -Wshadow -Wcast-qual -g
 LDFLAGS = -lz -lzstd -lm -lpthread
+CC = gcc
 
 src = $(wildcard *.c)
 obj = $(src:.c=.o)
