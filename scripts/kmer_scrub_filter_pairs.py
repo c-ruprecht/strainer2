@@ -826,6 +826,109 @@ def main():
             df_locations.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'), sep='\t', index=False, compression='gzip')
         else:
             pd.DataFrame(sorted(all_kmers), columns=['#kmer']).to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'), sep='\t', index=False, compression='gzip')
+    
+    if args.pair_mode == 'all_pairs':
+        if args.genome:
+            strain = strain_name_from_path(args.genome)
+        basename = args.basename if args.basename else strain
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        # switch to scan csv for memory efficiency
+        df_global_counts = pl.read_csv(args.counts_global, 
+                                       separator= '\t', 
+                                       schema_overrides={'reference_count': pl.UInt32,
+                                                        'pangenome_count': pl.UInt32,
+                                                        'metagenome_count': pl.UInt32,
+                                                        'drug_count': pl.UInt32,}
+                                        )
+        print(df_global_counts)
+        # Create waterfall plot scrub
+        df_gl = (df_global_counts.to_pandas().drop(columns=['reference_count']).set_index('#kmer'))
+        row_sums = df_gl.sum(axis=1)
+        count_hist = (row_sums.value_counts()
+              .sort_index()
+              .rename_axis('total_count')
+              .reset_index(name='n_kmers'))
+        
+        print(count_hist)
+        fig = px.scatter(count_hist,
+                     y = 'n_kmers',
+                     x = 'total_count',
+                     log_y = True,
+                     template = 'simple_white',
+                     range_x  = [-0.1, 5000],
+                     title = f'{basename}')
+        fig.add_hline(y = count_hist.loc[count_hist['total_count']==0]['n_kmers'][0],line_width=3, line_dash="dash", line_color="grey")
+        fig.write_image(os.path.join(args.output_dir, f'{basename}.scrub_counts.svg'))
+
+        # create histogram plot
+        df_hist = pd.read_csv(args.counts_summary, sep='\t')
+        fig = px.histogram(
+            df_hist,
+            x='coverage_pct',
+            log_y = True,
+            color = 'sample_type',
+            histfunc = 'count',
+            template='simple_white',
+            title=f'{basename} — coverage_pct distribution',
+            range_x = [0,1],
+            )
+        fig.add_vline(x=0.96, line_width=3, line_dash="dash", line_color="grey")
+        fig.update_layout(width=800, height=500)
+        fig.write_image(os.path.join(args.output_dir, f'{basename}.histogram_scrub_db.svg'))
+        
+        ## first get rarest kmers
+        total_kmers = len(df_global_counts)
+
+        print(f'Total kmers: {total_kmers}')
+        print('Remove kmers with count >1 from ref genome:')
+        df_global_counts = df_global_counts.filter(pl.col("reference_count") == 1)
+        print(f'Remaining kmers: {len(df_global_counts)}')
+        
+        if "drug_count" in df_global_counts.columns:
+            print('Removing all kmers present in drug scrub:')
+            df_no_drugs = df_global_counts.filter(pl.col("drug_count") == 0)
+        else:
+            print("No drug scrub performed")
+            df_no_drugs = df_global_counts
+        print(f'Remaining kmers: {len(df_no_drugs)}')
+
+        ## get position on genome
+        print(f'Loading genome: {args.genome}')
+        records = load_genome(args.genome)
+        
+
+        #df_rare = df_no_drugs.filter((pl.col('metagenome_count') == 0 ) & (pl.col('pangenome_count') == 0))        
+        percentile = args.percentile_union
+        lowest = df_no_drugs.filter(((pl.col('pangenome_count')  <= pl.col('pangenome_count').quantile(percentile, interpolation="higher"))  &
+                                     (pl.col('metagenome_count') <= pl.col('metagenome_count').quantile(percentile, interpolation="higher"))
+                            ))
+        print(lowest)
+
+        ## select kmers based on overlap
+        all_kmers = set(lowest["#kmer"].to_list())
+        df_locations ,_ = build_mapped_kmers_ahocorasick(records, all_kmers, terminal_dist=args.terminal_dist)
+        print('dropping terminal kmers')
+        df_locations = df_locations.loc[df_locations['terminal_kmer'] == False] 
+
+        print('finding overlapping kmers for kmer selection')
+        dict_overlap = find_overlap_kmer_fast(df_locations, max = 0.6)
+        
+        print('selecting kmers')
+        selected = max_independent_kmers_greedy_heap(dict_overlap=dict_overlap)
+        print(f"Selected pair kmers: {len(selected):,}")
+
+        ## create pairs of all kmers
+        create_all_pairs(selected, 
+                        args.output_dir , 
+                        basename = basename,
+                        #n_workers=args.threads,
+                        max_kmers = 50000)
+
+        # export
+        print(f"Total kmers for strain_detect: {len(selected):,}")
+        df_locations.loc[df_locations['#kmer'].isin(selected)].to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
+                                         sep='\t', index=False)
     # Standard pair generation 
     else:
         
@@ -843,7 +946,24 @@ def main():
                                                         'drug_count': pl.UInt32,}
                                         )
         print(df_global_counts)
-        total_kmers = len(df_global_counts)
+        # Create waterfall plot scrub
+        df_gl = (df_global_counts.to_pandas().drop(columns=['reference_count']).set_index('#kmer'))
+        row_sums = df_gl.sum(axis=1)
+        count_hist = (row_sums.value_counts()
+              .sort_index()
+              .rename_axis('total_count')
+              .reset_index(name='n_kmers'))
+        
+        print(count_hist)
+        fig = px.scatter(count_hist,
+                     y = 'n_kmers',
+                     x = 'total_count',
+                     log_y = True,
+                     template = 'simple_white',
+                     range_x  = [-0.1, 5000],
+                     title = f'{basename}')
+        fig.add_hline(y = count_hist.loc[count_hist['total_count']==0]['n_kmers'][0],line_width=3, line_dash="dash", line_color="grey")
+        fig.write_image(os.path.join(args.output_dir, f'{basename}.scrub_counts.svg'))
 
         # create histogram plot
         df_hist = pd.read_csv(args.counts_summary, sep='\t')
@@ -901,7 +1021,8 @@ def main():
                                  df_keep=df_non_inform_singletons,
                                  presence_t = args.presence_t, 
                                  similarity_t=None, 
-                                 n_workers=args.threads)
+                                 n_workers=args.threads,
+                                 max_for_pairs = 100000)
         
        
 
@@ -932,7 +1053,7 @@ def main():
         df_locations = df_locations.loc[df_locations['terminal_kmer'] == False] 
 
         print('finding overlapping kmers for kmer selection')
-        dict_overlap = find_overlap_kmer_fast(df_locations, max = 0.8)
+        dict_overlap = find_overlap_kmer_fast(df_locations, max = 0.6)
         
         print('selecting kmers')
         selected = max_independent_kmers_greedy_heap(dict_overlap=dict_overlap)
@@ -944,7 +1065,7 @@ def main():
         print(f"Selected singletons: {len(selected_singletons):,}")
 
         # downselect to random subset if too many rare singletons found
-        max_singletons = 50000
+        max_singletons = 100000
         if len(selected_singletons) > max_singletons:
             selected_singletons = set(random.Random(42).sample(sorted(selected_singletons), max_singletons)) 
             # ensure selection is correct for export
@@ -975,18 +1096,19 @@ def main():
             print("WARNING: final parquet missing or empty — keeping part files", flush=True)
 
         # Create pairs with singletons
-        if args.pair_mode == "sxp":
-            singleton_path, _ = create_pairs_with_singletons(
-                selected_singletons, selected_pair_kmers,
-                output_dir=args.output_dir, basename=basename,
-                self_singletons=True,
-                max_singletons = 20000,
-            )
         if args.pair_mode == "sxs":
             singleton_path, _ = create_pairs_with_singletons(
                 selected_singletons, selected_pair_kmers,
                 output_dir=args.output_dir, basename=basename,
+                self_singletons=True,
+                max_singletons = 100000,
+            )
+        if args.pair_mode == "sxp":
+            singleton_path, _ = create_pairs_with_singletons(
+                selected_singletons, selected_pair_kmers,
+                output_dir=args.output_dir, basename=basename,
                 self_singletons=False,
+                max_singletons = 100000,
             )
 
 if __name__ == '__main__':

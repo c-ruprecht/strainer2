@@ -248,7 +248,7 @@ def create_disjoint_kmer_pairs_parallel(
 
 def kmer_pairs_from_presence(
     presence_tsv, summary_tsv, output_dir, basename, df_keep,
-    presence_t=50, similarity_t=None,
+    presence_t=10, similarity_t=None,
     n_workers=None, write_non_inform=False,
     testmode = None, max_for_pairs = 20000
 ):
@@ -293,11 +293,17 @@ def kmer_pairs_from_presence(
         if len(df_presence) == 0:
             print('HELP')
     # random subsample when df_presence is too big
-    max_for_pairs = max_for_pairs
+
     if len(df_presence) > max_for_pairs:
         print(f'too many potential pairs: >{max_for_pairs}')
-        print('random subselection')
-        df_presence = df_presence.sample(n=max_for_pairs,  seed=42, shuffle=True)
+        print('rarest subselection')
+        df_presence = (
+            df_presence
+            .sort(pl.col('list_scrub_id').list.len())
+            .head(max_for_pairs)
+        )
+        print(df_presence)
+        #df_presence = df_presence.sample(n=max_for_pairs,  seed=42, shuffle=True)
         # maybe this should be sorted by presence list length
 
 
@@ -307,6 +313,56 @@ def kmer_pairs_from_presence(
         n_workers=n_workers,
         write_non_inform=write_non_inform,
     )
+def create_all_pairs(
+    kmer_set,
+    output_dir, basename,
+    batch_size=1_000_000,
+    max_kmers=20000,
+):
+    """Stream all unique pairs from a single kmer set to parquet
+    (matches _PAIR_SCHEMA / count=0).
+
+    Every combination i<j among the (optionally subsampled) kmers.
+    Returns (path, n_pairs).
+    """
+    kmers = sorted(kmer_set)
+
+    # subsample if over cap (pair count grows ~n^2/2)
+    if len(kmers) > max_kmers:
+        kmers = sorted(random.sample(kmers, max_kmers))
+
+    n = len(kmers)
+    print(f"Combining {n} kmers among themselves "
+          f"({n * (n - 1) // 2:,} pairs)", flush=True)
+
+    path = os.path.join(output_dir, f"{basename}.inform_kmer_pairs.all.parquet")
+    writer = pq.ParquetWriter(path, _PAIR_SCHEMA, compression="zstd")
+
+    a_col, b_col, c_col = [], [], []
+    n_pairs = 0
+
+    def flush():
+        if a_col:
+            writer.write_table(
+                pa.table({"kmerA": a_col, "kmerB": b_col, "count": c_col},
+                         schema=_PAIR_SCHEMA)
+            )
+            a_col.clear(); b_col.clear(); c_col.clear()
+
+    for i in range(n):
+        kA = kmers[i]
+        for j in range(i + 1, n):
+            kB = kmers[j]
+            a_, b_ = (kA, kB) if kA < kB else (kB, kA)
+            a_col.append(a_); b_col.append(b_); c_col.append(0)
+            n_pairs += 1
+            if len(a_col) >= batch_size:
+                flush()
+
+    flush()
+    writer.close()
+    print(f"Wrote {n_pairs:,} pairs -> {path}", flush=True)
+    return path, n_pairs
 
 def create_pairs_with_singletons(
     singleton_kmer_set, pair_kmer_set,
@@ -559,7 +615,7 @@ def main():
         # downselect to random subset 
         max_singletons = 50000
         if singleton_kmers > max_singletons:
-            singleton_kmers = set(df_inform_singletons.sample(n=max_for_singlletons,  seed=42, shuffle=True)["#kmer"].to_list())
+            singleton_kmers = set(df_inform_singletons.sample(n=max_for_singletons,  seed=42, shuffle=True)["#kmer"].to_list())
 
         singleton_path, _ = create_pairs_with_singletons(
             singleton_kmers, pair_kmers,
