@@ -82,6 +82,13 @@ def main():
     # Get informative kmer coverage
     df_samples = pl.read_csv(args.hits, separator="\t")
     
+    map_glob = os.path.join(args.inform_kmers, "*.rare_kmers_mapped.*")
+    matches = glob.glob(map_glob)
+    if matches:
+        df_mapped = pd.read_csv(matches[0], sep='\t')
+        origin_counts = df_mapped['origin'].value_counts().to_dict()
+        print(origin_counts)
+    
     #get toal evaulated kmers
     row = df_samples.filter(pl.col("#kmer") == "total_evaluated").drop("#kmer")
     dict_total_reads = row.row(0, named=True)
@@ -144,8 +151,13 @@ def main():
     df_cov_inform.drop(columns = drop_cols, inplace = True)
     print(df_cov_inform.columns)
 
+    df_cov_inform['singeltons_individual_kmers_total'] = origin_counts['singleton']
+    df_cov_inform['pairs_individual_kmers_total'] = origin_counts['pair']
+
        
-    sort_cols = ['strain', 'sample', 'total_kmers_evaluated','total_unique_kmers','observed_unique_kmers',
+    sort_cols = ['strain', 'sample', 'total_kmers_evaluated',
+                 'total_unique_kmers','singeltons_individual_kmers_total', 'pairs_individual_kmers_total',
+                 'observed_unique_kmers',
                  'unique_kmer_count_mean','unique_kmer_coverage', 'combined_pairs_coverage', 'singletons_pairs_coverage', 'pairs_pairs_coverage',
                   'combined_pairs_total', 'singletons_pairs_total','pairs_pairs_total',
                  'combined_pairs_observed', 'singletons_pairs_observed', 'pairs_pairs_observed',
