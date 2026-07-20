@@ -151,12 +151,12 @@ def main():
     df_cov_inform.drop(columns = drop_cols, inplace = True)
     print(df_cov_inform.columns)
 
-    df_cov_inform['singeltons_individual_kmers_total'] = origin_counts['singleton']
+    df_cov_inform['singletons_individual_kmers_total'] = origin_counts['singleton']
     df_cov_inform['pairs_individual_kmers_total'] = origin_counts['pair']
 
        
     sort_cols = ['strain', 'sample', 'total_kmers_evaluated',
-                 'total_unique_kmers','singeltons_individual_kmers_total', 'pairs_individual_kmers_total',
+                 'total_unique_kmers','singletons_individual_kmers_total', 'pairs_individual_kmers_total',
                  'observed_unique_kmers',
                  'unique_kmer_count_mean','unique_kmer_coverage', 'combined_pairs_coverage', 'singletons_pairs_coverage', 'pairs_pairs_coverage',
                   'combined_pairs_total', 'singletons_pairs_total','pairs_pairs_total',
