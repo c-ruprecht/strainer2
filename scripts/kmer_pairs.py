@@ -278,7 +278,6 @@ def kmer_pairs_from_presence(
                     .list.set_difference(li_t)
             )
             .filter(pl.col('list_scrub_id').list.len() > 0)
-            #.filter(pl.col('#kmer').is_in(li_kmers))
             .collect(engine='streaming')
         )
         print(df_presence)
@@ -292,7 +291,6 @@ def kmer_pairs_from_presence(
         # if this is lenght = 0 need to stop here and return
         if len(df_presence) == 0:
             print('HELP')
-    # random subsample when df_presence is too big
 
     if len(df_presence) > max_for_pairs:
         print(f'too many potential pairs: >{max_for_pairs}')
@@ -319,11 +317,9 @@ def create_all_pairs(
     batch_size=1_000_000,
     max_kmers=20000,
 ):
-    """Stream all unique pairs from a single kmer set to parquet
-    (matches _PAIR_SCHEMA / count=0).
-
-    Every combination i<j among the (optionally subsampled) kmers.
-    Returns (path, n_pairs).
+    """
+    Change to create all pairs only for presenece 0 and presence 1
+    These will all be informative pairs and the coverage_pairs = coverage**2 relationship should be true
     """
     kmers = sorted(kmer_set)
 
@@ -526,11 +522,11 @@ def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer",
     rows = [{
         "strain": strain_name,
         "sample": s,
-        "total_unique_kmers": total_unique_kmers,
-        "observed_unique_kmers": dict_sum[s],
-        "unique_kmer_coverage": dict_sum[s]/total_unique_kmers,
-        "unique_kmer_count_mean": dict_mean[s],
-        "unique_kmer_count_std": dict_std[s],
+        "total_individual_kmers": total_unique_kmers,
+        "observed_individual_kmers": dict_sum[s],
+        "individual_kmer_coverage": dict_sum[s]/total_unique_kmers,
+        "individual_kmer_count_mean": dict_mean[s],
+        "individual_kmer_count_std": dict_std[s],
         "pairs_total": n_total,
         "pairs_observed": observed[s],
         "pairs_coverage": observed[s] / n_total if n_total else 0.0,

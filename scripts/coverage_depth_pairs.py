@@ -81,6 +81,7 @@ def main():
 
     # Get informative kmer coverage
     df_samples = pl.read_csv(args.hits, separator="\t")
+    print(df_samples)
     
     map_glob = os.path.join(args.inform_kmers, "*.rare_kmers_mapped.*")
     matches = glob.glob(map_glob)
@@ -100,72 +101,38 @@ def main():
     #pair_cols = ["#kmer"] + [col for col in df_samples.columns if col != "#kmer" and df_samples[col].sum() > 1]
     #df_samples = df_samples.select(pair_cols)
     
+    print('getting singleton pair coverage')
+    # this downselects to only singleton x singleton pairs, potentially usefull for coverage_pairs = coverage**2 call
+    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.singletons.parquet")
+    if glob.glob(pair_glob):
+        li_ss_kmers = df_mapped.loc[df_mapped['origin']=='singleton']['#kmer'].to_list()
+        df_ss = df_samples.filter(pl.col('#kmer').is_in(li_ss_kmers))
+        df_cov_sp = get_pair_hits_streaming(df_ss, pair_glob)
 
     ### Pairs
-    print('getting pair coverage')
-    #df_kmer_pairs = pl.read_parquet(os.path.join(args.inform_kmers, f"*.inform_kmer_pairs.parquet"))
-    #df_cov_p = get_pair_hits(df_samples, df_kmer_pairs)
+    print('getting combined pair coverage')
     pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.*.parquet")
     if glob.glob(pair_glob):
         df_cov_p = get_pair_hits_streaming(df_samples, pair_glob)
     
-    print('getting only pair coverage')
-    
-    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.pairs.parquet")
-    if glob.glob(pair_glob):
-        df_cov_pp = get_pair_hits_streaming(df_samples, pair_glob)
-        # add pair_ prefix to all columns but sample
-    print('getting only singleton coverage')
-    
-    pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.singletons.parquet")
-    if glob.glob(pair_glob):
-        df_cov_sp = get_pair_hits_streaming(df_samples, pair_glob)
-        # add singleton_ prefix to all columns but sample
 
     # add prefix to non sample columns
     def add_prefix(df, prefix):
         return df.rename({c: f"{prefix}{c}" for c in df.columns if c != "sample"})
     
     df_cov_inform = (add_prefix(df_cov_p,  "combined_")
-                    .join(add_prefix(df_cov_pp, "pairs_"),      on="sample", how="left")
+                    #.join(add_prefix(df_cov_pp, "pairs_"),      on="sample", how="left")
                     .join(add_prefix(df_cov_sp, "singletons_"), on="sample", how="left")
                     .to_pandas()
-            )
+                    )
     
     #merge in total reads
     df_cov_inform['total_kmers_evaluated'] = df_cov_inform['sample'].map(dict_total_reads)
-    #renames:
-    drop_cols = ['pairs_strain', 'pairs_total_unique_kmers',
-                  'pairs_observed_unique_kmers',	'pairs_unique_kmer_coverage','pairs_unique_kmer_count_mean',
-                  'pairs_unique_kmer_count_std', 'singletons_strain','singletons_total_unique_kmers',
-                  'singletons_observed_unique_kmers',	'singletons_unique_kmer_coverage',	'singletons_unique_kmer_count_mean'	,
-                  'singletons_unique_kmer_count_std',
-                  'combined_unique_kmer_count_std']
-    
-    df_cov_inform = df_cov_inform.rename(columns = {'combined_strain': 'strain',
-                                                    'combined_total_unique_kmers': 'total_unique_kmers',
-                                                    'combined_observed_unique_kmers': 'observed_unique_kmers',
-                                                    'combined_unique_kmer_coverage': 'unique_kmer_coverage',
-                                                    'combined_unique_kmer_count_mean':'unique_kmer_count_mean'})
-    print(df_cov_inform)
-    df_cov_inform.drop(columns = drop_cols, inplace = True)
-    print(df_cov_inform.columns)
-
     df_cov_inform['singletons_individual_kmers_total'] = origin_counts['singleton']
     df_cov_inform['pairs_individual_kmers_total'] = origin_counts['pair']
+    df_cov_inform.sort_values(['combined_pairs_coverage'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
 
-       
-    sort_cols = ['strain', 'sample', 'total_kmers_evaluated',
-                 'total_unique_kmers','singletons_individual_kmers_total', 'pairs_individual_kmers_total',
-                 'observed_unique_kmers',
-                 'unique_kmer_count_mean','unique_kmer_coverage', 'combined_pairs_coverage', 'singletons_pairs_coverage', 'pairs_pairs_coverage',
-                  'combined_pairs_total', 'singletons_pairs_total','pairs_pairs_total',
-                 'combined_pairs_observed', 'singletons_pairs_observed', 'pairs_pairs_observed',
-                 'combined_pairs_count_mean-min', 'combined_pairs_count_mean-mean', 'combined_pairs_count_mean-max',
-                 'singletons_pairs_count_mean-min', 'singletons_pairs_count_mean-mean', 'singletons_pairs_count_mean-max', 
-                 'pairs_pairs_count_mean-min', 'pairs_pairs_count_mean-mean','pairs_pairs_count_mean-max'
-                 ]
-    df_cov_inform[sort_cols].sort_values(['combined_pairs_coverage'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
+
 
 
 
