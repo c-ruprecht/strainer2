@@ -429,6 +429,106 @@ def create_pairs_with_singletons(
     print(f"Wrote {n_pairs:,} singleton pairs -> {path}", flush=True)
     return path, n_pairs
 
+def get_singletons_hits_streaming(df_samples, pairs_glob, kmer_column = "#kmer", batch_size = 250_000):
+    part_files = sorted(glob.glob(pairs_glob))
+    if not part_files:
+        raise FileNotFoundError(f"No pair part files matched {pairs_glob}")
+
+    strain_name = re.match(r"(.+)\.inform_kmer_pairs\..+\.parquet", os.path.basename(part_files[0])).group(1)
+    sample_cols = [c for c in df_samples.columns if c != kmer_column]
+    # get mean and standard deviation of counts per sample from hits
+    global_stats = df_samples.select([expr
+                                    for s in sample_cols
+                                    for expr in [
+                                        pl.col(s).mean().alias(f"mean__{s}"),
+                                        pl.col(s).std().alias(f"std__{s}"),
+                                        (pl.col(s)>0).sum().alias(f"sum__{s}"),
+                                    ]
+                                ]).row(0, named=True)
+
+    dict_mean = {s: global_stats[f"mean__{s}"] for s in sample_cols}
+    dict_std  = {s: global_stats[f"std__{s}"]  for s in sample_cols}
+    dict_sum = {s: global_stats[f"sum__{s}"]  for s in sample_cols}
+    total_unique_kmers = len(df_samples)
+
+
+
+    observed = {s: 0 for s in sample_cols}
+    sum_count_min = {s: 0 for s in sample_cols}
+    sum_count_mean = {s: 0 for s in sample_cols}
+    sum_count_max = {s: 0 for s in sample_cols}
+
+    n_total = 0        # valid pairs: BOTH k-mers present in df_samples
+    n_raw   = 0        # raw pairs in the parquet (kept for sanity-checking)
+    for path in part_files:
+        pf = pq.ParquetFile(path)
+        for batch in pf.iter_batches(batch_size=batch_size, columns=["kmerA", "kmerB"]):
+            df_part = pl.from_arrow(batch)
+
+            n_raw += len(df_part)
+            if len(df_part) == 0:
+                continue
+
+            part_kmers = pl.concat([df_part["kmerA"], df_part["kmerB"]]).unique()
+            df_hits = df_samples.filter(pl.col(kmer_column).is_in(part_kmers.implode()))
+
+            df_A = df_hits.rename({kmer_column: "kmerA", **{s: f"{s}__A" for s in sample_cols}})
+            df_B = df_hits.rename({kmer_column: "kmerB", **{s: f"{s}__B" for s in sample_cols}})
+
+            df_pair = (
+                df_part.select(["kmerA", "kmerB"])
+                .join(df_A, on="kmerA", how="inner")
+                .join(df_B, on="kmerB", how="inner")
+            )
+
+            # only pairs where both k-mers are in the (reduced) reference count as "total"
+            n_total += len(df_pair)
+
+            # single pass: all samples at once instead of n_samples selects
+            exprs = []
+            for s in sample_cols:
+                a = pl.col(f"{s}__A")
+                b = pl.col(f"{s}__B")
+                both_nonzero = (a > 0) & (b > 0)
+
+                pc_min  = pl.when(both_nonzero).then(pl.min_horizontal(a, b)).otherwise(0)
+                pc_mean = pl.when(both_nonzero).then(pl.mean_horizontal(a, b)).otherwise(0)
+                pc_max  = pl.when(both_nonzero).then(pl.max_horizontal(a, b)).otherwise(0)
+
+                exprs.append((both_nonzero).sum().alias(f"o__{s}"))
+                exprs.append(pc_min.sum().alias(f"cmin__{s}"))
+                exprs.append(pc_mean.sum().alias(f"cmean__{s}"))
+                exprs.append(pc_max.sum().alias(f"cmax__{s}"))
+
+
+            stats = df_pair.select(exprs).row(0, named=True)
+            
+            for s in sample_cols:
+                observed[s] += stats[f"o__{s}"] or 0
+                sum_count_min[s] += stats[f"cmin__{s}"] or 0
+                sum_count_mean[s] += stats[f"cmean__{s}"] or 0
+                sum_count_max[s] += stats[f"cmax__{s}"] or 0
+
+            del df_part, df_hits, df_A, df_B, df_pair
+
+
+    # return dataframe
+    rows = [{
+        "strain": strain_name,
+        "sample": s,
+        "total_singleton_kmers": total_unique_kmers,
+        "observed_singleton_kmers": dict_sum[s],
+        "singleton_kmer_coverage": dict_sum[s]/total_unique_kmers,
+        "singleton_kmer_count_mean": dict_mean[s],
+        "singleton_kmer_count_std": dict_std[s],
+        "singelton_pairs_total": n_total,
+        "singelton_pairs_observed": observed[s],
+        "singelton_pairs_coverage": observed[s] / n_total if n_total else 0.0,
+        "singelton_pairs_count_mean-min": sum_count_min[s] / n_total if n_total else 0.0,
+        "singelton_pairs_count_mean-mean": sum_count_mean[s] / n_total if n_total else 0.0,
+        "singelton_pairs_count_mean-max": sum_count_max[s] / n_total if n_total else 0.0,
+    } for s in sample_cols]
+    return pl.DataFrame(rows)
 
 def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer",
                             batch_size=250_000):
@@ -464,22 +564,20 @@ def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer",
     sum_count_mean = {s: 0 for s in sample_cols}
     sum_count_max = {s: 0 for s in sample_cols}
 
-    n_total = 0
-
+    n_total = 0        # valid pairs: both k-mers tracked in df_samples
+    n_raw   = 0        # raw parquet pairs (sanity check)
 
     for path in part_files:
         pf = pq.ParquetFile(path)
         for batch in pf.iter_batches(batch_size=batch_size,
                                      columns=["kmerA", "kmerB"]):
             df_part = pl.from_arrow(batch)
-            n_total += len(df_part)
+            n_raw += len(df_part)
             if len(df_part) == 0:
                 continue
-            
-            # get all kmers that are in pairs 
+
             part_kmers = pl.concat([df_part["kmerA"], df_part["kmerB"]]).unique()
             df_hits = df_samples.filter(pl.col(kmer_column).is_in(part_kmers.implode()))
-
 
             df_A = df_hits.rename({kmer_column: "kmerA", **{s: f"{s}__A" for s in sample_cols}})
             df_B = df_hits.rename({kmer_column: "kmerB", **{s: f"{s}__B" for s in sample_cols}})
@@ -489,6 +587,9 @@ def get_pair_hits_streaming(df_samples, pairs_glob, kmer_column="#kmer",
                 .join(df_A, on="kmerA", how="inner")
                 .join(df_B, on="kmerB", how="inner")
             )
+
+            # only pairs where BOTH k-mers are tracked count toward the denominator
+            n_total += len(df_pair)
 
             # single pass: all samples at once instead of n_samples selects
             exprs = []
@@ -608,16 +709,12 @@ def main():
         else:
             print("WARNING: final parquet missing or empty — keeping part files", flush=True)
 
-        # downselect to random subset 
-        max_singletons = 50000
-        if singleton_kmers > max_singletons:
-            singleton_kmers = set(df_inform_singletons.sample(n=max_for_singletons,  seed=42, shuffle=True)["#kmer"].to_list())
 
         singleton_path, _ = create_pairs_with_singletons(
             singleton_kmers, pair_kmers,
             output_dir=args.output_dir, basename=basename,
             self_singletons=True,
-            max_singletons=5
+            max_singletons=100
         )
     
     
@@ -630,9 +727,20 @@ def main():
 
         print('Creating coverage outputs')
         df_cov_p = get_pair_hits_streaming(df_samples,os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.*.parquet"))
-        
-        df_cov_p.write_csv(os.path.join(args.output_dir, f'{basename}.coverage.csv'))
-        print(df_cov_p)
+
+        # get pure singleton pairs sxs 
+        print(df_inform_singletons)
+        inform_parts = sorted(glob.glob(os.path.join(args.output_dir, f"{basename}.singletons.parquet")))
+        if inform_parts:
+            print('All kmer pairs created')
+            print(pl.read_parquet(inform_parts))
+        singleton_kmers = df_inform_singletons["#kmer"].to_list()
+        df_singles = df_samples.filter(pl.col('#kmer').is_in(singleton_kmers))
+        df_cov_s = get_singletons_hits_streaming(df_singles,os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.singletons.parquet"))
+        #merge
+        df_cov_sp = df_cov_p.join(df_cov_s, on=["strain", "sample"], how="inner")
+        df_cov_sp.write_csv(os.path.join(args.output_dir, f'{basename}.coverage.csv'))
+        print(df_cov_sp)
 
 
 if __name__ == '__main__':

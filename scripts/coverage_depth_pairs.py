@@ -6,7 +6,7 @@ import polars as pl
 import glob
 import gc
 import argparse
-from kmer_pairs import get_pair_hits_streaming
+from kmer_pairs import get_pair_hits_streaming, get_singletons_hits_streaming
 import warnings
 warnings.filterwarnings("ignore", module="kaleido")
 
@@ -90,16 +90,12 @@ def main():
         origin_counts = df_mapped['origin'].value_counts().to_dict()
         print(origin_counts)
     
-    #get toal evaulated kmers
+    #get total evaulated kmers
     row = df_samples.filter(pl.col("#kmer") == "total_evaluated").drop("#kmer")
     dict_total_reads = row.row(0, named=True)
-
-
     df_samples = df_samples.filter(pl.col("#kmer") != "total_evaluated")
 
-    # drop this to check if missing samples reappear
-    #pair_cols = ["#kmer"] + [col for col in df_samples.columns if col != "#kmer" and df_samples[col].sum() > 1]
-    #df_samples = df_samples.select(pair_cols)
+    
     
     print('getting singleton pair coverage')
     # this downselects to only singleton x singleton pairs, potentially usefull for coverage_pairs = coverage**2 call
@@ -107,30 +103,26 @@ def main():
     if glob.glob(pair_glob):
         li_ss_kmers = df_mapped.loc[df_mapped['origin']=='singleton']['#kmer'].to_list()
         df_ss = df_samples.filter(pl.col('#kmer').is_in(li_ss_kmers))
-        df_cov_sp = get_pair_hits_streaming(df_ss, pair_glob)
+        df_cov_s = get_singletons_hits_streaming(df_ss, pair_glob)
 
     ### Pairs
     print('getting combined pair coverage')
     pair_glob = os.path.join(args.inform_kmers, "*.inform_kmer_pairs.*.parquet")
     if glob.glob(pair_glob):
-        df_cov_p = get_pair_hits_streaming(df_samples, pair_glob)
+        li_all_kmers = df_mapped['#kmer'].to_list()
+        df_cov_p = get_pair_hits_streaming(df_samples.filter(pl.col('#kmer').is_in(li_all_kmers)), pair_glob)
     
 
     # add prefix to non sample columns
     def add_prefix(df, prefix):
         return df.rename({c: f"{prefix}{c}" for c in df.columns if c != "sample"})
     
-    df_cov_inform = (add_prefix(df_cov_p,  "combined_")
-                    #.join(add_prefix(df_cov_pp, "pairs_"),      on="sample", how="left")
-                    .join(add_prefix(df_cov_sp, "singletons_"), on="sample", how="left")
-                    .to_pandas()
-                    )
+    df_cov_inform = df_cov_p.join(df_cov_s, on=["strain","sample"], how="left").to_pandas()
+                    
     
     #merge in total reads
     df_cov_inform['total_kmers_evaluated'] = df_cov_inform['sample'].map(dict_total_reads)
-    df_cov_inform['singletons_individual_kmers_total'] = origin_counts['singleton']
-    df_cov_inform['pairs_individual_kmers_total'] = origin_counts['pair']
-    df_cov_inform.sort_values(['combined_pairs_coverage'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
+    df_cov_inform.sort_values(['pairs_coverage'], ascending= False).to_csv(output_dir+'/coverage_depth.tsv', index = False, sep = '\t')
 
 
 
