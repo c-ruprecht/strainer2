@@ -107,6 +107,15 @@ _PAIR_SCHEMA = pa.schema([
     ("count", pa.int64()),
 ])
 
+_PAIR_SCHEMA_PL = {"kmerA": pl.Utf8, "kmerB": pl.Utf8, "count": pl.Int64}
+
+# fixes 0 pairs issue
+def write_empty_pairs(path):
+    """Valid zero-row parquet so downstream scans/globs still resolve."""
+    pl.DataFrame(schema=_PAIR_SCHEMA_PL).write_parquet(path, compression="zstd")
+    print(f"Wrote empty pairs parquet -> {path}", flush=True)
+    return path
+
 
 # ---------- worker globals (presence -> scrub_id sets) ----------
 
@@ -311,6 +320,7 @@ def kmer_pairs_from_presence(
         n_workers=n_workers,
         write_non_inform=write_non_inform,
     )
+
 def create_all_pairs(
     kmer_set,
     output_dir, basename,

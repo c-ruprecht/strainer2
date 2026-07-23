@@ -1078,14 +1078,30 @@ def main():
                                          sep='\t', index=False)
         
         
-        # write pairs file
+        # write pairs file, create empty file with correct schema if no pairs exist
         filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.pairs.parquet")
-        sel_pl = pl.Series(sorted(selected_pair_kmers))
-        (
-            pl.scan_parquet(pair_glob, low_memory=True)
-            .filter(pl.col("kmerA").is_in(sel_pl) & pl.col("kmerB").is_in(sel_pl))
-            .sink_parquet(filtered_path, compression="zstd")
-        )
+        pair_parts = sorted(glob.glob(pair_glob))
+
+        if pair_parts and selected_pair_kmers:
+            sel_pl = pl.Series(sorted(selected_pair_kmers))
+            (
+                pl.scan_parquet(pair_parts, low_memory=True)   # expanded list, not the glob string
+                .filter(pl.col("kmerA").is_in(sel_pl) & pl.col("kmerB").is_in(sel_pl))
+                .sink_parquet(filtered_path, compression="zstd")
+            )
+        else:
+            print("No informative pairs for this strain — writing empty pairs parquet", flush=True)
+            write_empty_pairs(filtered_path)
+
+        #old
+        #filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.pairs.parquet")
+        #sel_pl = pl.Series(sorted(selected_pair_kmers))
+        #(
+        #    pl.scan_parquet(pair_glob, low_memory=True)
+        #    .filter(pl.col("kmerA").is_in(sel_pl) & pl.col("kmerB").is_in(sel_pl))
+        #    .sink_parquet(filtered_path, compression="zstd")
+        #)
+
         # only delete the parts once the selected file exists and is non-empty
         if os.path.exists(filtered_path) and os.path.getsize(filtered_path) > 0:
             parts = glob.glob(pair_glob)
@@ -1103,6 +1119,7 @@ def main():
                 self_singletons=True,
                 max_singletons = 100000,
             )
+            
         if args.pair_mode == "sxp":
             singleton_path, _ = create_pairs_with_singletons(
                 selected_singletons, selected_pair_kmers,
