@@ -531,12 +531,12 @@ def get_singletons_hits_streaming(df_samples, pairs_glob, kmer_column = "#kmer",
         "singleton_kmer_coverage": dict_sum[s]/total_unique_kmers,
         "singleton_kmer_count_mean": dict_mean[s],
         "singleton_kmer_count_std": dict_std[s],
-        "singelton_pairs_total": n_total,
-        "singelton_pairs_observed": observed[s],
-        "singelton_pairs_coverage": observed[s] / n_total if n_total else 0.0,
-        "singelton_pairs_count_mean-min": sum_count_min[s] / n_total if n_total else 0.0,
-        "singelton_pairs_count_mean-mean": sum_count_mean[s] / n_total if n_total else 0.0,
-        "singelton_pairs_count_mean-max": sum_count_max[s] / n_total if n_total else 0.0,
+        "singleton_pairs_total": n_total,
+        "singleton_pairs_observed": observed[s],
+        "singleton_pairs_coverage": observed[s] / n_total if n_total else 0.0,
+        "singleton_pairs_count_mean-min": sum_count_min[s] / n_total if n_total else 0.0,
+        "singleton_pairs_count_mean-mean": sum_count_mean[s] / n_total if n_total else 0.0,
+        "singleton_pairs_count_mean-max": sum_count_max[s] / n_total if n_total else 0.0,
     } for s in sample_cols]
     return pl.DataFrame(rows)
 
