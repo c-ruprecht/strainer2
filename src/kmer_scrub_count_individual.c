@@ -34,6 +34,11 @@
 	The sample STILL gets a scrub_id, summary row, and presence appends.
 	Default 1.0 disables the gate.
 
+	Presence cap (-P): k-mers hit by more than -P samples are dropped from
+	the presence file (their id-list is freed and never written or grown).
+	Bounds both output size and peak memory for ubiquitous k-mers. Default
+	10; -P 0 disables the cap.
+
 	Architecture: single-pass per file. Workers do hot loop + scratch
 	sweep in parallel; a single writer thread assigns scrub_ids and
 	appends them to per-bucket id-lists (one queue record per sample).
@@ -47,6 +52,7 @@
 
 #define N_GLOBAL_COLS 4
 #define DEFAULT_COVERAGE_THRESHOLD 1.0
+#define DEFAULT_PRESENCE_MAX 10
 
 static void usage(void);
 static void print_hash_counts(BIO_hash seqHash, const char *C_file);
@@ -67,10 +73,11 @@ int main(int argc, char *argv[])
 	const int default_hash_increment = 1;
 	int num_threads = 4;
 	double cov_threshold = DEFAULT_COVERAGE_THRESHOLD;
+	long presence_max = DEFAULT_PRESENCE_MAX;
 	int c;
 	FILE *progress = NULL;
 
-	while ((c = getopt(argc, argv, "A:B:C:r:p:o:S:t:T:Hhud")) != EOF)
+	while ((c = getopt(argc, argv, "A:B:C:r:p:o:S:t:T:P:Hhud")) != EOF)
 		switch (c) {
 			case 'A': A_file = strdup(optarg); break;
 			case 'B': B_file = strdup(optarg); break;
@@ -81,6 +88,7 @@ int main(int argc, char *argv[])
 			case 'S': s_file = strdup(optarg); break;
 			case 't': num_threads = atoi(optarg); break;
 			case 'T': cov_threshold = atof(optarg); break;
+			case 'P': presence_max = atol(optarg); break;
 			case 'u':
 			case 'h':
 			default: usage(); break;
@@ -93,6 +101,12 @@ int main(int argc, char *argv[])
 	if (num_threads < 1) num_threads = 1;
 	if (cov_threshold < 0.0) {
 		fprintf(stderr, "error: -T must be >= 0 (got %g)\n", cov_threshold);
+		exit(EXIT_FAILURE);
+	}
+	if (presence_max < 0 || presence_max > (long)UINT32_MAX) {
+		fprintf(stderr,
+		        "error: -P must be between 0 and %u (got %ld)\n",
+		        UINT32_MAX, presence_max);
 		exit(EXIT_FAILURE);
 	}
 
@@ -118,10 +132,16 @@ int main(int argc, char *argv[])
 	fprintf(stderr, "coverage threshold for global accumulation: %g%s\n",
 	        cov_threshold,
 	        cov_threshold >= 1.0 ? " (disabled — all samples included)" : "");
+	fprintf(stderr, "presence cap for inverted index: %ld%s\n",
+	        presence_max,
+	        presence_max == 0
+	            ? " (disabled — all hit k-mers written)"
+	            : " (k-mers seen in more samples are dropped)");
 
 	presence_writer *w = NULL;
 	if (o_file) {
-		w = presence_writer_open(o_file, /*queue_capacity*/ 0);
+		w = presence_writer_open(o_file, /*queue_capacity*/ 0,
+		                         (uint32_t)presence_max);
 		if (!w) {
 			fprintf(stderr, "could not open presence writer %s\n", o_file);
 			exit(EXIT_FAILURE);
@@ -203,6 +223,7 @@ static void usage(void)
 	    "                       [-o <inverted presence file, .tsv.zst>]\n"
 	    "                       [-S <per-sample summary output, .tsv>]\n"
 	    "                       [-T <coverage threshold, default 1.0>]\n"
+	    "                       [-P <presence cap, default 10>]\n"
 	    "                       [-p <progress log file>]\n"
 	    "                       [-t <num threads, default 4>]\n"
 	    "\n"
@@ -222,8 +243,15 @@ static void usage(void)
 	    "          counts are NOT added to the global column (is_in_global\n"
 	    "          becomes False), but scrub_id is still allocated and\n"
 	    "          presence/summary rows still emitted. Default 1.0 disables.\n"
+	    "  -P:     presence cap for the -o inverted index. A k-mer hit by\n"
+	    "          more than P samples is dropped: its id-list is freed and\n"
+	    "          it is never written to -o nor allowed to grow further.\n"
+	    "          Bounds both output size and peak memory for ubiquitous\n"
+	    "          k-mers. Keeps k-mers with presence <= P. Default 10;\n"
+	    "          P=0 disables the cap. Does NOT affect the global stdout\n"
+	    "          counts or the -S summary — only the presence file.\n"
 	    "  Each input file is read exactly once. Memory bounded by\n"
-	    "  O(n_kmers x (4 + threads)) for the hash + O(total_kmer_appends x 4)\n"
+	    "  O(n_kmers x (4 + threads)) for the hash + O(kept_kmer_appends x 4)\n"
 	    "  for the inverted index. Duplicate (sample_type, sample_id) pairs\n"
 	    "  are skipped with a warning.\n"
 	    "\n"

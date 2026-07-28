@@ -87,6 +87,12 @@ static int zstd_out_close(zstd_out_t *z)
 
 /* ── Per-bucket dynamic id list ──────────────────────────────────────── */
 
+/* Sentinel stored in id_list_t.cap to mark a bucket as "saturated": its
+   presence exceeded presence_max, so its ids have been freed and it must
+   never be re-grown or written. Chosen to be a value cap can never take
+   legitimately (real caps double from 4 and would need 16 GB to reach). */
+#define ID_LIST_SATURATED 0xFFFFFFFFu
+
 typedef struct {
 	uint32_t *ids;
 	uint32_t  size;
@@ -194,6 +200,9 @@ struct presence_writer_s {
 	id_list_t        *id_lists;
 	unsigned int      n_buckets;
 
+	uint32_t          presence_max;   /* drop k-mers seen in > this many
+	                                     samples; 0 = unlimited */
+
 	/* Diagnostic counters */
 	uint64_t  diag_writer_waits;
 	uint64_t  diag_worker_waits;
@@ -202,6 +211,7 @@ struct presence_writer_s {
 	size_t    diag_max_queue_depth;
 	uint64_t  diag_samples_processed;
 	uint64_t  diag_kmer_appends;
+	uint64_t  diag_kmers_dropped;     /* distinct k-mers cut by presence cap */
 };
 
 static inline uint64_t now_ns(void)
@@ -214,13 +224,15 @@ static inline uint64_t now_ns(void)
 static void *presence_writer_main(void *arg);
 
 presence_writer *presence_writer_open(const char *path,
-                                      size_t queue_capacity)
+                                      size_t queue_capacity,
+                                      uint32_t presence_max)
 {
 	if (queue_capacity == 0) queue_capacity = 256;
 
 	presence_writer *w = calloc(1, sizeof(*w));
 	if (!w) return NULL;
 	w->out_path = path;
+	w->presence_max = presence_max;
 	w->cap = queue_capacity;
 	w->queue = calloc(queue_capacity, sizeof(sample_record_t *));
 	if (!w->queue) { free(w); return NULL; }
@@ -327,10 +339,29 @@ static void *presence_writer_main(void *arg)
 		if (w->id_lists != NULL && rec->bucket_indices != NULL) {
 			for (uint32_t k = 0; k < rec->n_kmers; k++) {
 				uint32_t idx = rec->bucket_indices[k];
-				if (idx < w->n_buckets) {
-					id_list_append(&w->id_lists[idx], scrub_id);
-					w->diag_kmer_appends++;
+				if (idx >= w->n_buckets) continue;
+
+				id_list_t *l = &w->id_lists[idx];
+
+				/* Presence cap. Each sample contributes a given bucket at
+				   most once, so l->size == number of distinct samples seen
+				   so far. Keep k-mers with presence <= presence_max; the
+				   moment a further sample would push presence past the cap,
+				   drop the list entirely: free its ids and mark it
+				   saturated so it is never re-grown or written. */
+				if (l->cap == ID_LIST_SATURATED)
+					continue;                 /* already dropped */
+				if (w->presence_max != 0 && l->size >= w->presence_max) {
+					free(l->ids);
+					l->ids  = NULL;
+					l->size = 0;
+					l->cap  = ID_LIST_SATURATED;
+					w->diag_kmers_dropped++;
+					continue;
 				}
+
+				id_list_append(l, scrub_id);
+				w->diag_kmer_appends++;
 			}
 		}
 
@@ -389,7 +420,7 @@ void presence_writer_flush(presence_writer *w, BIO_hash h)
 	uint64_t emitted = 0;
 	for (unsigned int i = 0; i < w->n_buckets; i++) {
 		id_list_t *l = &w->id_lists[i];
-		if (l->size == 0) continue;
+		if (l->size == 0 || l->cap == ID_LIST_SATURATED) continue;
 		const char *key = h->data[i].key;
 		if (!key) continue;
 
@@ -425,6 +456,7 @@ void presence_writer_print_diagnostics(presence_writer *w)
 	        "─── presence writer diagnostics ─────────────────────────────\n"
 	        "  samples processed:   %" PRIu64 "\n"
 	        "  scrub_id appends:    %" PRIu64 "\n"
+	        "  kmers dropped (cap):  %" PRIu64 " (presence_max = %u%s)\n"
 	        "  worker queue waits:  %" PRIu64
 	        " (total %.3fs blocked on full queue)\n"
 	        "                       ↑ if >>0: WRITER is the bottleneck\n"
@@ -435,6 +467,9 @@ void presence_writer_print_diagnostics(presence_writer *w)
 	        "─────────────────────────────────────────────────────────────\n",
 	        w->diag_samples_processed,
 	        w->diag_kmer_appends,
+	        w->diag_kmers_dropped,
+	        w->presence_max,
+	        w->presence_max == 0 ? ", disabled" : "",
 	        w->diag_worker_waits,
 	        (double)w->diag_worker_wait_ns / 1e9,
 	        w->diag_writer_waits,

@@ -33,13 +33,23 @@
 	Side-array (id_lists) parallel to the hash carries a small dynamic
 	u32 array per bucket, allocated lazily on first scrub_id append.
 
+	Presence cap
+	------------
+	presence_max bounds how many samples a k-mer may be seen in before its
+	id-list is dropped. Once a k-mer is hit by more than presence_max
+	samples, its list is freed and the k-mer is neither written to the
+	presence file nor allowed to grow further — this bounds both output
+	size and peak memory for ubiquitous k-mers. presence_max == 0 disables
+	the cap (unlimited).
+
 	Outputs
 	-------
 	1) stdout — global k-mer counts (driver-printed; this lib is silent
 	   on stdout).
 
 	2) presence file (optional, via presence_writer_open()):
-	   zstd-compressed TSV with one row per k-mer that had any sample hit:
+	   zstd-compressed TSV with one row per k-mer that had any sample hit
+	   (and was not dropped by the presence cap):
 	     #kmer<TAB>list_scrub_id
 	   list_scrub_id is comma-separated u32.
 
@@ -66,8 +76,12 @@ typedef struct seen_registry_s   seen_registry;
    Spawns a single writer thread that consumes per-sample queue records
    from the public entry-point's workers. Handles scrub_id assignment,
    summary writes (if attached), and per-bucket scrub_id appends.
+
+   presence_max: k-mers hit by more than presence_max samples have their
+   id-lists dropped (not written, not grown). 0 disables the cap.
+
    Call sequence:
-     w = presence_writer_open(path, queue_capacity);
+     w = presence_writer_open(path, queue_capacity, presence_max);
      ... GEN_per_sample_kmer_counts_dual(...) one or more times ...
      presence_writer_close(w);            (joins writer thread, drains queue)
      presence_writer_flush(w, h);         (writes the zstd output)
@@ -75,7 +89,8 @@ typedef struct seen_registry_s   seen_registry;
      presence_writer_destroy(w);          (frees memory)
    ──────────────────────────────────────────────────────────────────── */
 presence_writer *presence_writer_open(const char *path,
-                                      size_t queue_capacity);
+                                      size_t queue_capacity,
+                                      uint32_t presence_max);
 void             presence_writer_close(presence_writer *w);
 void             presence_writer_flush(presence_writer *w, BIO_hash h);
 void             presence_writer_print_diagnostics(presence_writer *w);
