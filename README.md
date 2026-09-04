@@ -41,6 +41,9 @@ There are a two python files in the scripts directory that are also needed.
 
 Note that the software examples and applications are currently set up for differentiating human gut strains in the human gut metagenome. The main ideas should apply to other body sites, but the learning of informative kmers would require metagenomes and genomes from the target sites.
 
+## genome compare
+./genome_compare_presence -B /Volumes/metrica/scratch/derep_animalis_kmer_high_qual-comp99-cont05/kmer_primary/cl_Bifidobacterium_animalis__95b681/genomes -k 51 -o /Volumes/metrica/scratch/animalisk51
+
 ## Description of programs and order of execution
 
 ### timing
