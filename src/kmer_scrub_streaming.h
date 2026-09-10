@@ -71,6 +71,23 @@
 typedef struct presence_writer_s presence_writer;
 typedef struct summary_writer_s  summary_writer;
 typedef struct seen_registry_s   seen_registry;
+typedef struct zstd_out_s        zstd_out_t;
+
+/* ── zstd stream writer ───────────────────────────────────────────────
+   Thin streaming wrapper over libzstd, used internally for the presence
+   file and exposed so drivers can write other .zst outputs (e.g. the
+   global counts table) without duplicating the boilerplate.
+
+     z = zstd_out_open(path, level);
+     zstd_out_write(z, buf, len);   ... repeat ...
+     zstd_out_close(z);             (flushes, closes, frees)
+
+   open returns NULL on failure; write/close return 0 on success, -1 on
+   I/O or compression error.
+   ──────────────────────────────────────────────────────────────────── */
+zstd_out_t *zstd_out_open(const char *path, int level);
+int         zstd_out_write(zstd_out_t *z, const void *data, size_t len);
+int         zstd_out_close(zstd_out_t *z);
 
 /* ── Presence writer ──────────────────────────────────────────────────
    Spawns a single writer thread that consumes per-sample queue records

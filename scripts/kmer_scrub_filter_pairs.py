@@ -1,61 +1,49 @@
 #!/usr/bin/env python3
-"""Map scrubbed kmers onto a genome and export result dataframes.
+"""Select strain-informative kmers from a scrub database and build kmer pairs.
+
+Flow:
+  1. global counts -> drop repeated reference kmers and drug-scrub hits
+  2. split into informative singletons (zero pangenome + metagenome counts)
+     and non-informative ones
+  3. map singletons onto the genome, drop terminal kmers, reduce to a
+     non-overlapping set, pair them
+  4. if that set is smaller than --max_kmers, pull non-informative kmers from
+     the presence index, pair them, and reduce to a set that is independent of
+     each other AND of the singletons already committed
+  5. keep only pairs whose two members both survived, export their locations
 
 Usage:
-    python kmer_scrub_filter2.py <genome.fna.gz> <scrubbed_kmers.gz>
-    python kmer_scrub_filter2.py <genome.fna.gz> <scrubbed_kmers.gz> --output-dir results/ --basename my_strain --figures
+    python kmer_scrub_filter_pairs.py \
+        --genome strain.fna.gz \
+        --counts_global counts_global.tsv \
+        --counts_individual kmer_presence.tsv.zst \
+        --counts_summary summary.tsv \
+        --basename my_strain --output_dir results/
 """
 import argparse
-import gzip
-import os
-import sys
-import time
-import numpy as np
-import ahocorasick
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from Bio import SeqIO
-from Bio.Seq import Seq
-import polars as pl
-import pandas as pd
-import pyarrow as pa
 import gc
 import glob
+import gzip
 import os
-import pyarrow as pa
-import pyarrow.parquet as pq
-import re
 import random
-import subprocess
-import math
-
 from collections import defaultdict
-from itertools import combinations, product
 
-import subprocess
-import os
-import polars as pl
-import shutil
-import polars as pl
-import pyarrow as pa
-import pyarrow.parquet as pq
+import ahocorasick
 import numpy as np
-from itertools import combinations
-import os
-from collections import defaultdict
-
-from collections import defaultdict
-from itertools import combinations
-from multiprocessing import Pool
-import os
-import glob
-
+import pandas as pd
+import plotly.express as px
 import polars as pl
-import pyarrow as pa
-import pyarrow.parquet as pq
-from kmer_pairs import *
+from Bio import SeqIO
+from Bio.Seq import Seq
 
+from kmer_pairs import (
+    create_all_pairs,
+    kmer_pairs_from_presence,
+    write_empty_pairs,
+)
+
+
+# ── genome IO ───────────────────────────────────────────────────────────
 
 def load_genome(genome_path):
     opener = gzip.open if genome_path.endswith('.gz') else open
@@ -65,6 +53,7 @@ def load_genome(genome_path):
             records[record.id] = record.seq
     return records
 
+
 def strain_name_from_path(path):
     base = os.path.basename(path)
     for ext in ('.fna.gz', '.fasta.gz', '.fa.gz', '.fna', '.fasta', '.fa'):
@@ -72,32 +61,10 @@ def strain_name_from_path(path):
             return base[: -len(ext)]
     return base.split('.')[0]
 
-def get_lowest_percentile(df, percentile=0.05, drug_scrub='percentile'):
-
-    if df['drug_count'].isna().all():
-        print('No drug counts found, continuing without drugscrub')
-        df['drug_count'] = 0
-        
-    if drug_scrub == 'percentile':
-        lowest = df[
-            (df['reference_count'] <= df['reference_count'].quantile(percentile)) &
-            (df['pangenome_count'] <= df['pangenome_count'].quantile(percentile)) &
-            (df['metagenome_count'] <= df['metagenome_count'].quantile(percentile)) &
-            (df['drug_count'] <= df['drug_count'].quantile(percentile))
-        ].copy()
-    
-    if drug_scrub == 'count_hard':
-        lowest = df[
-            (df['reference_count'] <= df['reference_count'].quantile(percentile)) &
-            (df['pangenome_count'] <= df['pangenome_count'].quantile(percentile)) &
-            (df['metagenome_count'] <= df['metagenome_count'].quantile(percentile)) &
-            (df['drug_count'] == 0)
-        ].copy()
-    return lowest
 
 def build_mapped_kmers_ahocorasick(records, kmers, terminal_dist):
-    # Build Aho-Corasick automaton with forward and reverse complement kmers
-    # Important: only pass single-count kmers; only the first hit per kmer is kept
+    """Locate each kmer (forward or reverse complement) on the genome.
+    Only the first hit per kmer is kept, so pass single-count kmers."""
     A = ahocorasick.Automaton()
     for kmer in kmers:
         A.add_word(kmer, (kmer, False))
@@ -106,21 +73,19 @@ def build_mapped_kmers_ahocorasick(records, kmers, terminal_dist):
 
     found = set()
     rows = []
-    print(A)
     for record_id, seq in records.items():
         for pos, (kmer, is_rc) in A.iter(str(seq)):
             if kmer not in found:
                 rows.append((record_id, kmer, pos - len(kmer) + 1, is_rc))
                 found.add(kmer)
 
-    df = pd.DataFrame(rows, columns=['contig_id', '#kmer', 'kmer_position', 'reverse_complement'])
+    df = pd.DataFrame(
+        rows, columns=['contig_id', '#kmer', 'kmer_position', 'reverse_complement'])
 
     if len(df) < len(kmers):
-        print('WARNING: not all kmers found in genome')
-    elif len(df) > len(kmers):
-        print('WARNING: kmers found more than once')
+        print(f'  WARNING: {len(kmers) - len(df)} kmers not found in genome')
     else:
-        print(f'  {len(df)} kmers mapped (all unique)')
+        print(f'  {len(df)} kmers mapped')
 
     dict_len = {cid: len(seq) for cid, seq in records.items()}
     df['contig_length'] = df['contig_id'].map(dict_len)
@@ -129,228 +94,41 @@ def build_mapped_kmers_ahocorasick(records, kmers, terminal_dist):
         ((df['contig_length'] - df['kmer_position']) < terminal_dist)
     )
     df['label'] = df['terminal_kmer'].map({True: 'terminal', False: 'internal'})
-
-    n_terminal = int(df['terminal_kmer'].sum())
-    print(f'  Terminal kmers: {n_terminal} / {len(df)}')
+    print(f'  Terminal kmers: {int(df["terminal_kmer"].sum())} / {len(df)}')
 
     return df, dict_len
 
 
-def assign_mapping_bin(df, bin_size):
-    li_dfs = []
-    for contig in df['contig_id'].unique():
-        df_contig = df.loc[df['contig_id'] == contig].copy()
-        df_contig['bin'] = (df_contig['kmer_position'] // bin_size) * bin_size
-        li_dfs.append(df_contig)
-    return pd.concat(li_dfs)
-
-
-def smooth_downsample(df, total_target, bin_size, mode = None):
-    """Downsample df so the total selected kmers equals total_target,
-    with each contig's share proportional to its length.
-    A global bin cap is computed as the bin_percentile quantile of bin counts across
-    all contigs combined, then each contig's bins are smoothed down to that cap.
-    The contig is further sampled down to its proportional share if still over.
-    Removes terminal kmers to avoid bad assembly regions.
-    """
-    
-    if mode == 'independent':
-        
-        kmer_gap = 31
-        df = assign_mapping_bin(df.loc[df['terminal_kmer'] == False], bin_size)
-        # drop all non ATCG in kmers
-        df = df.loc[df['#kmer'].str.fullmatch(r'[ACGT]+')].copy()
-        total_genome_length = df.groupby('contig_id')['contig_length'].first().sum()
-
-        contig_results = []
-        for contig_id, contig_df in df.groupby('contig_id'):
-
-            contig_length = contig_df['contig_length'].iloc[0]
-            contig_cap = max(1, int(total_target * contig_length / total_genome_length))
-            print(f'Contig length: {contig_length}, max allowed kmers: {contig_cap}' )
-            current_total = len(contig_df)
-            excess = current_total - contig_cap
-            print(f"Available Kmers on contig: {current_total}")
-            print('Excess kmers on contig: ' + str(excess))
-            
-            #sort dataframe by position and counts
-            sort_df = contig_df.sort_values(['bin','drug_count', 'pangenome_count', 'metagenome_count'])
-            contig_result = sort_df.drop_duplicates('bin', keep = 'first')
-            # need a check to see if kmers overlap anyway
-            li_drop = []
-            for pos_i, (_, row) in enumerate(contig_result.iterrows()):
-                if row['reverse_complement'] == True:
-                    if pos_i == 0:
-                        continue
-                    else:
-                        neighbor = contig_result.iloc[pos_i-1]
-                        distance = row['kmer_position'] - neighbor['kmer_position']
-                        if neighbor['reverse_complement'] == True:
-                            req_distance = 31
-                        if neighbor['reverse_complement'] == False:
-                            req_distance = 62
-                        if distance < req_distance and distance > 0:
-                            print('kmers are too close')
-                            print('drop worse kmer: ')
-                            pair =  contig_result.iloc[pos_i-1:pos_i+1]
-                            drop_position = pair.sort_values(['drug_count', 'pangenome_count', 'metagenome_count'], ascending = False).iloc[0]['kmer_position']
-                            print(drop_position)
-                            li_drop.append(drop_position)
-                if row['reverse_complement'] == False:
-                    if pos_i == len(contig_result)-1:
-                        continue
-                    else:
-                        neighbor = contig_result.iloc[pos_i+1]
-                        distance = neighbor['kmer_position'] - row['kmer_position']
-                        if neighbor['reverse_complement'] == True:
-                            req_distance = 62
-                        if neighbor['reverse_complement'] == False:
-                            req_distance = 31
-                        if distance < req_distance:
-                            print('kmers are too close')
-                            pair = contig_result.iloc[pos_i:pos_i+2]
-                            drop_position = pair.sort_values(['drug_count', 'pangenome_count', 'metagenome_count'],ascending=False).iloc[0]['kmer_position']
-                            print(f'drop worse kmer at position: {drop_position}')
-                            li_drop.append(drop_position)
-
-            print(f'Found too close kmers, dropped: {len(li_drop)}')
-            contig_result = contig_result.loc[contig_result['kmer_position'].isin(li_drop) == False].copy()
-            # if over contig cap, trim more common kmers until its hit
-            if len(contig_result) > contig_cap:
-                print('More rare kmers than contig cap allows')
-                n_remove = len(contig_result) - contig_cap
-                print(f'fremoving additional kmers: {n_remove}')
-                
-                contig_result = (contig_result.sort_values(['drug_count', 'pangenome_count', 'metagenome_count'], ascending = True)
-                                 .iloc[:contig_cap])
-
-            contig_results.append(contig_result)
-        result = pd.concat(contig_results)
-        print(f'  Total: {len(result)} after independent scrub')
-        return result.sort_values(['contig_id', 'kmer_position'])
-
-
-    else:
-        df = assign_mapping_bin(df.loc[df['terminal_kmer'] == False], bin_size)
-
-        bin_counts = df.groupby(['contig_id', 'bin']).size()
-        #global_bin_cap = int(bin_counts.mean())
-        #mean_bin_count_genome = bin_counts.groupby('contig_id').mean()
-
-        bin_counts = bin_counts.reset_index()
-        bin_counts = bin_counts.rename(columns = {0: 'size'})
-        #bin_counts['to_scrub'] = bin_counts['size'] - global_bin_cap
-        #print(bin_counts.sort_values(['to_scrub'],ascending = False))
-
-        #print(bin_counts, global_bin_cap,mean_bin_count_genome)
-        
-        #print(f'  Global mean bin cap: {global_bin_cap}')
-
-        total_genome_length = df.groupby('contig_id')['contig_length'].first().sum()
-
-        contig_results = []
-        for contig_id, contig_df in df.groupby('contig_id'):
-            contig_length = contig_df['contig_length'].iloc[0]
-            contig_cap = max(1, int(total_target * contig_length / total_genome_length))
-            print(contig_cap)
-
-            #df_scrub = bin_counts.loc[(bin_counts['contig_id']==contig_id) & 
-            #                          (bin_counts['to_scrub']>0)]
-            #print('counts for kmers not to be scrubbed')
-
-            # HERE YOU NEED TO ACTUALLY ALSO GRAB NOT ONLY FROM THE OVERREPRESENTED ONES!
-            #print(str(bin_counts.loc[(bin_counts['contig_id']==contig_id) & 
-            #                          (bin_counts['to_scrub']<0)]['size'].sum()))
-            
-            current_total = len(contig_df)
-            excess = current_total - contig_cap
-            df_scrub = bin_counts.loc[bin_counts["contig_id"]==contig_id]
-            
-            #df_scrub['n_remove'] = (df_scrub['to_scrub'] / df_scrub['to_scrub'].sum() * excess).astype(int)
-            
-            #proportionally remove the excess from size
-            df_scrub['n_remove'] = (df_scrub['size'] / df_scrub['size'].sum() * excess).astype(int)
-
-            # cap so we never remove more than what's scrubable
-            #df_scrub['n_remove'] = df_scrub['n_remove'].clip(upper=df_scrub['to_scrub'])
-
-            # fix rounding remainder — assign to largest bins first
-            remainder = excess - df_scrub['n_remove'].sum()
-            if remainder > 0:
-                largest = df_scrub.nlargest(remainder, 'size').index
-                df_scrub.loc[largest, 'n_remove'] += 1
-
-            # what each bin keeps after removal
-            df_scrub['n_keep'] = df_scrub['size'] - df_scrub['n_remove']
-            print(df_scrub.sort_values(['n_remove'], ascending = False))
-            print('current contig kmers:' + str(current_total))
-            print('Excess kmers in contig: ' + str(excess))
-            #print('potential scrubs: ' + str(df_scrub['to_scrub'].sum()))
-            print('total kmers that will be filtered: ' + str(df_scrub['n_remove'].sum()))
-            # get all contig bins above global_bin_cap
-            scrub_map = dict(zip(df_scrub['bin'], df_scrub['n_keep']))
-
-            contig_keep = []
-            for bin_name, group in contig_df.groupby('bin'):
-                if bin_name in scrub_map:
-                    n_in_bin = len(group)
-                    n_keep = scrub_map[bin_name]
-                    if n_keep < n_in_bin:
-                        contig_keep.append(
-                            group.sort_values('kmer_position').iloc[
-                                np.linspace(0, n_in_bin - 1, n_keep, dtype=int)
-                            ]
-                        )
-                    else:
-                        contig_keep.append(group)
-                else:
-                    contig_keep.append(group)
-
-            contig_result = pd.concat(contig_keep)
-
-            if len(contig_result) > contig_cap:
-                print('random sample')
-                contig_result = contig_result.sample(n=contig_cap)
-
-            contig_results.append(contig_result)
-            print(f'  {contig_id}: {len(contig_df)} -> {len(contig_result)} kmers (contig cap: {contig_cap})')
-
-        result = pd.concat(contig_results)
-        print(f'  Total: {len(df)} -> {len(result)} kmers after smooth downsampling')
-        return result.sort_values(['contig_id', 'kmer_position'])
-
+# ── overlap graph and independent-set selection ─────────────────────────
 
 def find_overlap_kmer_fast(df, max=0.8, chunk_size=10_000):
+    """Map each kmer to the kmers whose genomic footprint it overlaps.
+    Returns a one-directional dict: symmetrise before using it as a graph."""
     dict_overlap = {}
     same_thresh = 31 * max
-    cross_lo    = 31 * (1 - max)
-    cross_hi    = 62 * max
+    cross_lo = 31 * (1 - max)
+    cross_hi = 62 * max
 
     for contig_id, contig_df in df.groupby('contig_id'):
-        kmers     = contig_df['#kmer'].values
+        kmers = contig_df['#kmer'].values
         positions = contig_df['kmer_position'].values
-        is_rc     = contig_df['reverse_complement'].values.astype(bool)
+        is_rc = contig_df['reverse_complement'].values.astype(bool)
         n = len(kmers)
-        
         overlap_lists = [[] for _ in range(n)]
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
-            
-            # dist[i,j] = pos[j] - pos[i], i in chunk, j in all
-            dist = positions[None, :] - positions[start:end, None]  # (chunk, n)
+            dist = positions[None, :] - positions[start:end, None]
             rc_i = is_rc[start:end, None]
             rc_j = is_rc[None, :]
 
             same_strand = (rc_i == rc_j) & (np.abs(dist) < same_thresh)
-            fwd_rc = (~rc_i) &  rc_j & (dist >  cross_lo) & (dist <  cross_hi)
-            rc_fwd =   rc_i  & (~rc_j) & (dist > -cross_hi) & (dist < -cross_lo)
+            fwd_rc = (~rc_i) & rc_j & (dist > cross_lo) & (dist < cross_hi)
+            rc_fwd = rc_i & (~rc_j) & (dist > -cross_hi) & (dist < -cross_lo)
 
             overlap_matrix = same_strand | fwd_rc | rc_fwd
-            # zero out self
             for local_i in range(end - start):
                 overlap_matrix[local_i, start + local_i] = False
-
             for local_i in range(end - start):
                 overlap_lists[start + local_i] = kmers[overlap_matrix[local_i]].tolist()
 
@@ -359,59 +137,27 @@ def find_overlap_kmer_fast(df, max=0.8, chunk_size=10_000):
 
     return dict_overlap
 
-def find_overlap_kmer(df, max = 0.8):
-    
-    dict_overlap = {} 
 
-    for contig_id, contig_df in df.groupby('contig_id'):
-
-        for pos_i, (_, row) in enumerate(contig_df.iterrows()):
-            if row['reverse_complement'] == True:
-                overlap_df = contig_df.loc[((contig_df['reverse_complement'] == True ) & 
-                                            (contig_df['kmer_position'] - row['kmer_position']  < 31 * max) & (contig_df['kmer_position'] - row['kmer_position']  > -31 * max))|
-                                            ((contig_df['reverse_complement'] == False ) & 
-                                             (row['kmer_position'] - contig_df['kmer_position'] < 62 * max) & (row['kmer_position'] - contig_df['kmer_position'] > 0 + 31*(1-max)))]
-                #remove self kmer
-                overlap_df = overlap_df.loc[overlap_df['#kmer'] != row['#kmer']]
-                dict_overlap[row['#kmer']] = overlap_df ['#kmer'].to_list()
-             
-            if row['reverse_complement'] == False:
-                overlap_df = contig_df.loc[((contig_df['reverse_complement'] == True ) & 
-                                            ((contig_df['kmer_position'] - row['kmer_position'] < 62 * max) & (contig_df['kmer_position'] - row['kmer_position'] > 0 + 31*(1-max))))|
-                                            ((contig_df['reverse_complement'] == False ) &
-                                            ((contig_df['kmer_position'] -  row['kmer_position'] < 31 * max) & (contig_df['kmer_position'] -  row['kmer_position'] > -31 * max)))]
-                
-                #remove self kmer
-                overlap_df = overlap_df.loc[overlap_df['#kmer'] != row['#kmer']]
-                dict_overlap[row['#kmer']] = overlap_df ['#kmer'].to_list()
-
-    return dict_overlap
 def max_independent_kmers_greedy_heap(dict_overlap):
+    """Greedy minimum-degree independent set, heap-backed."""
     import heapq
-    
-    # original one-directional degree BEFORE symmetry expansion
+
     original_degree = {k: len(v) for k, v in dict_overlap.items()}
-    
-    # expand to symmetric adj
     adj = {k: set(v) for k, v in dict_overlap.items()}
     for k, nbrs in list(adj.items()):
         for nb in nbrs:
             adj.setdefault(nb, set()).add(k)
 
-    degree = {k: len(v) for k, v in adj.items()}  # live symmetric degree
-
+    degree = {k: len(v) for k, v in adj.items()}
     counter = 0
     heap = []
     for k in dict_overlap.keys():
         heapq.heappush(heap, (degree[k], original_degree[k], counter, k))
         counter += 1
 
-    selected = []
-    excluded = set()
-
+    selected, excluded = [], set()
     while heap:
         d, od, _, node = heapq.heappop(heap)
-
         if node in excluded:
             continue
         if d != degree[node]:
@@ -421,7 +167,6 @@ def max_independent_kmers_greedy_heap(dict_overlap):
 
         selected.append(node)
         excluded.add(node)
-
         for nb in adj[node]:
             if nb in excluded:
                 continue
@@ -431,702 +176,361 @@ def max_independent_kmers_greedy_heap(dict_overlap):
                     degree[nb2] -= 1
                     heapq.heappush(heap, (degree[nb2], original_degree[nb2], counter, nb2))
                     counter += 1
-
     return selected
 
-def max_independent_kmers_greedy(dict_overlap):
-    """Greedy minimum-degree independent set from an overlap dict.
-    dict_overlap: {kmer: [overlapping_kmers]}. Returns a list of selected kmers."""
 
-    adj = {k: set(v) for k, v in dict_overlap.items()}
-    for k, nbrs in list(adj.items()):
+def select_independent_with_fixed(df_locations, fixed_kmers, candidate_kmers, overlap):
+    """Independent set over candidate_kmers that also avoids fixed_kmers.
+
+    The singletons are selected and committed before the pair kmers exist, so
+    running the greedy on the pair kmers alone would happily pick one sitting
+    on top of a selected singleton. Build the graph over the union, drop every
+    candidate adjacent to a committed kmer, then reduce what's left.
+    """
+    fixed_kmers = set(fixed_kmers)
+    candidate_kmers = set(candidate_kmers) - fixed_kmers
+
+    sub = df_locations.loc[df_locations['#kmer'].isin(fixed_kmers | candidate_kmers)]
+    dict_overlap = find_overlap_kmer_fast(sub, max=overlap)
+
+    adj = defaultdict(set)
+    for k, nbrs in dict_overlap.items():
         for nb in nbrs:
-            adj.setdefault(nb, set()).add(k)
+            adj[k].add(nb)
+            adj[nb].add(k)
 
-    selected = []
-    remaining = set(adj)
-    while remaining:
-        # pick node with fewest remaining neighbors
-        node = min(remaining, key=lambda k: len(adj[k] & remaining))
-        selected.append(node)
-        # remove node and all its neighbors from contention
-        remaining.discard(node)
-        remaining -= adj[node]
-    return selected
+    blocked = set()
+    for k in fixed_kmers:
+        blocked |= adj.get(k, set())
+
+    free = candidate_kmers - blocked
+    sub_overlap = {k: [nb for nb in adj.get(k, ()) if nb in free] for k in free}
+
+    print(f'  {len(candidate_kmers) - len(free):,} pair kmers dropped for '
+          f'overlapping a selected singleton, {len(free):,} still eligible')
+    return max_independent_kmers_greedy_heap(sub_overlap)
 
 
-def make_inform_kmers_independent(df, type = 'singleton'):
-    
-    if type == 'singleton':
-        df = assign_mapping_bin(df.loc[df['terminal_kmer'] == False], 31)
+# ── presence index helpers ──────────────────────────────────────────────
 
-        dict_drop = {}
-        for contig_id, contig_df in df.groupby('contig_id'):
-            contig_df = contig_df.sort_values(['bin','drug_count', 'pangenome_count', 'metagenome_count'])
-            contig_df = contig_df.drop_duplicates('bin', keep = 'first')
-            contig_df = contig_df.sort_values('kmer_position', ascending = True)
-            li_drop = []
-            print(contig_df[['#kmer', 'kmer_position', 'reverse_complement']])
-            for pos_i, (_, row) in enumerate(contig_df.iterrows()):
-                if row['reverse_complement'] == True:
-                    if pos_i == 0:
-                        continue
-                    else:
-                        neighbor = contig_df.iloc[pos_i-1]
-                        distance = row['kmer_position'] - neighbor['kmer_position']
-                        if neighbor['reverse_complement'] == True:
-                            req_distance = 31
-                        if neighbor['reverse_complement'] == False:
-                            req_distance = 62
-                        if distance < req_distance and distance > 0:
-                            pair =  contig_df.iloc[pos_i-1:pos_i+1]
-                            drop_position = pair.sort_values(['drug_count', 'pangenome_count', 'metagenome_count'], ascending = False).iloc[0]['kmer_position']
-                            li_drop.append(drop_position)
-                
-                if row['reverse_complement'] == False:
-                    if pos_i == len(contig_df)-1:
-                        continue
-                    else:
-                        neighbor = contig_df.iloc[pos_i+1]
-                        distance = neighbor['kmer_position'] - row['kmer_position']
-                        if neighbor['reverse_complement'] == True:
-                            req_distance = 62
-                        if neighbor['reverse_complement'] == False:
-                            req_distance = 31
-                        if distance < req_distance:
-                            pair = contig_df.iloc[pos_i:pos_i+2]
-                            # for singletons this is always 0 so whats the point here? could do some other score like jaccard from rest?
-                            drop_position = pair.sort_values(['drug_count', 'pangenome_count', 'metagenome_count'],ascending=False).iloc[0]['kmer_position']
-                            li_drop.append(drop_position)
-            dict_drop[contig_id] = li_drop
-            print(f'Found too close kmers, on {contig_id}, drop: {len(li_drop)}')
-        return dict_drop
-    
-
-def plot_genome_bins(df, df_smooth, basename, bin_size, output_dir, map_only = False):
-    if map_only:
-        df=df.copy()
-        df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
-        df['kmer_count'] = 1
-        df['bin'] = (df['kmer_position'] // bin_size) * bin_size
-
-        contigs = df['contig_id'].unique()
-        plot_dir = os.path.join(output_dir, 'contig_plots')
-        os.makedirs(plot_dir, exist_ok=True)
-
-        for contig in contigs:
-            df_contig = df.loc[df['contig_id'] == contig]
-            binned_all = df_contig.groupby('bin')['kmer_count'].sum().reset_index()
-            binned_all = binned_all[binned_all['kmer_count'] > 0]
-
-            y_max = binned_all['kmer_count'].max() if len(binned_all) else 1
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=binned_all['bin'], y=binned_all['kmer_count'],
-                mode='markers', name='all rare kmers',
-                marker=dict(color=px.colors.qualitative.D3[0], size=3),
-            ))
-            
-            fig.update_xaxes(title_text='position (bp)')
-            fig.update_yaxes(showline=True, showticklabels=True, range=[0, y_max * 1.05])
-            fig.update_layout(
-                title_text=f'{basename} — {contig}',
-                height=400,
-                width=800,
-                template='simple_white',
-            )
-            safe_contig = contig.replace('/', '_').replace(' ', '_')
-            fig.write_image(os.path.join(plot_dir, f'{basename}.{safe_contig}.svg'))
+def exclusion_list(summary_tsv, similarity_t=None):
+    """scrub_ids whose hits should not count: samples excluded from the global
+    columns, or below a coverage cutoff if one is given."""
+    df = pl.read_csv(summary_tsv, separator='\t')
+    if similarity_t is not None:
+        df_t = df.filter(pl.col('coverage_pct') < similarity_t)
     else:
-        df = df.copy()
-        df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
-        df['kmer_count'] = 1
-        df['bin'] = (df['kmer_position'] // bin_size) * bin_size
+        df_t = df.filter(pl.col('is_in_global') == False)
+    return df_t.get_column('scrub_id').cast(pl.UInt32).to_list()
 
-        df_smooth = df_smooth.copy()
-        df_smooth['kmer_count'] = 1
-        df_smooth['bin'] = (df_smooth['kmer_position'] // bin_size) * bin_size
 
-        contigs = df['contig_id'].unique()
-        plot_dir = os.path.join(output_dir, 'contig_plots')
-        os.makedirs(plot_dir, exist_ok=True)
+def _pl_to_pandas(df):
+    """polars -> pandas without going through pyarrow."""
+    return pd.DataFrame({c: df[c].to_list() for c in df.columns})
 
-        for contig in contigs:
-            df_contig = df.loc[df['contig_id'] == contig]
-            binned_all = df_contig.groupby('bin')['kmer_count'].sum().reset_index()
-            binned_all = binned_all[binned_all['kmer_count'] > 0]
 
-            df_contig_smooth = df_smooth.loc[df_smooth['contig_id'] == contig]
-            binned_smooth = df_contig_smooth.groupby('bin')['kmer_count'].sum().reset_index()
-            binned_smooth = binned_smooth[binned_smooth['kmer_count'] > 0]
+def annotate_kmers(df_export, df_global_counts, presence_tsv, li_t):
+    """Attach the global scrub counts and the presence list to the export.
 
-            y_max = binned_all['kmer_count'].max() if len(binned_all) else 1
+    list_scrub_id is the li_t-masked list — the same one the pipeline uses to
+    judge informativeness — re-joined with commas, and n_presence is its
+    length. An empty list means the kmer was hit by nothing, or was dropped by
+    the -P cap in the C writer; the count columns tell those apart, since a
+    capped kmer has non-zero pangenome/metagenome counts.
+    """
+    used = pl.Series(sorted(df_export['#kmer'].unique())).implode()
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=binned_all['bin'], y=binned_all['kmer_count'],
-                mode='markers', name='all rare kmers',
-                marker=dict(color=px.colors.qualitative.D3[0], size=3),
-            ))
-            fig.add_trace(go.Scatter(
-                x=binned_smooth['bin'], y=binned_smooth['kmer_count'],
-                mode='markers', name='selected kmers',
-                marker=dict(color=px.colors.qualitative.D3[1], size=3),
-            ))
-            fig.update_xaxes(title_text='position (bp)')
-            fig.update_yaxes(showline=True, showticklabels=True, range=[0, y_max * 1.05])
-            fig.update_layout(
-                title_text=f'{basename} — {contig}',
-                height=400,
-                width=800,
-                template='simple_white',
-            )
-            safe_contig = contig.replace('/', '_').replace(' ', '_')
-            fig.write_image(os.path.join(plot_dir, f'{basename}.{safe_contig}.svg'))
+    presence = (
+        pl.scan_csv(presence_tsv, separator='\t')
+        .filter(pl.col('#kmer').is_in(used))
+        .with_columns(
+            pl.col('list_scrub_id')
+              .str.split(',')
+              .cast(pl.List(pl.UInt32))
+              .list.set_difference(li_t)
+              .alias('ids')
+        )
+        .with_columns(
+            pl.col('ids').list.len().alias('n_presence'),
+            pl.col('ids').list.sort().cast(pl.List(pl.String))
+              .list.join(',').alias('list_scrub_id'),
+        )
+        .select(['#kmer', 'list_scrub_id', 'n_presence'])
+        .collect(engine='streaming')
+    )
 
-def plot_kmer_counts(lowest_pct):
-    df_plot = lowest_pct.sort_values(['pangenome_count', 'metagenome_count'], ascending=True).reset_index(drop=True).reset_index()
-    df_plot_stack = df_plot.set_index(['index', '#kmer']).stack().reset_index()
-    df_plot_stack = df_plot_stack.rename(columns={'level_2': 'scrub_type', 0: 'value'})
-    df_plot_stack = df_plot_stack.loc[~df_plot_stack['scrub_type'].str.contains('freq')]
-    fig = px.line(df_plot_stack,
-                  x='index',
-                  y='value',
-                  #log_y=True,
-                  template='simple_white',
-                  color='scrub_type',
-                  title='rare kmers by count')
-    fig.update_yaxes(title_text='')
-    return fig
+    ann = (df_global_counts
+           .filter(pl.col('#kmer').is_in(used))
+           .join(presence, on='#kmer', how='left'))
 
-def plot_box_coverage(df_lowest, df_smooth, basename, bin_size, map_only = False):
-    if map_only:
-        df = df_lowest
-        df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
-        df['kmer_count'] = 1
+    out = df_export.merge(_pl_to_pandas(ann), on='#kmer', how='left')
+    out['n_presence'] = out['n_presence'].fillna(0).astype(int)
+    out['list_scrub_id'] = out['list_scrub_id'].fillna('')
+    return out
 
-        df['bin'] = (df['kmer_position'] // bin_size) * bin_size
-        binned = df.groupby(['contig_id','bin'])['kmer_count'].sum().reset_index()
 
-        fig = px.box(binned,
-                    x = 'contig_id',
-                    y = 'kmer_count',
-                    #color = 'stage',
-                    points = 'all',
-                    template = 'simple_white',
-                    title = basename,
-                    width = 800,
-                    height = 600)
+# ── plots ───────────────────────────────────────────────────────────────
+
+def plot_scrub_counts(df_global_counts, basename, output_dir):
+    """Waterfall of how many kmers carry each total scrub count.
+
+    Written twice: the full range, and a zoom on the first 20 counts where
+    the informative tail actually lives.
+    """
+    df_gl = df_global_counts.to_pandas().drop(columns=['reference_count']).set_index('#kmer')
+    count_hist = (df_gl.sum(axis=1).value_counts()
+                  .sort_index()
+                  .rename_axis('total_count')
+                  .reset_index(name='n_kmers'))
+
+    zero = count_hist.loc[count_hist['total_count'] == 0, 'n_kmers']
+
+    for x_max, suffix in ((5000, ''), (20, '.zoom')):
+        # subset rather than just setting range_x, so the log y-axis
+        # autoscales to what is visible instead of to the whole tail
+        sub = count_hist.loc[count_hist['total_count'] <= x_max]
+        fig = px.scatter(sub, x='total_count', y='n_kmers',
+                         log_y=True, template='simple_white',
+                         range_x=[-0.1, x_max], title=basename)
+        if len(zero):
+            fig.add_hline(y=zero.iloc[0], line_width=3,
+                          line_dash='dash', line_color='grey')
+        fig.write_image(
+            os.path.join(output_dir, f'{basename}.scrub_counts{suffix}.svg'))
+
+
+def plot_coverage_histogram(summary_tsv, basename, output_dir):
+    df_hist = pd.read_csv(summary_tsv, sep='\t')
+    fig = px.histogram(df_hist, x='coverage_pct', log_y=True,
+                       color='is_in_global', histfunc='count',
+                       template='simple_white', range_x=[0, 1],
+                       title=f'{basename} — coverage_pct distribution')
+    fig.update_layout(width=800, height=500)
+    fig.write_image(os.path.join(output_dir, f'{basename}.histogram_scrub_db.svg'))
+
+
+# ── pair selection and export ───────────────────────────────────────────
+
+def finish_pair_workflow(args, basename, records, selected_singletons,
+                         pair_kmers, df_locations_singletons,
+                         df_global_counts):
+    """Reduce the pair kmers to a set independent of each other and of the
+    committed singletons, keep only pairs whose two members both survive, and
+    export the merged locations for strain_detect."""
+    pair_glob = os.path.join(args.output_dir,
+                             f'{basename}.inform_kmer_pairs.part*.parquet')
+    filtered_path = os.path.join(args.output_dir,
+                                 f'{basename}.inform_kmer_pairs.pairs.parquet')
+
+    df_locations_all = df_locations_singletons
+    selected_pair_kmers = set()
+
+    if pair_kmers:
+        print(f'Locating pair kmers on genome ({len(pair_kmers):,})')
+        df_locations_pairs, _ = build_mapped_kmers_ahocorasick(
+            records, pair_kmers, terminal_dist=args.terminal_dist)
+        print('dropping terminal kmers')
+        df_locations_pairs = df_locations_pairs.loc[
+            df_locations_pairs['terminal_kmer'] == False]
+
+        df_locations_all = pd.concat(
+            [df_locations_singletons, df_locations_pairs], ignore_index=True)
+
+        print('finding overlapping kmers for pair selection')
+        selected_pair_kmers = set(select_independent_with_fixed(
+            df_locations_all, selected_singletons,
+            set(df_locations_pairs['#kmer']), args.kmer_overlap))
+        print(f'Selected pair kmers: {len(selected_pair_kmers):,}')
+
+    # keep only pairs where BOTH members survived selection
+    pair_parts = sorted(glob.glob(pair_glob))
+    if pair_parts and selected_pair_kmers:
+        sel = pl.Series(sorted(selected_pair_kmers))
+        (
+            pl.scan_parquet(pair_parts, low_memory=True)
+            .filter(pl.col('kmerA').is_in(sel) & pl.col('kmerB').is_in(sel))
+            .sink_parquet(filtered_path, compression='zstd')
+        )
     else:
-        df_lowest['stage'] = 'pre_smooth'
-        df_smooth['stage'] = 'post_smooth'
-        print(df_lowest)
-        print(df_smooth)
+        print('No informative pairs for this strain — writing empty pairs parquet',
+              flush=True)
+        write_empty_pairs(filtered_path)
 
-        df = pd.concat([df_lowest, df_smooth])
+    # A selected kmer whose partner was dropped now appears in no pair at all.
+    # Read back what survived so the exported locations match the pairs file.
+    used_pair_kmers = set()
+    if os.path.exists(filtered_path) and os.path.getsize(filtered_path) > 0:
+        for col in ('kmerA', 'kmerB'):
+            used_pair_kmers.update(
+                pl.read_parquet(filtered_path, columns=[col])
+                  .get_column(col).unique().to_list())
+            gc.collect()
+    dropped = len(selected_pair_kmers) - len(used_pair_kmers)
+    if dropped > 0:
+        print(f'  {dropped:,} selected pair kmers ended up in no surviving pair '
+              f'and are excluded from the export')
+
+    if pair_parts:
+        if os.path.exists(filtered_path) and os.path.getsize(filtered_path) > 0:
+            for p in pair_parts:
+                os.remove(p)
+            print(f'Wrote {filtered_path} and removed {len(pair_parts)} part files',
+                  flush=True)
+        else:
+            print('WARNING: final parquet missing or empty — keeping part files',
+                  flush=True)
+
+    # merged export for strain_detect
+    used = set(selected_singletons) | used_pair_kmers
+    df_export = df_locations_all.loc[df_locations_all['#kmer'].isin(used)].copy()
+    df_export['origin'] = np.where(
+        df_export['#kmer'].isin(selected_singletons), 'singleton', 'pair')
+    df_export = df_export.sort_values(['contig_id', 'kmer_position'])
+
+    li_t = exclusion_list(args.counts_summary, args.similarity_t)
+    print(f'Annotating export with scrub counts and presence lists '
+          f'({len(li_t):,} samples excluded from the lists)')
+    df_export = annotate_kmers(df_export, df_global_counts,
+                               args.counts_individual, li_t)
+
+    out_path = os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz')
+    df_export.to_csv(out_path, sep='\t', index=False, compression='gzip')
+
+    n_s = int((df_export['origin'] == 'singleton').sum())
+    n_p = int((df_export['origin'] == 'pair').sum())
+    print(f'Total kmers for strain_detect: {len(df_export):,} '
+          f'({n_s:,} singleton, {n_p:,} pair)')
+    print(f'Wrote {out_path}', flush=True)
+    return df_export
 
 
-        df.sort_values(['contig_length', 'contig_id', 'kmer_position'], inplace=True)
-        df['kmer_count'] = 1
-
-        df['bin'] = (df['kmer_position'] // bin_size) * bin_size
-        binned = df.groupby(['stage','contig_id','bin'])['kmer_count'].sum().reset_index()
-
-        fig = px.box(binned,
-                    x = 'contig_id',
-                    y = 'kmer_count',
-                    color = 'stage',
-                    points = 'all',
-                    template = 'simple_white',
-                    title = basename,
-                    width = 800,
-                    height = 600)
-    return fig
+# ── main ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Map scrubbed kmers onto a genome.')
-    parser.add_argument('--genome', help='Genome FASTA file (.fna or .fna.gz)')
-    parser.add_argument('--counts_global', help='Either a kmer counts file or a scrubbed kmers file if map_scrubbed_kmers')
-    parser.add_argument('--counts_individual', help='Either a kmer counts file or a scrubbed kmers file if map_scrubbed_kmers')
-    parser.add_argument('--counts_summary')
-    parser.add_argument('--output-dir', default='.', help='Output directory (default: current directory)')
-    parser.add_argument('--basename', default=None, help='Output basename (default: derived from genome filename)')
-    parser.add_argument('--figures', action='store_true', default=False, help='Save figures as SVG (default: False)')
-    parser.add_argument('--threads', type = int,default = 32)
-    parser.add_argument('--presence_t', type = int, help = 'maximal presence threshold for pair generation' ,default = 10)
-    parser.add_argument('--pair_mode', type = str, default = "sxp", help = ' Either set to "sxs" for including singeltons x singletons pair generation or "sxp"')
-    parser.add_argument('--percentage', type=float, default=0.01,
-                        help='Percentile threshold for rare kmer selection (default: 0.05)')
-    parser.add_argument('--percentile_union', type = float, default = 0.05, help = 'percentile passed for union of different kmer scrubs')
-    parser.add_argument('--bin-size', type=int, default=1000, help='Bin size in bp for kmer density smoothing (default: 1000)')
-    parser.add_argument('--terminal-dist', type=int, default=300,  help='Distance from contig ends to flag terminal kmers (default: 300)')
-    parser.add_argument('--map_scrubbed_kmers_only', action='store_true', help = 'Takes a file of rare kmers as a list, one kmer per line that will be mapped to a target genome')
-    parser.add_argument('--independent', action='store_true', help = 'reduces bin size to 31 to and only allows 1 kmer per bin')
-    parser.add_argument('--force', action='store_true', help='Recompute outputs even if they already exist')
-    #classic strainer to pairs arguments
-    parser.add_argument('--create_classic_pairs', action='store_true', help = 'Takes a file of rare kmers as a list, one kmer per line that will be mapped to a target genome')
-    parser.add_argument('--scrubbed_kmers' , help = 'Output of kmer_scrub_filter.py redirected to file.')
+    parser = argparse.ArgumentParser(
+        description='Select strain-informative kmers and build kmer pairs.')
+    parser.add_argument('--genome', required=True,
+                        help='Genome FASTA (.fna or .fna.gz)')
+    parser.add_argument('--counts_global', required=True,
+                        help='Global kmer counts TSV from kmer_scrub_count_individual')
+    parser.add_argument('--counts_individual', required=True,
+                        help='Inverted presence index (#kmer, list_scrub_id)')
+    parser.add_argument('--counts_summary', required=True,
+                        help='Per-sample summary TSV')
+    parser.add_argument('--output_dir', default='.')
+    parser.add_argument('--basename', default=None,
+                        help='Output basename (default: derived from --genome)')
+    parser.add_argument('--threads', type=int, default=20)
+    parser.add_argument('--max_kmers', type=int, default=20000,
+                        help='Target kmer count; below this, pairs are also '
+                             'built from non-informative kmers')
+    parser.add_argument('--kmer_overlap', type=float, default=0.8,
+                        help='Max fraction of overlap allowed between two '
+                             'selected kmers (0-1)')
+    parser.add_argument('--terminal_dist', type=int, default=300,
+                        help='Distance from contig ends to flag terminal kmers')
+    parser.add_argument('--similarity_t', type=float, default=None,
+                        help='Optional coverage cutoff for excluding samples; '
+                             'default uses is_in_global from the summary')
     args = parser.parse_args()
 
+    basename = args.basename if args.basename else strain_name_from_path(args.genome)
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.map_scrubbed_kmers_only:
-        strain = strain_name_from_path(args.genome)
-        basename = args.basename if args.basename else strain
-        os.makedirs(args.output_dir, exist_ok=True)
-        print(f'Loading genome: {args.genome}')
-        records = load_genome(args.genome)
-        print(f'  {len(records)} contigs')
-        df_counts = pd.read_csv(args.kmer_counts, sep='\t', header = None)
-        #print(df_counts)
-        print(f'Total scrubbed kmers to map: {len(df_counts)}')
-        kmers = df_counts[0].to_list()
-        df, _ = build_mapped_kmers_ahocorasick(records, kmers, terminal_dist=args.terminal_dist)
-        if args.figures:
-            plot_genome_bins(df, df, basename, bin_size=args.bin_size, output_dir=args.output_dir, map_only = True )
-            
-            fig_bins2 = plot_box_coverage(df, df, basename, bin_size=args.bin_size, map_only=True)
-            fig_bins2.write_image(os.path.join(args.output_dir, f'{basename}.box_genome_bins.svg'))
+    # ── global counts ──────────────────────────────────────────────────
+    df_global_counts = pl.read_csv(
+        args.counts_global, separator='\t',
+        schema_overrides={'reference_count': pl.UInt32,
+                          'pangenome_count': pl.UInt32,
+                          'metagenome_count': pl.UInt32,
+                          'drug_count': pl.UInt32})
+    print(f'Total kmers: {len(df_global_counts):,}')
 
-        df.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
-                        sep='\t', index=False, compression='gzip')
-    
-    # add entry point for classic strainer kmers
-    if args.create_classic_pairs:
-        
-        if args.genome:
-            strain = strain_name_from_path(args.genome)
-        basename = args.basename if args.basename else strain
-        os.makedirs(args.output_dir, exist_ok=True)
+    plot_scrub_counts(df_global_counts, basename, args.output_dir)
+    plot_coverage_histogram(args.counts_summary, basename, args.output_dir)
 
-        # create histogram plot for scrub db
-        df_hist = pd.read_csv(args.counts_summary, sep='\t')
-        fig = px.histogram(
-            df_hist,
-            x='coverage_pct',
-            log_y = True,
-            color = 'sample_type',
-            histfunc = 'count',
-            template='simple_white',
-            title=f'{basename} — coverage_pct distribution',
-            range_x = [-0.01,1.1],
-            )
-        fig.add_vline(x=0.96, line_width=3, line_dash="dash", line_color="grey")
-        fig.update_layout(width=800, height=500)
-        fig.write_image(os.path.join(args.output_dir, f'{basename}.histogram_scrub_db.svg'))
+    print('Removing kmers with count >1 in reference genome')
+    df_global_counts = df_global_counts.filter(pl.col('reference_count') == 1)
+    print(f'  remaining: {len(df_global_counts):,}')
 
-        print('Creating pairs from classic kmer scrub count file')
-        # read scrubbed kmers
-        li_kmer_scrubs = [l.strip() for l in open(args.scrubbed_kmers) if l.strip() and not l.startswith("#")]
-        print(f'Scrubbed kmer counts: {len(li_kmer_scrubs)}')
-
-        #
-        df_global_counts = pl.read_csv(args.counts_global, 
-                                       separator= '\t', 
-                                       schema_overrides={'reference_count': pl.UInt32,
-                                                        'pangenome_count': pl.UInt32,
-                                                        'metagenome_count': pl.UInt32,
-                                                        'drug_count': pl.UInt32,}
-                                        )
-        # Create waterfall plot scrub
-        df_gl = (df_global_counts.to_pandas().drop(columns=['reference_count']).set_index('#kmer'))
-        row_sums = df_gl.sum(axis=1)
-        count_hist = (row_sums.value_counts()
-              .sort_index()
-              .rename_axis('total_count')
-              .reset_index(name='n_kmers'))
-        
-        print(count_hist)
-        fig = px.scatter(count_hist,
-                     y = 'n_kmers',
-                     x = 'total_count',
-                     log_y = True,
-                     template = 'simple_white',
-                     range_x  = [-0.1, 5000],
-                     title = f'{basename}')
-        fig.add_hline(y = count_hist.loc[count_hist['total_count']==0]['n_kmers'][0],line_width=3, line_dash="dash", line_color="grey")
-        fig.write_image(os.path.join(args.output_dir, f'{basename}.scrub_counts.svg'))
-
-        # create inform singletons from scrubbed files
-        df_scrub_kmers = df_global_counts.filter(pl.col("#kmer").is_in(li_kmer_scrubs))
-        print(df_scrub_kmers)
-
-        
-        df_inform_singletons = df_scrub_kmers.filter((pl.col('metagenome_count') == 0 ) & (pl.col('pangenome_count') == 0))        
-        df_non_inform_singletons = df_scrub_kmers.filter(~((pl.col('metagenome_count') == 0) & (pl.col('pangenome_count') == 0)))
-
-        print(df_inform_singletons)
-        print(df_non_inform_singletons)
-
-        # export parquet inform kmers
-        print('Creating pairs from non informative singletons')
-        kmer_pairs_from_presence(args.counts_individual, args.counts_summary, 
-                                 args.output_dir , 
-                                 basename = basename,
-                                 df_keep=df_non_inform_singletons,
-                                 presence_t = 1000, # set to just make pairs whereever possible
-                                 similarity_t=None, 
-                                 n_workers=args.threads,
-                                 max_for_pairs = 100000)
-        
-        # pair parts → unique kmers across both columns, computed lazily
-        pair_glob = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")
-
-        unique_kmers = set()
-        for path in sorted(glob.glob(pair_glob)):
-            # read just one column at a time, dedupe per-part
-            df_part_a = pl.read_parquet(path, columns=['kmerA'])
-            unique_kmers.update(df_part_a.get_column('kmerA').unique().to_list())
-            del df_part_a
-            df_part_b = pl.read_parquet(path, columns=['kmerB'])
-            unique_kmers.update(df_part_b.get_column('kmerB').unique().to_list())
-            del df_part_b
-            gc.collect()
-
-        pair_kmers = unique_kmers
-        singleton_kmers = set(df_inform_singletons["#kmer"].to_list())
-
-        print(f"Pair kmers: {len(pair_kmers)}")
-        # create pairs without regard for file sizes
-        if args.pair_mode == "sxs":
-            singleton_path, _ = create_pairs_with_singletons(singleton_kmers, pair_kmers,
-                                                            output_dir=args.output_dir, basename=basename,
-                                                            self_singletons=True,
-                                                            max_singletons = 100000)
-        if args.pair_mode == "sxp":
-            singleton_path, _ = create_pairs_with_singletons(singleton_kmers, pair_kmers,
-                                                            output_dir=args.output_dir, basename=basename,
-                                                            self_singletons=False,
-                                                            max_singletons = 100000)
-        # Cleaning files
-        pair_parts = sorted(glob.glob(pair_glob))
-        filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.pairs.parquet")
-        if pair_parts:
-            (pl.scan_parquet(pair_parts)          # pass the expanded list, not the glob string
-            .sink_parquet(filtered_path, compression="zstd"))
-        else:
-            #write an empty file so downstream readers still find it
-            pl.DataFrame(schema={"kmerA": pl.Utf8,"kmerB": pl.Utf8,"count": pl.Int64}).write_parquet(filtered_path, compression="zstd")
-        
-        # only delete the parts once the selected file exists and is non-empty
-        if os.path.exists(filtered_path) and os.path.getsize(filtered_path) > 0:
-            parts = glob.glob(pair_glob)
-            for p in parts:
-                os.remove(p)
-            print(f"Wrote {filtered_path} and removed {len(parts)} part files", flush=True)
-        else:
-            print("WARNING: final parquet missing or empty — keeping part files", flush=True)
-        
-        # map and export
-        all_kmers = singleton_kmers | pair_kmers
-        if args.genome:
-            records = load_genome(args.genome)
-            df_locations ,_ = build_mapped_kmers_ahocorasick(records, all_kmers, terminal_dist = args.terminal_dist)
-            df_locations['origin'] = df_locations['#kmer'].apply(lambda x: 'singleton' if x in singleton_kmers else 'pair')
-            df_locations.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'), sep='\t', index=False, compression='gzip')
-        else:
-            pd.DataFrame(sorted(all_kmers), columns=['#kmer']).to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'), sep='\t', index=False, compression='gzip')
-    
-    if args.pair_mode == 'all_pairs':
-        if args.genome:
-            strain = strain_name_from_path(args.genome)
-        basename = args.basename if args.basename else strain
-        os.makedirs(args.output_dir, exist_ok=True)
-
-        # switch to scan csv for memory efficiency
-        df_global_counts = pl.read_csv(args.counts_global, 
-                                       separator= '\t', 
-                                       schema_overrides={'reference_count': pl.UInt32,
-                                                        'pangenome_count': pl.UInt32,
-                                                        'metagenome_count': pl.UInt32,
-                                                        'drug_count': pl.UInt32,}
-                                        )
-        print(df_global_counts)
-        # Create waterfall plot scrub
-        df_gl = (df_global_counts.to_pandas().drop(columns=['reference_count']).set_index('#kmer'))
-        row_sums = df_gl.sum(axis=1)
-        count_hist = (row_sums.value_counts()
-              .sort_index()
-              .rename_axis('total_count')
-              .reset_index(name='n_kmers'))
-        
-        print(count_hist)
-        fig = px.scatter(count_hist,
-                     y = 'n_kmers',
-                     x = 'total_count',
-                     log_y = True,
-                     template = 'simple_white',
-                     range_x  = [-0.1, 5000],
-                     title = f'{basename}')
-        fig.add_hline(y = count_hist.loc[count_hist['total_count']==0]['n_kmers'][0],line_width=3, line_dash="dash", line_color="grey")
-        fig.write_image(os.path.join(args.output_dir, f'{basename}.scrub_counts.svg'))
-
-        # create histogram plot
-        df_hist = pd.read_csv(args.counts_summary, sep='\t')
-        fig = px.histogram(
-            df_hist,
-            x='coverage_pct',
-            log_y = True,
-            color = 'sample_type',
-            histfunc = 'count',
-            template='simple_white',
-            title=f'{basename} — coverage_pct distribution',
-            range_x = [0,1],
-            )
-        fig.add_vline(x=0.96, line_width=3, line_dash="dash", line_color="grey")
-        fig.update_layout(width=800, height=500)
-        fig.write_image(os.path.join(args.output_dir, f'{basename}.histogram_scrub_db.svg'))
-        
-        ## first get rarest kmers
-        total_kmers = len(df_global_counts)
-
-        print(f'Total kmers: {total_kmers}')
-        print('Remove kmers with count >1 from ref genome:')
-        df_global_counts = df_global_counts.filter(pl.col("reference_count") == 1)
-        print(f'Remaining kmers: {len(df_global_counts)}')
-        
-        if "drug_count" in df_global_counts.columns:
-            print('Removing all kmers present in drug scrub:')
-            df_no_drugs = df_global_counts.filter(pl.col("drug_count") == 0)
-        else:
-            print("No drug scrub performed")
-            df_no_drugs = df_global_counts
-        print(f'Remaining kmers: {len(df_no_drugs)}')
-
-        ## get position on genome
-        print(f'Loading genome: {args.genome}')
-        records = load_genome(args.genome)
-        
-
-        #df_rare = df_no_drugs.filter((pl.col('metagenome_count') == 0 ) & (pl.col('pangenome_count') == 0))        
-        percentile = args.percentile_union
-        lowest = df_no_drugs.filter(((pl.col('pangenome_count')  <= pl.col('pangenome_count').quantile(percentile, interpolation="higher"))  &
-                                     (pl.col('metagenome_count') <= pl.col('metagenome_count').quantile(percentile, interpolation="higher"))
-                            ))
-        print(lowest)
-
-        ## select kmers based on overlap
-        all_kmers = set(lowest["#kmer"].to_list())
-        df_locations ,_ = build_mapped_kmers_ahocorasick(records, all_kmers, terminal_dist=args.terminal_dist)
-        print('dropping terminal kmers')
-        df_locations = df_locations.loc[df_locations['terminal_kmer'] == False] 
-
-        print('finding overlapping kmers for kmer selection')
-        dict_overlap = find_overlap_kmer_fast(df_locations, max = 0.6)
-        
-        print('selecting kmers')
-        selected = max_independent_kmers_greedy_heap(dict_overlap=dict_overlap)
-        print(f"Selected pair kmers: {len(selected):,}")
-
-        ## create pairs of all kmers
-        create_all_pairs(selected, 
-                        args.output_dir , 
-                        basename = basename,
-                        #n_workers=args.threads,
-                        max_kmers = 50000)
-
-        # export
-        print(f"Total kmers for strain_detect: {len(selected):,}")
-        df_locations.loc[df_locations['#kmer'].isin(selected)].to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
-                                         sep='\t', index=False)
-    # Standard pair generation 
+    if 'drug_count' in df_global_counts.columns:
+        print('Removing kmers present in drug scrub')
+        df_no_drugs = df_global_counts.filter(pl.col('drug_count') == 0)
     else:
-        
-        strain = strain_name_from_path(args.genome)
-        basename = args.basename if args.basename else strain
-        os.makedirs(args.output_dir, exist_ok=True)
-        
+        print('No drug scrub performed')
+        df_no_drugs = df_global_counts
+    print(f'  remaining: {len(df_no_drugs):,}')
 
-        # switch to scan csv for memory efficiency
-        df_global_counts = pl.read_csv(args.counts_global, 
-                                       separator= '\t', 
-                                       schema_overrides={'reference_count': pl.UInt32,
-                                                        'pangenome_count': pl.UInt32,
-                                                        'metagenome_count': pl.UInt32,
-                                                        'drug_count': pl.UInt32,}
-                                        )
-        print(df_global_counts)
-        # Create waterfall plot scrub
-        df_gl = (df_global_counts.to_pandas().drop(columns=['reference_count']).set_index('#kmer'))
-        row_sums = df_gl.sum(axis=1)
-        count_hist = (row_sums.value_counts()
-              .sort_index()
-              .rename_axis('total_count')
-              .reset_index(name='n_kmers'))
-        
-        print(count_hist)
-        fig = px.scatter(count_hist,
-                     y = 'n_kmers',
-                     x = 'total_count',
-                     log_y = True,
-                     template = 'simple_white',
-                     range_x  = [-0.1, 5000],
-                     title = f'{basename}')
-        fig.add_hline(y = count_hist.loc[count_hist['total_count']==0]['n_kmers'][0],line_width=3, line_dash="dash", line_color="grey")
-        fig.write_image(os.path.join(args.output_dir, f'{basename}.scrub_counts.svg'))
+    is_informative = (pl.col('metagenome_count') == 0) & (pl.col('pangenome_count') == 0)
+    df_inform_singletons = df_no_drugs.filter(is_informative)
+    df_non_inform_singletons = df_no_drugs.filter(~is_informative)
+    print(f'Informative singletons: {len(df_inform_singletons):,} | '
+          f'non-informative: {len(df_non_inform_singletons):,}')
 
-        # create histogram plot
-        df_hist = pd.read_csv(args.counts_summary, sep='\t')
-        fig = px.histogram(
-            df_hist,
-            x='coverage_pct',
-            log_y = True,
-            color = 'sample_type',
-            histfunc = 'count',
-            template='simple_white',
-            title=f'{basename} — coverage_pct distribution',
-            range_x = [0,1],
-            )
-        fig.add_vline(x=0.96, line_width=3, line_dash="dash", line_color="grey")
-        fig.update_layout(width=800, height=500)
-        fig.write_image(os.path.join(args.output_dir, f'{basename}.histogram_scrub_db.svg'))
-        
+    print(f'Loading genome: {args.genome}')
+    records = load_genome(args.genome)
 
-        
-        print(f'Total kmers: {len(df_global_counts)}')
-        print('Remove kmers with count >1 from ref genome:')
-        df_global_counts = df_global_counts.filter(pl.col("reference_count") == 1)
-        print(f'Remaining kmers: {len(df_global_counts)}')
-        
-        if "drug_count" in df_global_counts.columns:
-            print('Removing all kmers present in drug scrub:')
-            df_no_drugs = df_global_counts.filter(pl.col("drug_count") == 0)
-        else:
-            print("No drug scrub performed")
-            df_no_drugs = df_global_counts
-        print(f'Remaining kmers: {len(df_no_drugs)}')
+    # ── singletons: map, reduce to non-overlapping, pair ───────────────
+    singleton_kmers = set(df_inform_singletons['#kmer'].to_list())
+    print(f'Locating unique kmers on genome ({len(singleton_kmers):,})')
+    df_locations_singletons, _ = build_mapped_kmers_ahocorasick(
+        records, singleton_kmers, terminal_dist=args.terminal_dist)
+    print('dropping terminal kmers')
+    df_locations_singletons = df_locations_singletons.loc[
+        df_locations_singletons['terminal_kmer'] == False]
 
-        # you can then just grab the 0 counts here much faster
-        print('Getting all kmers with counts')
+    print('finding overlapping kmers for kmer selection')
+    dict_overlap = find_overlap_kmer_fast(df_locations_singletons, max=args.kmer_overlap)
+    selected = max_independent_kmers_greedy_heap(dict_overlap)
+    print(f'Selected {len(selected):,} kmers from unique at overlap {args.kmer_overlap}')
 
+    # create_all_pairs subsamples internally with an unseeded random.sample, so
+    # cap here instead: the exported kmers must be the ones that got paired.
+    if len(selected) > args.max_kmers:
+        print(f'Capping {len(selected):,} singletons to --max_kmers '
+              f'({args.max_kmers:,})')
+        selected = sorted(random.Random(42).sample(sorted(selected), args.max_kmers))
 
-        print(f'Loading genome: {args.genome}')
-        records = load_genome(args.genome)
-        
+    print('creating pairs of selected kmers')
+    # create_all_pairs joins output_dir with `basename` directly, so this has
+    # to be the full filename including the extension.
+    create_all_pairs(selected,
+                     output_dir=args.output_dir,
+                     basename=f'{basename}.inform_kmer_pairs.singletons.parquet',
+                     batch_size=1_000_000,
+                     max_kmers=args.max_kmers)
 
+    # ── top up from non-informative kmers if the set is thin ───────────
+    pair_kmers = set()
+    if len(selected) < args.max_kmers:
+        print('creating pairs from non informative kmers')
+        print(f'max kmers for generation: {args.max_kmers} *3 ')
+        kmer_pairs_from_presence(
+            args.counts_individual, args.counts_summary,
+            args.output_dir,
+            basename=basename,
+            df_keep=df_non_inform_singletons,
+            presence_t=10,
+            similarity_t=args.similarity_t,
+            n_workers=args.threads,
+            max_for_pairs=args.max_kmers * 3)
 
-
-        df_inform_singletons = df_no_drugs.filter((pl.col('metagenome_count') == 0 ) & (pl.col('pangenome_count') == 0))        
-        # get all non unique singletons
-        df_non_inform_singletons = df_no_drugs.filter(~((pl.col('metagenome_count') == 0) & (pl.col('pangenome_count') == 0)))
-
-        print(df_inform_singletons)
-        print(df_non_inform_singletons)
-
-        # export parquet inform kmers
-        print('Creating pairs from non informative singletons')
-        kmer_pairs_from_presence(args.counts_individual, args.counts_summary, 
-                                 args.output_dir , 
-                                 basename = basename,
-                                 df_keep=df_non_inform_singletons,
-                                 presence_t = args.presence_t, 
-                                 similarity_t=None, 
-                                 n_workers=args.threads,
-                                 max_for_pairs = 100000)
-        
-       
-
-        # pair parts → unique kmers across both columns, computed lazily
-        pair_glob = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.part*.parquet")
-
-        unique_kmers = set()
+        pair_glob = os.path.join(args.output_dir,
+                                 f'{basename}.inform_kmer_pairs.part*.parquet')
         for path in sorted(glob.glob(pair_glob)):
-            # read just one column at a time, dedupe per-part
-            df_part_a = pl.read_parquet(path, columns=['kmerA'])
-            unique_kmers.update(df_part_a.get_column('kmerA').unique().to_list())
-            del df_part_a
-            df_part_b = pl.read_parquet(path, columns=['kmerB'])
-            unique_kmers.update(df_part_b.get_column('kmerB').unique().to_list())
-            del df_part_b
+            for col in ('kmerA', 'kmerB'):
+                pair_kmers.update(
+                    pl.read_parquet(path, columns=[col])
+                      .get_column(col).unique().to_list())
             gc.collect()
+        print(f'Pair kmers: {len(pair_kmers):,}')
+    else:
+        print(f'{len(selected):,} singletons already meet --max_kmers '
+              f'({args.max_kmers:,}); skipping non-informative pairs')
 
-        pair_kmers = unique_kmers
-        print(f"Pair kmers: {len(pair_kmers):,}")
+    finish_pair_workflow(args, basename, records, set(selected),
+                         pair_kmers, df_locations_singletons, df_no_drugs)
 
-        # Add pairs from singletons
-        singleton_kmers = set(df_inform_singletons["#kmer"].to_list())
-        all_kmers = singleton_kmers | pair_kmers
-        
-        # map positions
-        df_locations ,_ = build_mapped_kmers_ahocorasick(records, all_kmers, terminal_dist=args.terminal_dist)
-        print('dropping terminal kmers')
-        df_locations = df_locations.loc[df_locations['terminal_kmer'] == False] 
-
-        print('finding overlapping kmers for kmer selection')
-        dict_overlap = find_overlap_kmer_fast(df_locations, max = 0.6)
-        
-        print('selecting kmers')
-        selected = max_independent_kmers_greedy_heap(dict_overlap=dict_overlap)
-
-        # split selected kmers into two sets
-        selected_pair_kmers = set(selected) & set(pair_kmers)
-        selected_singletons = set(selected) & set(singleton_kmers)
-        print(f"Selected pair kmers: {len(selected_pair_kmers):,}")
-        print(f"Selected singletons: {len(selected_singletons):,}")
-
-        # downselect to random subset if too many rare singletons found
-        max_singletons = 100000
-        if len(selected_singletons) > max_singletons:
-            selected_singletons = set(random.Random(42).sample(sorted(selected_singletons), max_singletons)) 
-            # ensure selection is correct for export
-            selected = list(selected_pair_kmers | selected_singletons)
-
-        #  Export locations
-        df_locations['origin'] = df_locations['#kmer'].apply(lambda x: 'singleton' if x in selected_singletons else 'pair')
-        print(f"Total kmers for strain_detect: {len(selected):,}")
-        df_locations.loc[df_locations['#kmer'].isin(selected)].to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers_mapped.tsv.gz'),
-                                         sep='\t', index=False)
-        
-        
-        # write pairs file, create empty file with correct schema if no pairs exist
-        filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.pairs.parquet")
-        pair_parts = sorted(glob.glob(pair_glob))
-
-        if pair_parts and selected_pair_kmers:
-            sel_pl = pl.Series(sorted(selected_pair_kmers))
-            (
-                pl.scan_parquet(pair_parts, low_memory=True)   # expanded list, not the glob string
-                .filter(pl.col("kmerA").is_in(sel_pl) & pl.col("kmerB").is_in(sel_pl))
-                .sink_parquet(filtered_path, compression="zstd")
-            )
-        else:
-            print("No informative pairs for this strain — writing empty pairs parquet", flush=True)
-            write_empty_pairs(filtered_path)
-
-        #old
-        #filtered_path = os.path.join(args.output_dir, f"{basename}.inform_kmer_pairs.pairs.parquet")
-        #sel_pl = pl.Series(sorted(selected_pair_kmers))
-        #(
-        #    pl.scan_parquet(pair_glob, low_memory=True)
-        #    .filter(pl.col("kmerA").is_in(sel_pl) & pl.col("kmerB").is_in(sel_pl))
-        #    .sink_parquet(filtered_path, compression="zstd")
-        #)
-
-        # only delete the parts once the selected file exists and is non-empty
-        if os.path.exists(filtered_path) and os.path.getsize(filtered_path) > 0:
-            parts = glob.glob(pair_glob)
-            for p in parts:
-                os.remove(p)
-            print(f"Wrote {filtered_path} and removed {len(parts)} part files", flush=True)
-        else:
-            print("WARNING: final parquet missing or empty — keeping part files", flush=True)
-
-        # Create pairs with singletons
-        if args.pair_mode == "sxs":
-            singleton_path, _ = create_pairs_with_singletons(
-                selected_singletons, selected_pair_kmers,
-                output_dir=args.output_dir, basename=basename,
-                self_singletons=True,
-                max_singletons = 100000,
-            )
-            
-        if args.pair_mode == "sxp":
-            singleton_path, _ = create_pairs_with_singletons(
-                selected_singletons, selected_pair_kmers,
-                output_dir=args.output_dir, basename=basename,
-                self_singletons=False,
-                max_singletons = 100000,
-            )
 
 if __name__ == '__main__':
     main()

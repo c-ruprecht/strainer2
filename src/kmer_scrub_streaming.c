@@ -19,16 +19,16 @@ KSEQ_INIT(gzFile, gzread)
 
 #define GLOBAL_COLS 4
 
-/* ── zstd stream writer (used at flush time) ────────────────────────── */
+/* ── zstd stream writer (declared in kmer_scrub_streaming.h) ────────── */
 
-typedef struct {
+struct zstd_out_s {
 	FILE         *fp;
 	ZSTD_CStream *cs;
 	void         *out_buf;
 	size_t        out_cap;
-} zstd_out_t;
+};
 
-static zstd_out_t *zstd_out_open(const char *path, int level)
+zstd_out_t *zstd_out_open(const char *path, int level)
 {
 	zstd_out_t *z = calloc(1, sizeof(*z));
 	if (!z) return NULL;
@@ -50,7 +50,7 @@ static zstd_out_t *zstd_out_open(const char *path, int level)
 	return z;
 }
 
-static int zstd_out_write(zstd_out_t *z, const void *data, size_t len)
+int zstd_out_write(zstd_out_t *z, const void *data, size_t len)
 {
 	ZSTD_inBuffer in = { data, len, 0 };
 	while (in.pos < in.size) {
@@ -64,7 +64,7 @@ static int zstd_out_write(zstd_out_t *z, const void *data, size_t len)
 	return 0;
 }
 
-static int zstd_out_close(zstd_out_t *z)
+int zstd_out_close(zstd_out_t *z)
 {
 	if (!z) return 0;
 	int err = 0;
@@ -794,8 +794,17 @@ static void *worker_main(void *arg)
 			        id, p->sample_type, coverage, p->cov_threshold);
 		}
 
+		/* A sample excluded from the global columns is excluded from the
+		   presence index too, so the two artifacts agree on what counts.
+		   Passing 0 here leaves idxs NULL: the sweep still zeroes the
+		   scratch column, but no bucket indices are collected, nothing is
+		   queued to the writer, and the sample never occupies a slot in
+		   any k-mer's presence list. That last part matters — an excluded
+		   sample that hits everything otherwise burns one of the -P slots
+		   on every k-mer and saturates lists that hold real signal. */
+		unsigned long n_collect = is_in_global ? n_unique : 0;
 		uint32_t *idxs = collect_zero_and_maybe_merge(
-		    p->h, scratch_col, p->global_col, is_in_global, n_unique);
+		    p->h, scratch_col, p->global_col, is_in_global, n_collect);
 
 		if (p->writer) {
 			/* Hand off to writer; writer assigns scrub_id and writes summary. */
@@ -808,8 +817,8 @@ static void *worker_main(void *arg)
 			rec->n_unique_kmers = n_unique;
 			rec->coverage_pct   = coverage;
 			rec->is_in_global   = is_in_global;
-			rec->bucket_indices = idxs;       /* ownership transferred */
-			rec->n_kmers        = (uint32_t)n_unique;
+			rec->bucket_indices = idxs;       /* NULL when excluded */
+			rec->n_kmers        = (uint32_t)n_collect;
 			writer_push_sample(p->writer, rec);
 			/* DO NOT free id or idxs — owned by writer now. */
 		} else {

@@ -259,7 +259,7 @@ def kmer_pairs_from_presence(
     presence_tsv, summary_tsv, output_dir, basename, df_keep,
     presence_t=10, similarity_t=None,
     n_workers=None, write_non_inform=False,
-    testmode = None, max_for_pairs = 20000
+    testmode = None, max_for_pairs = 100000
 ):
     # exclusion list from summary
     if testmode:
@@ -275,22 +275,16 @@ def kmer_pairs_from_presence(
             df_t = df.filter(pl.col('is_in_global') == False)
         
         li_t = df_t.get_column('scrub_id').cast(pl.UInt32).to_list()
+        # is in global needs to be removed but also from 
 
         # read & clean presence
-        df_presence = (
-            pl.scan_csv(presence_tsv, separator='\t')
-            .filter(pl.col('list_scrub_id').str.count_matches(',') <= presence_t - 1) 
-            .with_columns(
-                pl.col('list_scrub_id')
-                    .str.split(',')
-                    .cast(pl.List(pl.UInt32))
-                    .list.set_difference(li_t)
-            )
-            .filter(pl.col('list_scrub_id').list.len() > 0)
-            .collect(engine='streaming')
-        )
+        df_presence = (pl.scan_csv(presence_tsv, separator='\t')
+                        .with_columns(pl.col('list_scrub_id').str.split(',').cast(pl.List(pl.UInt32)).alias('list_scrub_id')) 
+                        .collect(engine='streaming')
+                        .filter(pl.col('list_scrub_id').list.len() <= presence_t ) 
+                        )
+
         print(df_presence)
-        print(f"Presence rows after filtering: {df_presence.shape[0]:,}", flush=True)
         
     if df_keep is not None:
         print('removing all informative singletons from pair generation')
@@ -341,7 +335,7 @@ def create_all_pairs(
     print(f"Combining {n} kmers among themselves "
           f"({n * (n - 1) // 2:,} pairs)", flush=True)
 
-    path = os.path.join(output_dir, f"{basename}.inform_kmer_pairs.all.parquet")
+    path = os.path.join(output_dir, basename)
     writer = pq.ParquetWriter(path, _PAIR_SCHEMA, compression="zstd")
 
     a_col, b_col, c_col = [], [], []
