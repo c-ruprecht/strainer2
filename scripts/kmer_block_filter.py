@@ -115,6 +115,7 @@ def main():
                         help='Output basename (default: derived from --genome)')
     parser.add_argument('--terminal_dist', type=int, default=300,
                         help='Distance from contig ends to flag terminal kmers')
+    parser.add_argument('--min_block_size', type =int, default = 20)
     parser.add_argument('--percentile', type = float, default = 0.01,
                         help = 'percentile union on pan genome and metagenome counts for rare kmer selection')
     args = parser.parse_args()
@@ -145,6 +146,7 @@ def main():
     df_merge = pd.merge(df_locations, df_global.to_pandas(), on = '#kmer', how = 'left')
     print(df_merge)
     df_merge2 = pd.merge(df_merge, df_presence.to_pandas(), on = '#kmer', how = 'left')
+
     # convert scrub ids to actual lists, empty list where pangenome and metagenome_count ==0 else drop na
     print(df_merge2)
     missing = df_merge2['list_scrub_id'].isna()
@@ -161,7 +163,7 @@ def main():
     print(f"dropped {n_capped} k-mers with capped presence lists")
     df_merge2  = df_merge2.loc[df_merge2['terminal_kmer'] == False].copy()
 
-    df, df_gpd = add_block_ids(df_merge2)
+    df, df_gpd = add_block_ids(df_merge2, min_block_size=args.min_block_size)
     df.to_csv(os.path.join(args.output_dir, f"{basename}.rare_kmers.mapped.tsv"),
             sep = '\t', index = None)
 

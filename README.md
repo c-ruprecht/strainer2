@@ -30,6 +30,12 @@ conda env create -f strainer2_environment.yml
 # database 
 - In order to identify strain specific kmers we built and dereplicated a dataset of high quality genomes
 - Space requirements genomes_t98: 181756 files, 227.5 GiB     
+- download dir holds temporary files
+- dest is where database will be built
+- cleanup deletes raw files
+
+python scripts/scrubdb_hf.py pull --repo cruprecht/scrubdb-derep-hq-comp99-cont05 --download-dir /path/to/tmp --dest /path/to/db --cleanup
+
 
 
 ### External libraries and C headers used
