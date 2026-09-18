@@ -18,6 +18,19 @@ If you use Strainer2, please cite:
 ## Installation
 in the source directory is a simple Makefile. 
 
+# make 
+- git pull
+- cd src && make
+
+# create conda environment
+- all packages needed to run python based filtering of kmers
+
+conda env create -f strainer2_environment.yml
+
+# database 
+- In order to identify strain specific kmers we built and dereplicated a dataset of high quality genomes 
+
+
 ### External libraries and C headers used
 * zlib (must be installed on your system, but very likely it is)
 * kseq.h (excellent fasta/fastq parser distributed with this software) [original site]()

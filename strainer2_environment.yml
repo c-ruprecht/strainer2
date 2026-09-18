@@ -26,6 +26,9 @@ dependencies:
   - skani
   - sklearn
   - seaborn
-  #- pip:
-  #  - kaleido
+  - xgboost # probably not needed
+  - huggingface_hub
+  - hf-xet
+  - zstd
+
 
