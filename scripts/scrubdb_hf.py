@@ -438,7 +438,7 @@ def rewrite_reps_tables(man, dl, dest, reps, t98_names):
             if ip is not None and ip < len(r):
                 new_paths.append(r[ip])
         write_tsv(dest / f"representatives_{tier}.tsv", header, rows)
-        if f"representatives_{tier}.list" in man["summaries"]:
+        if (dl / "summaries" / f"representatives_{tier}.list").exists():
             (dest / f"representatives_{tier}.list").write_text("".join(p + "\n" for p in new_paths))
         resolved_by_tier[tier] = [h for h in hits if h]
         log(f"  representatives_{tier}: {len(resolved_by_tier[tier])} paths rewritten"
@@ -454,16 +454,17 @@ def cmd_restore(a):
         die(f"unsupported format_version {man['format_version']} (script expects {FORMAT_VERSION})")
     reps = dest / "representatives"
     rdb_parent = Path(a.rocksdb_dest).resolve() if a.rocksdb_dest else dest
-    src_db = Path(man["source_db_dir"])
-    src_rdb = Path(man["rocksdb"]["source"]) if man["rocksdb"] else None
+    # original build locations are optional; only used to refuse restoring on top of the source
+    src_db = Path(man["source_db_dir"]) if man.get("source_db_dir") else None
+    src_rdb = Path(man["rocksdb"]["source"]) if man["rocksdb"] and man["rocksdb"].get("source") else None
     clash = [p for p in (src_db, src_rdb) if p and (p == dest or p in dest.parents or dest in p.parents)]
     if src_rdb and man["rocksdb"] and (rdb_parent / man["rocksdb"]["name"]) == src_rdb:
         clash.append(src_rdb)
     if clash and not a.allow_overwrite_source:
         die(f"restore target overlaps the original database {clash[0]}; choose another --dest/--rocksdb-dest "
             "(or --allow-overwrite-source if you really mean it)")
-    marks = dl / ".unpacked"
-    marks.mkdir(exist_ok=True)
+    marks = dest / ".restore_state"          # tied to the destination, not the download dir
+    marks.mkdir(parents=True, exist_ok=True)
 
     want_genomes = not a.no_genomes
     want_rocksdb = not a.no_rocksdb and man["rocksdb"]
@@ -539,9 +540,14 @@ def cmd_restore(a):
 
     # --- summaries back to the DB top level (original content)
     dest.mkdir(parents=True, exist_ok=True)
+    n_copied = 0
     for name in man["summaries"]:
+        if not (dl / "summaries" / name).exists():
+            log(f"  summary {name} listed in MANIFEST but not in repo - skipped")
+            continue
         shutil.copy2(dl / "summaries" / name, dest / name)
-    log(f"Restored {len(man['summaries'])} summary files into {dest}")
+        n_copied += 1
+    log(f"Restored {n_copied} summary files into {dest}")
 
     # --- representatives tables: rewrite genome_path to the restored location
     t98_names = [r[0] for r in read_table(dl / "manifest" / "genomes_t98.tsv")[1]]

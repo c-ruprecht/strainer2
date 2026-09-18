@@ -28,7 +28,8 @@ in the source directory is a simple Makefile.
 conda env create -f strainer2_environment.yml
 
 # database 
-- In order to identify strain specific kmers we built and dereplicated a dataset of high quality genomes 
+- In order to identify strain specific kmers we built and dereplicated a dataset of high quality genomes
+- Space requirements genomes_t98: 181756 files, 227.5 GiB     
 
 
 ### External libraries and C headers used
