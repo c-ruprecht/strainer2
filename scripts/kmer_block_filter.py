@@ -212,7 +212,7 @@ def main():
                         help='percentile union on pan genome and metagenome counts for rare kmer selection')
     parser.add_argument('--lineage_db', type=str, required=True,
                         help='path to .parquet lineage file in db')
-    parser.add_argument('--lineage_metric', choices=['n_hits', 'frac_lineage_hit'], default='n_hits', help='score used to pick the lineage call')
+    parser.add_argument('--lineage_metric', choices=['n_hits', 'frac_lineage_hit'], default='frac_lineage_hit', help='score used to pick the lineage call')
     parser.add_argument('--no_map_lineage', action='store_true',
                         help='skip mapping lineage kmers to the reference (positions left NA)')
     args = parser.parse_args()
