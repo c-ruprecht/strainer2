@@ -16,9 +16,9 @@ def read_kmer_hits(path_to_kmer_hits, path_to_genome_map):
     df_locations = pd.read_csv(path_to_genome_map, sep = '\t')
 
     df_merge = pd.merge(df_kmer_hits, df_locations, on = ['#kmer'], how = 'left')
-    df_merge = df_merge.set_index(df_locations.columns.to_list()).stack()
-    df_merge = df_merge.reset_index()
-    df_merge = df_merge.rename(columns={'level_9': 'sample', 0: 'count'})
+    df_merge = df_merge.set_index(df_locations.columns.to_list())
+    df_merge.columns.name = 'sample'   # name the stacked level; don't rely on 'level_N'
+    df_merge = df_merge.stack().rename('count').reset_index()
     df_merge['strain'] = str(path_to_genome_map).split('/')[-1].split('.rare_kmers_mapped.')[0]
     return df_merge, dict_total_reads
 

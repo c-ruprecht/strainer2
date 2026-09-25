@@ -4,6 +4,24 @@ import argparse
 import sys
 import gzip
 import re
+import io
+import subprocess
+
+
+def open_counts(path):
+    """Open a kmer_scrub_count(_individual) table as text.
+    Handles .zst (global_counts.tsv.zst), .gz, and plain text."""
+    if path.endswith('.zst'):
+        try:
+            import zstandard
+            fh = open(path, 'rb')
+            return io.TextIOWrapper(zstandard.ZstdDecompressor().stream_reader(fh), encoding='utf-8')
+        except ImportError:
+            proc = subprocess.Popen(['zstd', '-dc', path], stdout=subprocess.PIPE, text=True)
+            return proc.stdout
+    if path.endswith('.gz'):
+        return gzip.open(path, 'rt')
+    return open(path)
 
 parser = argparse.ArgumentParser(description = "\
 DESCRIPTION: Script will take as input the output from the program kmer_scrub_count \n\
@@ -140,7 +158,7 @@ def joint_scrub(min_fraction, pangenome_hash, metagenome_hash, strain_hash, all_
 
 def main():
     if args.min_fraction < 0.0 or args.min_fraction > 1.0:
-        sys.stderr.write("error --min_fraction (-m) must be between 0.0 and 1.0 (" + args.min_fraction +  ")\n")
+        sys.stderr.write("error --min_fraction (-m) must be between 0.0 and 1.0 (" + str(args.min_fraction) + ")\n")
     if not args.scrub_count_file and not args.scrub_count_list:
         sys.stderr.write("error: one of scrub_count_file or scrub_count_list must be provided.")
     if args.scrub_count_file and args.scrub_count_list:
@@ -165,13 +183,13 @@ def main():
         # strain_hash and all_kmers should be the same across all files being
         # combined and should not be added up across files
 
-        if i > 1:
+        if i > 0:
             previous_strain_hash = strain_hash
 
         strain_hash = {} # reset to 0
         all_kmers = 0 # reset to 0
 
-        with gzip.open(file, 'rt') as reader:
+        with open_counts(file) as reader:
             for line in reader:
                 if(not line.startswith('#')): # use # at the beginning to have comments and things
                     content = line.rstrip('\n').split('\t')
@@ -192,11 +210,11 @@ def main():
                         drug_filter = 1
                         content[4] = int(content[4])        
                         if (content[4] > 0):
-                            drug_genome_hash[key] = drug_genome_hash.get(key, 0) + content[3]
+                            drug_genome_hash[key] = drug_genome_hash.get(key, 0) + content[4]
                     #strain_hash[key] = content[1]
                     #print("A:" + content[0] + " B:" + content[1] + " C:" + content[2])
 
-        if i > 1:
+        if i > 0:
             if strain_hash != previous_strain_hash:
                 sys.exit("error: input files do not have identical hash and strain hash values.")
 
