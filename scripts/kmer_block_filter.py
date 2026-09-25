@@ -328,8 +328,9 @@ def main():
 
     df_out = restore_int_cols(df_out)
     print(df_out['kmer_type'].value_counts())
-    df_out.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers.mapped.tsv'),
-                  sep='\t', index=None, na_rep='NA')
+    df_out.to_csv(os.path.join(args.output_dir, f'{basename}.rare_kmers.mapped.tsv.gz'),
+              sep='\t', index=None, na_rep='NA',
+              compression={'method': 'gzip', 'compresslevel': 6})
 
     df_gpd = restore_int_cols(df_gpd)
     df_gpd = df_gpd[['block_id', 'kmer_type', 'block_size'] +
