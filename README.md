@@ -61,8 +61,60 @@ There are a two python files in the scripts directory that are also needed.
 
 Note that the software examples and applications are currently set up for differentiating human gut strains in the human gut metagenome. The main ideas should apply to other body sites, but the learning of informative kmers would require metagenomes and genomes from the target sites.
 
-## genome compare
+# Little Helpers
+## genome_compare
+
+## genome_compare_presence
+
 ./genome_compare_presence -B /Volumes/metrica/scratch/derep_animalis_kmer_high_qual-comp99-cont05/kmer_primary/cl_Bifidobacterium_animalis__95b681/genomes -k 51 -o /Volumes/metrica/scratch/animalisk51
+
+## tax_genome.py
+
+Assigns a scrub-DB lineage (and its GTDB taxonomy) to one or more strain genomes.
+
+```bash
+python scripts/tax_genome.py \
+    --genome_dir /path/to/genomes \
+    --lineage_db /path/to/lineage_kmer_blocks.parquet \
+    --output /path/to/outdir \
+    --threads 16
+```
+
+Input is one of `--genome`, `--genome_dir` or `--genome_list` (one path per
+line); FASTA may be gzipped. `--output` takes a TSV path or a directory, in
+which case it writes `lineage_calls.tsv` there.
+
+### Output
+One row per genome:
+
+| Column | Meaning |
+|---|---|
+| `genome` | genome file name without its extension |
+| `lineage_id` | best-scoring lineage, or `not_found` |
+| `gtdb_tax` | that lineage's GTDB taxonomy, or `not_found` |
+| `n_labels` | distinct GTDB labels among the lineage's representatives |
+| `lineage_purity` | share of representatives carrying the label the lineage is named after |
+| `other_labels` | the other labels with their counts, trimmed to the part where the names disagree |
+| `n_hits` | query k-mers found in that lineage |
+| `n_lineage_kmers` | k-mers the lineage has in the database |
+| `frac_lineage_hit` | `n_hits / n_lineage_kmers` |
+
+`lineage_purity` near 1 means the lineage is one species and the call names it.
+Low purity means the lineage is a complex and the call means "something in this
+group"; `other_labels` says what else is in it. For example
+`Collinsella_aerofaciens_M` has 93 labels at purity 0.06, so it is a
+*Collinsella* complex rather than that species.
+
+`not_found` means no query k-mer hit any lineage. This usually reflects how the
+database was built rather than a problem with the genome: a lineage only exists
+where the dereplicated set holds enough related genomes to define one. For
+example *Streptococcus sanguinis_A* has only 3 representatives, which split too
+unevenly to form a lineage, so it contributes no k-mers and any *S. sanguinis_A*
+genome comes back `not_found`. `n_hits` is 0 and the two lineage columns stay
+empty.
+
+A runner-up scoring above half the best triggers an ambiguity warning in the
+log; the TSV keeps only the best call.
 
 ## Description of programs and order of execution
 

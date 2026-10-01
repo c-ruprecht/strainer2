@@ -30,5 +30,6 @@ dependencies:
   - huggingface_hub
   - hf-xet
   - zstd
+  - zstandard
 
 

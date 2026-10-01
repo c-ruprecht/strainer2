@@ -7,6 +7,7 @@ import pandas as pd
 import ahocorasick
 from Bio import SeqIO
 from Bio.Seq import Seq
+from tax_genome import call_lineage, get_lineage_kmers
 
 
 LINEAGE_COL = 'lineage_id'
@@ -125,74 +126,6 @@ def parse_presence(s):
     return [int(x) for x in str(s).split(',')] if pd.notna(s) else []
 
 
-# --------------------------------------------------------------------------- #
-# Lineage call
-# --------------------------------------------------------------------------- #
-
-def call_lineage(query_kmers, lineage_db, lineage_col=LINEAGE_COL, tax_col=TAX_COL,
-                 metric='n_hits', top_n=5):
-    """Group lineage-DB hits of the query kmers by lineage and pick the best one.
-
-    query_kmers : pl.DataFrame with a single '#kmer' column (unique)
-    Returns (lineage_call, gtdb_tax, df_calls) where df_calls holds the per-lineage
-    scores for every lineage with >= 1 hit.
-    """
-    lf = pl.scan_parquet(lineage_db)
-    cols = lf.collect_schema().names()
-    missing = {'#kmer', lineage_col, tax_col} - set(cols)
-    if missing:
-        raise ValueError(f"lineage_db missing columns {sorted(missing)}, found: {cols}")
-
-    tax_expr = pl.col(tax_col).first().alias('gtdb_tax')
-
-    # hits per lineage among the query kmers
-    df_hits = (lf.join(query_kmers.lazy(), on='#kmer', how='semi')
-                 .group_by(lineage_col)
-                 .agg(pl.len().alias('n_hits'), tax_expr)
-                 .collect(engine='streaming'))
-
-    if df_hits.height == 0:
-        print('WARNING: no query kmers found in lineage_db — no lineage call')
-        return None, None, df_hits
-
-    # total kmers per hit lineage -> fraction of the lineage recovered
-    df_tot = (lf.join(df_hits.lazy().select(lineage_col), on=lineage_col, how='semi')
-                .group_by(lineage_col)
-                .agg(pl.len().alias('n_lineage_kmers'))
-                .collect(engine='streaming'))
-
-    n_query = query_kmers.height
-    df_calls = (df_hits.join(df_tot, on=lineage_col, how='left')
-                .with_columns(
-                    (pl.col('n_hits') / pl.col('n_lineage_kmers')).alias('frac_lineage_hit'),
-                    (pl.col('n_hits') / n_query).alias('frac_query_hit'))
-                .sort([metric, 'n_hits'], descending=True))
-
-    print(f'Lineage hits (top {top_n} of {df_calls.height}):')
-    print(df_calls.head(top_n))
-
-    best = df_calls.row(0, named=True)
-    if df_calls.height > 1:
-        second = df_calls.row(1, named=True)
-        ratio = second[metric] / best[metric] if best[metric] else float('nan')
-        if ratio > 0.5:
-            print(f"WARNING: ambiguous lineage call — runner-up {second[lineage_col]} "
-                  f"scores {ratio:.2f}x of best")
-
-    print(f"Lineage call: {best[lineage_col]}  ({best['n_hits']} hits, "
-          f"{best['frac_lineage_hit']:.3f} of lineage kmers)")
-    print(f"GTDB tax:     {best['gtdb_tax']}")
-    return best[lineage_col], best['gtdb_tax'], df_calls
-
-
-def get_lineage_kmers(lineage_db, lineage, lineage_col=LINEAGE_COL):
-    """All unique kmers of the called lineage with their DB block id and block size."""
-    return (pl.scan_parquet(lineage_db)
-              .filter(pl.col(lineage_col) == lineage)
-              .select('#kmer', 'kmer_block_id', 'block_n_kmers')
-              .sort('kmer_block_id')
-              .unique(subset='#kmer', keep='first', maintain_order=True)
-              .collect(engine='streaming'))
 
 
 def main():
