@@ -85,6 +85,7 @@ line); FASTA may be gzipped. `--output` takes a TSV path or a directory, in
 which case it writes `lineage_calls.tsv` there.
 
 ### Output
+
 One row per genome:
 
 | Column | Meaning |
@@ -92,18 +93,19 @@ One row per genome:
 | `genome` | genome file name without its extension |
 | `lineage_id` | best-scoring lineage, or `not_found` |
 | `gtdb_tax` | that lineage's GTDB taxonomy, or `not_found` |
-| `n_labels` | distinct GTDB labels among the lineage's representatives |
-| `lineage_purity` | share of representatives carrying the label the lineage is named after |
-| `other_labels` | the other labels with their counts, trimmed to the part where the names disagree |
+| `frac_lineage_hit` | `n_hits / n_lineage_kmers` |
 | `n_hits` | query k-mers found in that lineage |
 | `n_lineage_kmers` | k-mers the lineage has in the database |
-| `frac_lineage_hit` | `n_hits / n_lineage_kmers` |
+| `lineage_purity` | dominance of the lineage's most common GTDB label: `max(label counts) / sum(label counts)` |
+| `n_labels` | distinct GTDB labels among the lineage's representatives |
+| `other_labels` | the other labels with their counts, trimmed to the part where the names disagree |
 
 `lineage_purity` near 1 means the lineage is one species and the call names it.
-Low purity means the lineage is a complex and the call means "something in this
-group"; `other_labels` says what else is in it. For example
-`Collinsella_aerofaciens_M` has 93 labels at purity 0.06, so it is a
-*Collinsella* complex rather than that species.
+Low purity means no label dominates, so the call means "something in this
+group"; `other_labels` says what else is in it.
+
+For example `Collinsella_aerofaciens_M` has 142 representatives over 93 labels
+at purity 0.06, so it is a *Collinsella* complex rather than that species.
 
 `not_found` means no query k-mer hit any lineage. This usually reflects how the
 database was built rather than a problem with the genome: a lineage only exists

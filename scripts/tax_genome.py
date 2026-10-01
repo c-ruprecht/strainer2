@@ -12,6 +12,7 @@ import polars as pl
 
 LINEAGE_COL = 'lineage_id'
 TAX_COL = 'gtdb_taxonomy'
+DEFAULT_SKETCH_SCALE = 100
 
 # Mirrors COMPLEMENT[] in BIO_sequence.c (incl. its K -> '.' quirk)
 _COMP = str.maketrans('ACGTRYMKSWBVDHN', 'TGCAYRK.SWVBHDN')
@@ -139,7 +140,8 @@ def sketch_path_for(lineage_db, sketch_scale):
     return f'{base}.fmh{sketch_scale}.parquet'
 
 
-def build_sketch(lineage_db, out_path, sketch_scale=1000, lineage_col=LINEAGE_COL):
+def build_sketch(lineage_db, out_path, sketch_scale=DEFAULT_SKETCH_SCALE,
+                 lineage_col=LINEAGE_COL):
     """One-off FracMinHash sketch: keep every kmer whose hash is in the lowest
     1/sketch_scale of the hash space. That is a plain row filter, so it streams
     through the DB in constant memory; only the ~1/sketch_scale survivors are
@@ -149,7 +151,10 @@ def build_sketch(lineage_db, out_path, sketch_scale=1000, lineage_col=LINEAGE_CO
     poly-A rich. The hash is only used here; the query side just checks
     membership, so hash stability across polars versions doesn't matter."""
     print(f'building lineage sketch -> {out_path} (one-off)')
-    tmp = out_path + '.tmp'
+    # pid in the temp names and a rename at the end: several jobs may reach this
+    # at once, and a half-written sketch must never appear under out_path
+    tmp = f'{out_path}.{os.getpid()}.raw'
+    part = f'{out_path}.{os.getpid()}.part'
     threshold = (2 ** 64) // sketch_scale
     (pl.scan_parquet(lineage_db)
        .select('#kmer', lineage_col)
@@ -159,8 +164,22 @@ def build_sketch(lineage_db, out_path, sketch_scale=1000, lineage_col=LINEAGE_CO
        .unique()
        .with_columns(pl.len().over(lineage_col).alias('n_sketch'))
        .collect()
-       .write_parquet(out_path))
+       .write_parquet(part))
+    os.replace(part, out_path)
     os.remove(tmp)
+
+
+def ensure_sketch(lineage_db, sketch_scale=DEFAULT_SKETCH_SCALE):
+    """Path to the prefilter sketch for this DB, building it if it is missing or
+    older than the DB (a stale sketch would prefilter against lineages that no
+    longer exist). Call it before starting workers, not inside them."""
+    path = sketch_path_for(lineage_db, sketch_scale)
+    if not os.path.exists(path):
+        build_sketch(lineage_db, path, sketch_scale)
+    elif os.path.getmtime(path) < os.path.getmtime(lineage_db):
+        print(f'sketch {path} is older than the lineage_db — rebuilding')
+        build_sketch(lineage_db, path, sketch_scale)
+    return path
 
 
 def candidate_lineages(query_kmers, sketch_path, top_k=5, min_ratio=0.2,
@@ -274,7 +293,7 @@ def main():
     parser.add_argument('--threads', type=int, default=4, help='genomes processed in parallel')
     parser.add_argument('--output', default='lineage_calls.tsv',
                         help='output TSV, or a directory (writes lineage_calls.tsv in it)')
-    parser.add_argument('--sketch_scale', type=int, default=1000,
+    parser.add_argument('--sketch_scale', type=int, default=DEFAULT_SKETCH_SCALE,
                         help='prefilter sketch keeps ~1 in N lineage kmers')
     parser.add_argument('--top_k', type=int, default=5,
                         help='candidate lineages scored exactly after the prefilter')
@@ -286,17 +305,9 @@ def main():
     if os.path.isdir(output):
         output = os.path.join(output, 'lineage_calls.tsv')
 
-    sketch_path = None
-    if not args.no_sketch:
-        # built here, before the workers start. A sketch older than the DB is
-        # from a previous build and would prefilter against lineages that no
-        # longer exist, so it is rebuilt rather than reused.
-        sketch_path = sketch_path_for(args.lineage_db, args.sketch_scale)
-        if not os.path.exists(sketch_path):
-            build_sketch(args.lineage_db, sketch_path, args.sketch_scale)
-        elif os.path.getmtime(sketch_path) < os.path.getmtime(args.lineage_db):
-            print(f'sketch {sketch_path} is older than the lineage_db — rebuilding')
-            build_sketch(args.lineage_db, sketch_path, args.sketch_scale)
+    # built here, before the workers start
+    sketch_path = None if args.no_sketch else ensure_sketch(args.lineage_db,
+                                                            args.sketch_scale)
 
     genomes = collect_genomes(args)
     n_workers = max(1, min(args.threads, len(genomes)))
@@ -317,8 +328,10 @@ def main():
             rows.append(row)
             print(f'[{i}/{len(genomes)}] {row["genome"]}: {row[LINEAGE_COL]}')
 
-    front = ['genome', LINEAGE_COL, 'gtdb_tax', 'n_labels', 'lineage_purity',
-             'other_labels']
+    # call first, then how good the hit is, then what the lineage is made of
+    front = ['genome', LINEAGE_COL, 'gtdb_tax',
+             'frac_lineage_hit', 'n_hits', 'n_lineage_kmers',
+             'lineage_purity', 'n_labels', 'other_labels']
     df = pl.DataFrame(rows, infer_schema_length=None)
     df = df.select([c for c in front if c in df.columns] +
                    [c for c in df.columns if c not in front])

@@ -7,11 +7,9 @@ import pandas as pd
 import ahocorasick
 from Bio import SeqIO
 from Bio.Seq import Seq
-from tax_genome import call_lineage, get_lineage_kmers
-
-
-LINEAGE_COL = 'lineage_id'
-TAX_COL = 'gtdb_taxonomy'
+from tax_genome import (DEFAULT_SKETCH_SCALE, LINEAGE_COL, TAX_COL, call_lineage,
+                        candidate_lineages, ensure_sketch, get_lineage_kmers,
+                        strain_name_from_path)
 
 
 def load_genome(genome_path):
@@ -21,14 +19,6 @@ def load_genome(genome_path):
         for record in SeqIO.parse(fh, 'fasta'):
             records[record.id] = record.seq
     return records
-
-
-def strain_name_from_path(path):
-    base = os.path.basename(path)
-    for ext in ('.fna.gz', '.fasta.gz', '.fa.gz', '.fna', '.fasta', '.fa'):
-        if base.endswith(ext):
-            return base[: -len(ext)]
-    return base.split('.')[0]
 
 
 def get_lowest_percentile(df, percentile=0.05, drug_scrub='percentile'):
@@ -126,8 +116,6 @@ def parse_presence(s):
     return [int(x) for x in str(s).split(',')] if pd.notna(s) else []
 
 
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='Select strain-informative kmers, add lineage kmers, build kmer blocks.')
@@ -146,6 +134,10 @@ def main():
     parser.add_argument('--lineage_db', type=str, required=True,
                         help='path to .parquet lineage file in db')
     parser.add_argument('--lineage_metric', choices=['n_hits', 'frac_lineage_hit'], default='frac_lineage_hit', help='score used to pick the lineage call')
+    parser.add_argument('--sketch_scale', type=int, default=DEFAULT_SKETCH_SCALE,
+                        help='prefilter sketch keeps ~1 in N lineage kmers')
+    parser.add_argument('--no_sketch', action='store_true',
+                        help='skip the prefilter and score every lineage exactly')
     parser.add_argument('--no_map_lineage', action='store_true',
                         help='skip mapping lineage kmers to the reference (positions left NA)')
     args = parser.parse_args()
@@ -162,9 +154,16 @@ def main():
                               separator='\t')
 
     # ---- lineage call on all kmers of the strain ----
+    # sketch prefilter: shortlist candidate lineages, then score only those
+    # exactly, so the full DB is not scanned per strain. Built on first use and
+    # rebuilt when older than the DB; shared with tax_genome.py.
     query_kmers = df_global.select('#kmer').unique()
+    cands = None
+    if not args.no_sketch:
+        sketch_path = ensure_sketch(args.lineage_db, args.sketch_scale)
+        cands = candidate_lineages(query_kmers, sketch_path) or None
     lineage_call, gtdb_tax, df_calls = call_lineage(
-        query_kmers, args.lineage_db, metric=args.lineage_metric)
+        query_kmers, args.lineage_db, metric=args.lineage_metric, lineages=cands)
     df_calls.write_csv(os.path.join(args.output_dir, f'{basename}.lineage_call.tsv'),
                        separator='\t')
 

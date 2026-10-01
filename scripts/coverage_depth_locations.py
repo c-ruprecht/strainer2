@@ -93,15 +93,5 @@ def main():
     #visualize_count_map(df_hits_stack, df_cov_depth, outdir = output_dir, min_coverage=0.1)
 
 
-    fig = px.scatter(df_cov_depth,
-                    x='count_mean',
-                    y = 'coverage',
-                    log_x= True,
-                    template= 'simple_white',
-                    hover_data = ['sample'],
-                    width =600)
-    #fig.show()
-    fig.write_image(output_dir + f'/coverage-depth.svg')
-
 if __name__ == '__main__':
     main()
