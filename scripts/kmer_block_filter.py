@@ -134,6 +134,9 @@ def main():
     parser.add_argument('--lineage_db', type=str, required=True,
                         help='path to .parquet lineage file in db')
     parser.add_argument('--lineage_metric', choices=['n_hits', 'frac_lineage_hit'], default='frac_lineage_hit', help='score used to pick the lineage call')
+    parser.add_argument('--min_lineage_cov', type=float, default=0.75,
+                        help='only accept the lineage call (add its kmers, purge shared rare kmers) '
+                             'if more than this fraction of its core kmers are present in the strain')
     parser.add_argument('--sketch_scale', type=int, default=DEFAULT_SKETCH_SCALE,
                         help='prefilter sketch keeps ~1 in N lineage kmers')
     parser.add_argument('--no_sketch', action='store_true',
@@ -171,16 +174,30 @@ def main():
     df_global_pd = df_global.to_pandas()
     df_presence_pd = df_presence.to_pandas()
 
-    # lineage kmers fetched up front: needed to purge non-strain-specific targets
+    # lineage kmers fetched up front: needed to purge non-strain-specific targets.
+    # Gate on coverage: a weak call is treated as no call -> no lineage kmers added,
+    # no lineage purge, lineage_call / gtdb_tax written as NA.
+    empty_lin = pd.DataFrame(columns=['#kmer', 'kmer_block_id', 'block_n_kmers'])
     if lineage_call is not None:
         df_lin_kmers = get_lineage_kmers(args.lineage_db, lineage_call).to_pandas()
+        n_lin = len(df_lin_kmers)
+        n_cov = int(df_lin_kmers['#kmer'].isin(df_global_pd['#kmer']).sum())
+        lin_cov = n_cov / n_lin if n_lin else 0.0
+        print(f'Lineage {lineage_call}: {n_cov} / {n_lin} core kmers covered ({lin_cov:.1%})')
+        if lin_cov <= args.min_lineage_cov:
+            print(f'Lineage coverage <= {args.min_lineage_cov:.0%}: weak call, '
+                  f'treating as no call (no lineage kmers added, no lineage purge)')
+            lineage_call, gtdb_tax = None, None
+            df_lin_kmers = empty_lin
     else:
-        df_lin_kmers = pd.DataFrame(columns=['#kmer', 'kmer_block_id', 'block_n_kmers'])
+        print('No lineage call: no lineage kmers added, no lineage purge')
+        df_lin_kmers = empty_lin
 
     df_rare = get_lowest_percentile(df_global_pd, percentile=args.percentile, drug_scrub='count_hard')
 
     # rare kmers shared with the lineage are by definition not strain specific -> drop.
     # Done before mapping/blocking so blocks only span strain-specific kmers.
+    # No-op when there is no (accepted) lineage call.
     in_lineage = df_rare['#kmer'].isin(df_lin_kmers['#kmer'])
     print(f'dropped {int(in_lineage.sum())} / {len(df_rare)} rare kmers shared with lineage')
     df_rare = df_rare[~in_lineage].copy()
