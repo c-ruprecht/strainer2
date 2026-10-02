@@ -53,13 +53,80 @@ and it should generate the executables: kmer_scrub_count, strain_detect, and (no
 There are a two python files in the scripts directory that are also needed.
 
 
-## Overview of the algorithm
+# Overview of the algorithm
+## Step 1/: scrubbing kmers
+
 1. for all kmers in a strain, count how often each kmer occurs in a large set of genomes and metagenomes where the strain is not expected (i.e., unrelated individuals)
 2. use the kmer counts from above to keep only the rare kmers and remove the other kmers. the more you scrub the lower the sensitivity and higher the precision. The default (empirically determined) is to keep 1% of the kmers
 3. take the scrubbed kmer set and track the kmers in the metagenomes
 4. determine if a strain is present or absent based on the frequency of the rare kmers in the metagenome
 
 Note that the software examples and applications are currently set up for differentiating human gut strains in the human gut metagenome. The main ideas should apply to other body sites, but the learning of informative kmers would require metagenomes and genomes from the target sites.
+
+## Step 2/ Filtering kmers
+
+
+## Step 3/ Strain detection (`kmer_strain_detect`)
+
+Counts how often each kmer in a query set occurs in each sample (reads or metagenomes).
+
+```bash
+kmer_strain_detect -k kmers.tsv.gz -B sample_sheet.tsv -o out.kmer_hits.tsv.gz [-G background.tsv] [-j 8]
+```
+
+| Flag | Meaning |
+|------|---------|
+| `-k` | Kmer TSV (plain or gzipped) with a `#kmer` column. k is taken from the first kmer's length. |
+| `-B` | Sample sheet of samples to scan (see below). **File paths must be complete.** |
+| `-G` | Optional background sample sheet, same format. Output columns are prefixed `b_`. |
+| `-o` | Output file. |
+| `-j` | Threads, one sample per thread (default 4). |
+
+**Output:** gzipped TSV with one row per kmer, in input order, and one column per sample. Cells are occurrence counts (both orientations are counted). The last row, `total_evaluated`, is the number of kmer positions scanned per sample, for normalising.
+
+### Sample sheet
+
+Tab-separated. A header line is optional.
+
+> **Paths must be complete.** `kmer_strain_detect` opens each file exactly as written. It does not search any directories, so bare filenames fail. Use absolute paths. Relative paths are resolved from the directory you run the tool in.
+> When running through the Snakemake workflow, bare filenames in your sheet are resolved against the `metagenomes` directories in the `locations` file, and the completed sheet (header and all other columns kept) is what gets passed to `-B`.
+
+**With a header** (columns found by name, any order, case-insensitive):
+
+| Column | Required | Notes |
+|--------|----------|-------|
+| `sequencing_type` (or `type`) | yes | `PE`, `SE`, or `PEI` (interleaved) |
+| `seq_file` | yes* | Full path; for PE, the two mates separated by a comma |
+| `file1`, `file2` | yes* | Alternative to `seq_file` |
+| `sample_name` | no | Used as-is for the output column name. Empty cell means automatic name. |
+
+\* Use either `seq_file` or `file1`/`file2`. Other columns (`sample_id`, `isolates_to_track`, ...) are ignored by this tool.
+
+```tsv
+sample_id	isolates_to_track	seq_file	sequencing_type	sample_name
+1001099B	15	/data/reads/1001099B_150804_B6_s09_PE1.fasta.gz,/data/reads/1001099B_150804_B6_s09_PE2.fasta.gz	PE	1001099B
+DK-D32-3524	31	/data/reads/DK-D32-3524-250106-H3_R1_001.fastq.gz,/data/reads/DK-D32-3524-250106-H3_R2_001.fastq.gz	PE	DK-D32-3524
+```
+
+**Without a header:** `type<TAB>file1[<TAB>file2]` per line, again with complete paths. Lines starting with `#` are comments.
+
+### Sample naming
+
+If `sample_name` is not given, the name is derived from the file names (directories are ignored):
+
+- **PE:** keep the common prefix of the two mates' names (extensions removed), then drop trailing connectors (`_ - . :`) and a trailing read tag (`R`, `PE`, `read`).
+  `1001099B_150804_B6_s09_PE1/2.fasta.gz` gives `1001099B_150804_B6_s09`, and `DK-D32-3524-250106-H3_R1_001/R2_001.fastq.gz` gives `DK-D32-3524-250106-H3`.
+- **SE / PEI:** the file name with only the extension removed (`.fastq.gz`, `.fasta.gz`, `.fa.gz`, `.fq.gz`, `.fastq`, `.fasta`, `.fa`, `.fq`).
+
+If the mates share no prefix, the name falls back to the first file's name.
+
+### Genome variant (`kmer_strain_detect_genome`)
+
+Same kmer counting, but `-B` is a plain list of genome FASTA paths (one per line, `.fna`/`.fasta`, optionally `.gz`; complete paths here too). Columns are named after the file names, and there is no PE handling.
+
+## Step 4/ Coverage of rare kmers
+
+## Step 5/5 Hit calling
 
 # Little Helpers
 ## genome_compare

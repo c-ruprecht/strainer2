@@ -13,6 +13,7 @@ import polars as pl
 LINEAGE_COL = 'lineage_id'
 TAX_COL = 'gtdb_taxonomy'
 DEFAULT_SKETCH_SCALE = 100
+DEFAULT_MIN_FRAC_LINEAGE = 0.7
 
 # Mirrors COMPLEMENT[] in BIO_sequence.c (incl. its K -> '.' quirk)
 _COMP = str.maketrans('ACGTRYMKSWBVDHN', 'TGCAYRK.SWVBHDN')
@@ -249,16 +250,31 @@ def minor_labels(members, top_n=3):
     return ','.join(out)
 
 
-def summarise(name, df_calls):
-    """One row per genome: best call and its scores. No hit anywhere in the DB
-    is a result, not a gap: lineage_id/gtdb_tax say not_found and n_hits is 0.
-    n_lineage_kmers and frac_lineage_hit stay empty, since without a lineage
-    there is nothing to count against."""
+CALL_TRUE = 'true'
+CALL_LOW = 'too_low_coverage'
+CALL_AMBIGUOUS = 'ambiguous'
+AMBIGUOUS_RATIO = 0.5  # same cutoff as the warning in call_lineage
+
+
+def summarise(name, df_calls, min_frac_lineage=0.0, metric='frac_lineage_hit'):
+    """One row per genome: best lineage and its scores, plus lineage_call:
+      true              best lineage has frac_lineage_hit > min_frac_lineage
+      too_low_coverage  best lineage found, but covered below the threshold
+                        (lineage/scores are still reported)
+      not_found         no hit anywhere in the DB: lineage_id/gtdb_tax say
+                        not_found and n_hits is 0. n_lineage_kmers and
+                        frac_lineage_hit stay empty, since without a lineage
+                        there is nothing to count against.
+    ';ambiguous' is appended (e.g. 'true;ambiguous') when the runner-up scores
+    more than AMBIGUOUS_RATIO of the best on `metric`. The runner-up_* columns
+    describe the second-best lineage whether or not it is ambiguous."""
     if df_calls is None or df_calls.height == 0:
         return {'genome': name, LINEAGE_COL: NOT_FOUND, 'gtdb_tax': NOT_FOUND,
-                'n_hits': 0}
+                'lineage_call': NOT_FOUND, 'n_hits': 0}
     best = df_calls.row(0, named=True)
+    call = CALL_TRUE if best['frac_lineage_hit'] > min_frac_lineage else CALL_LOW
     row = {'genome': name, LINEAGE_COL: best[LINEAGE_COL], 'gtdb_tax': best['gtdb_tax'],
+           'lineage_call': call,
            'n_hits': best['n_hits'], 'n_lineage_kmers': best['n_lineage_kmers'],
            'frac_lineage_hit': best['frac_lineage_hit']}
     for c in ('n_labels', 'lineage_purity'):
@@ -266,10 +282,22 @@ def summarise(name, df_calls):
             row[c] = best[c]
     if 'lineage_members' in best:
         row['other_labels'] = minor_labels(best['lineage_members'])
+
+    if df_calls.height > 1:
+        second = df_calls.row(1, named=True)
+        ratio = second[metric] / best[metric] if best[metric] else float('nan')
+        row['runner_up_lineage_id'] = second[LINEAGE_COL]
+        row['runner_up_gtdb_tax'] = second['gtdb_tax']
+        row['runner_up_frac_lineage_hit'] = second['frac_lineage_hit']
+        row['runner_up_n_hits'] = second['n_hits']
+        row['runner_up_ratio'] = ratio
+        if ratio > AMBIGUOUS_RATIO:
+            row['lineage_call'] = f'{call};{CALL_AMBIGUOUS}'
     return row
 
 
-def tax_one(genome, lineage_db, sketch_path, metric, kmer_size, top_k):
+def tax_one(genome, lineage_db, sketch_path, metric, kmer_size, top_k,
+            min_frac_lineage=0.0):
     """Worker: k-mers -> sketch prefilter -> exact call on candidates -> summary row."""
     name = strain_name_from_path(str(genome))
     query = kmers_to_frame(create_kmers(genome, kmer_size))
@@ -278,7 +306,7 @@ def tax_one(genome, lineage_db, sketch_path, metric, kmer_size, top_k):
         cands = None
     _, _, df_calls = call_lineage(query, lineage_db, metric=metric, verbose=False,
                                   lineages=cands)
-    return summarise(name, df_calls)
+    return summarise(name, df_calls, min_frac_lineage, metric)
 
 
 def main():
@@ -297,6 +325,11 @@ def main():
                         help='prefilter sketch keeps ~1 in N lineage kmers')
     parser.add_argument('--top_k', type=int, default=5,
                         help='candidate lineages scored exactly after the prefilter')
+    parser.add_argument('--min_frac_lineage', type=float, default=DEFAULT_MIN_FRAC_LINEAGE,
+                        help='lineage_call is true only if more than this fraction of the best '
+                             "lineage's kmers is covered by the genome, else "
+                             'too_low_coverage (0 disables); lineage and scores are '
+                             'reported either way')
     parser.add_argument('--no_sketch', action='store_true',
                         help='skip the prefilter and score every lineage exactly')
     args = parser.parse_args()
@@ -321,7 +354,8 @@ def main():
     # 'spawn' rather than fork: forking after polars has started its thread pool can deadlock
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp.get_context('spawn')) as ex:
         futures = {ex.submit(tax_one, g, args.lineage_db, sketch_path,
-                             args.lineage_metric, args.kmer_size, args.top_k): g
+                             args.lineage_metric, args.kmer_size, args.top_k,
+                             args.min_frac_lineage): g
                    for g in genomes}
         for i, fut in enumerate(as_completed(futures), 1):
             row = fut.result()
@@ -329,9 +363,11 @@ def main():
             print(f'[{i}/{len(genomes)}] {row["genome"]}: {row[LINEAGE_COL]}')
 
     # call first, then how good the hit is, then what the lineage is made of
-    front = ['genome', LINEAGE_COL, 'gtdb_tax',
+    front = ['genome', LINEAGE_COL, 'gtdb_tax', 'lineage_call',
              'frac_lineage_hit', 'n_hits', 'n_lineage_kmers',
-             'lineage_purity', 'n_labels', 'other_labels']
+             'lineage_purity', 'n_labels', 'other_labels',
+             'runner_up_lineage_id', 'runner_up_gtdb_tax',
+             'runner_up_frac_lineage_hit', 'runner_up_n_hits', 'runner_up_ratio']
     df = pl.DataFrame(rows, infer_schema_length=None)
     df = df.select([c for c in front if c in df.columns] +
                    [c for c in df.columns if c not in front])

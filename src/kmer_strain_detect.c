@@ -17,6 +17,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <strings.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -65,6 +67,7 @@ typedef struct {
 
 static int       get_file_type(const char *s);
 static char     *strip_basename(const char *path);
+static char     *pair_sample_name(const char *f1, const char *f2);
 static int       parse_targets(const char *file, Metagenome **out);
 static int       parse_kmer_tsv(const char *file, BIO_hash h, int n_mg,
                                  int *seed_out, char ***kmer_list_out);
@@ -105,7 +108,101 @@ static char *strip_basename(const char *path) {
     return b;
 }
 
-/* ── targets parser ────────────────────────────────────────────────── */
+/* ── sample naming for PE entries ──────────────────────────────────────
+ * Take the extension-stripped basenames of both mates, keep their longest
+ * common prefix (i.e. cut where the two names start to disagree), then
+ * clean up what is left:
+ *   1. drop trailing connectors  (_ - . : space)
+ *   2. drop a trailing read tag  (R, PE, read) if it sits behind a
+ *      connector, so "x_R1_001"/"x_R2_001" -> "x_R" -> "x"
+ *   3. drop connectors again
+ * Falls back to the stripped basename of f1 if nothing sensible is left.
+ *   1001099B_150804_B6_s09_PE1 / ..._PE2  -> 1001099B_150804_B6_s09
+ *   DK-D32-3524-250106-H3_R1_001 / _R2_001 -> DK-D32-3524-250106-H3
+ */
+static int is_connector(char c) {
+    return c == '_' || c == '-' || c == '.' || c == ':' || c == ' ';
+}
+
+static void trim_connectors(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && is_connector(s[n-1])) s[--n] = '\0';
+}
+
+static char *pair_sample_name(const char *f1, const char *f2) {
+    char *a = strip_basename(f1);
+    char *b = strip_basename(f2);
+
+    size_t i = 0;
+    while (a[i] && b[i] && a[i] == b[i]) i++;
+    a[i] = '\0';                       /* a is now the common prefix */
+    free(b);
+
+    trim_connectors(a);
+
+    /* strip a dangling read tag such as "_R", "_PE", "_read" */
+    static const char *tags[] = { "read", "Read", "READ", "PE", "pe", "R", "r", NULL };
+    size_t n = strlen(a);
+    for (int t = 0; tags[t]; t++) {
+        size_t tl = strlen(tags[t]);
+        if (n > tl + 1 && strcmp(a + n - tl, tags[t]) == 0 && is_connector(a[n - tl - 1])) {
+            a[n - tl] = '\0';
+            trim_connectors(a);
+            break;
+        }
+    }
+
+    if (a[0] == '\0') {                /* nothing in common: keep old behaviour */
+        free(a);
+        return strip_basename(f1);
+    }
+    return a;
+}
+
+/* ── targets parser ──────────────────────────────────────────────────
+ * Two layouts are accepted:
+ *
+ *  1. Headerless (original):   type <TAB> file1 [<TAB> file2]
+ *     Sample name is derived from the file name(s) (see pair_sample_name).
+ *
+ *  2. With a header line (first non-blank line, optional leading '#').
+ *     Columns are found by name, in any order, case-insensitive:
+ *        type | sequencing_type      PE / SE / PEI
+ *        file1, file2                 or  seq_file (comma-separated mates)
+ *        sample_name                  optional; used verbatim as the column
+ *                                     name in the output. Empty cell -> the
+ *                                     automatic name is used for that row.
+ *     Other columns (sample_id, isolates_to_track, ...) are ignored.
+ */
+
+#define MAX_FIELDS 64
+
+static int split_tabs(char *line, char **f, int max) {
+    int n = 0;
+    char *p = line;
+    while (n < max) {
+        f[n++] = p;
+        char *t = strchr(p, '\t');
+        if (!t) break;
+        *t = '\0';
+        p = t + 1;
+    }
+    return n;
+}
+
+static char *trim_ws(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = '\0';
+    return s;
+}
+
+/* NULL if the column is absent or the cell is empty */
+static char *cell(char **f, int nf, int col) {
+    if (col < 0 || col >= nf) return NULL;
+    char *s = trim_ws(f[col]);
+    return *s ? s : NULL;
+}
 
 static int parse_targets(const char *file, Metagenome **out) {
     FILE *fp = fopen(file, "r");
@@ -117,15 +214,63 @@ static int parse_targets(const char *file, Metagenome **out) {
     int cap = 64, n = 0;
     Metagenome *mgs = malloc(cap * sizeof(Metagenome));
 
+    /* column indices; defaults = headerless layout */
+    int c_type = 0, c_f1 = 1, c_f2 = 2, c_seq = -1, c_name = -1;
+    int first_line = 1;
+
     char *line = NULL;
     size_t len = 0;
     while (getline(&line, &len, fp) != -1) {
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
         char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
         char *cr = strchr(line, '\r'); if (cr) *cr = '\0';
+        if (line[0] == '\0') continue;
 
-        char *type_s = strtok(line, "\t");
-        char *f1     = strtok(NULL, "\t");
+        char *f[MAX_FIELDS];
+
+        /* header detection: first non-blank line only */
+        if (first_line) {
+            first_line = 0;
+            char *hl = strdup(line);
+            char *h = hl;
+            while (*h == '#') h++;
+            int nf = split_tabs(h, f, MAX_FIELDS);
+            int ht = -1, h1 = -1, h2 = -1, hs = -1, hn = -1;
+            for (int i = 0; i < nf; i++) {
+                char *c = trim_ws(f[i]);
+                if      (!strcasecmp(c, "type") || !strcasecmp(c, "sequencing_type")) ht = i;
+                else if (!strcasecmp(c, "file1"))       h1 = i;
+                else if (!strcasecmp(c, "file2"))       h2 = i;
+                else if (!strcasecmp(c, "seq_file"))    hs = i;
+                else if (!strcasecmp(c, "sample_name")) hn = i;
+            }
+            free(hl);
+            if (ht >= 0 || h1 >= 0 || hs >= 0 || hn >= 0) {
+                if (ht < 0 || (h1 < 0 && hs < 0)) {
+                    fprintf(stderr, "targets header needs a type/sequencing_type column and "
+                                    "file1 or seq_file column: %s\n", file);
+                    exit(1);
+                }
+                c_type = ht; c_f1 = h1; c_f2 = h2; c_seq = hs; c_name = hn;
+                continue;   /* header consumed */
+            }
+        }
+
+        if (line[0] == '#') continue;
+
+        int nf = split_tabs(line, f, MAX_FIELDS);
+        char *type_s = cell(f, nf, c_type);
+        char *f1 = NULL, *f2 = NULL;
+        if (c_seq >= 0) {
+            f1 = cell(f, nf, c_seq);
+            if (f1) {
+                char *comma = strchr(f1, ',');
+                if (comma) { *comma = '\0'; f2 = trim_ws(comma + 1); if (!*f2) f2 = NULL; }
+                f1 = trim_ws(f1);
+            }
+        } else {
+            f1 = cell(f, nf, c_f1);
+            f2 = cell(f, nf, c_f2);
+        }
         if (!type_s || !f1) continue;
 
         int type = get_file_type(type_s);
@@ -134,17 +279,21 @@ static int parse_targets(const char *file, Metagenome **out) {
             continue;
         }
 
-        char *f2 = (type == IS_PAIRED_END) ? strtok(NULL, "\t") : NULL;
         if (type == IS_PAIRED_END && !f2) {
             fprintf(stderr, "PE entry missing second file for %s, skipping\n", f1);
             continue;
         }
+        if (type != IS_PAIRED_END) f2 = NULL;
 
         if (n == cap) { cap *= 2; mgs = realloc(mgs, cap * sizeof(Metagenome)); }
-        mgs[n].type     = type;
-        mgs[n].file1    = strdup(f1);
-        mgs[n].file2    = f2 ? strdup(f2) : NULL;
-        mgs[n].basename = strip_basename(f1);
+        mgs[n].type  = type;
+        mgs[n].file1 = strdup(f1);
+        mgs[n].file2 = f2 ? strdup(f2) : NULL;
+
+        char *given = cell(f, nf, c_name);
+        if (given)      mgs[n].basename = strdup(given);                 /* explicit sample_name */
+        else if (f2)    mgs[n].basename = pair_sample_name(f1, f2);      /* PE: common prefix    */
+        else            mgs[n].basename = strip_basename(f1);            /* SE/PEI: strip ext    */
         n++;
     }
     free(line);
@@ -356,7 +505,9 @@ static void ksd_pool_wait_and_destroy(ksd_pool *pool) {
 static void usage(void) {
     fprintf(stderr, "Usage: kmer_strain_detect -k <kmer_tsv> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-G <background.txt>] [-j threads]\n\n");
     fprintf(stderr, "  -k  kmer TSV with a '#kmer' column (plain or gzipped)\n");
-    fprintf(stderr, "  -B  target metagenomes file (tab-separated: type file1 [file2])\n");
+    fprintf(stderr, "  -B  target metagenomes file (tab-separated: type file1 [file2]), or with a header\n");
+    fprintf(stderr, "      line naming columns: type|sequencing_type, file1/file2 or seq_file (comma-sep),\n");
+    fprintf(stderr, "      and optional sample_name (used as the output column name)\n");
     fprintf(stderr, "  -G  background metagenomes file (same format as -B); columns prefixed 'b_'\n");
     fprintf(stderr, "      types: PE, SE, PEI\n");
     fprintf(stderr, "  -o  output file (e.g. sample.kmer_hits.tsv.gz)\n");
