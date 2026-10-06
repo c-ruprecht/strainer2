@@ -32,9 +32,9 @@ conda env create -f strainer2_environment.yml
 - Space requirements genomes_t98: 181756 files, 227.5 GiB     
 - download dir holds temporary files
 - dest is where database will be built
-- cleanup deletes raw files
+- cleanup deletes temporary files
 
-python scripts/scrubdb_hf.py pull --repo cruprecht/scrubdb-derep-hq-comp99-cont05 --download-dir /path/to/tmp --dest /path/to/db --cleanup
+python scrubdb_hf.py pull --repo cruprecht/scrubdb-derep-hq-comp99-cont05 --revision v2026.10 --download-dir /path/to/tmp --dest /path/to/db --cleanup
 
 
 
