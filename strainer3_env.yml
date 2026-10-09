@@ -1,0 +1,37 @@
+name: strainer3_env
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  # workflow engine + LSF executor (known-good combo on Minerva)
+  - snakemake=9.1.1
+  - snakemake-minimal=9.1.1
+  - snakemake-interface-executor-plugins=9.3.3
+  - snakemake-executor-plugin-lsf=0.2.6
+  - snakemake-executor-plugin-lsf-jobstep=0.1.10
+  # strainer3
+  - biopython>1.8
+  - pandas
+  - polars
+  - pyarrow
+  - pyahocorasick
+  - pyrodigal
+  - plotly
+  - python-kaleido=0.2.1
+  - nbformat
+  - seaborn
+  - pycirclize
+  - scikit-learn
+  - xgboost        # probably not needed
+  - sourmash
+  - sourmash_plugin_branchwater
+  - skani
+  - ncbi-datasets-cli
+  - huggingface_hub
+  - hf-xet
+  - zlib
+  - zstd
+  - zstandard
+  - make
+  - pip
