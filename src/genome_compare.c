@@ -392,7 +392,7 @@ void GEN_calculate_kmer_count(const char *file, const int seed, BIO_hash h, unsi
 			has_N = contains_N(seed_seq);
 
 	
-			for (i = 0; i<seq->seq.l - seed+1; i++) { // for each possible seed position
+			for (i = 0; (size_t)i + (size_t)seed <= seq->seq.l; i++) { // for each possible seed position
 				temp_nuc = seed_seq[seed];
 				seed_seq[seed] = '\0';	
 
@@ -480,7 +480,7 @@ void GEN_calculate_coverage(const char *hash_file, const char *file, const int s
 		if (seq->seq.l<seed) // don't compare sequences that are too short
 			continue;
 
-		for (i = 0; i<seq->seq.l - seed+1; i++) { // for each possible seed position
+		for (i = 0; (size_t)i + (size_t)seed <= seq->seq.l; i++) { // for each possible seed position
 			idx=0;
 			N_skip = 0;
 			for (j=i; j<i+seed; j++) {  // generate the seeds
@@ -583,7 +583,7 @@ uint64_t GEN_metagenome_coverage_to_ref(const char *file, const int seed, BIO_ha
 //		printf("%s\tlen: %d\n", seq->seq.s, seq->seq.l);
 		seed_seq = seq->seq.s;
 
-		for (i = 0; i<seq->seq.l - seed+1; i++) { // for each possible seed position
+		for (i = 0; (size_t)i + (size_t)seed <= seq->seq.l; i++) { // for each possible seed position
 			temp_nuc = seed_seq[seed];
 			seed_seq[seed] = '\0';	
 //			printf("%s\n", seed_seq);
@@ -741,7 +741,7 @@ void GEN_print_coverage_to_ref(const char *file, const int seed, BIO_hash h, FIL
 		BIO_stringToUpper(seq->seq.s); // keep same case
 		seed_seq = seq->seq.s;
 
-		for (i = 0; i<seq->seq.l - seed+1; i++) { // for each possible seed position
+		for (i = 0; (size_t)i + (size_t)seed <= seq->seq.l; i++) { // for each possible seed position
 			temp_nuc = seed_seq[seed];
 			seed_seq[seed] = '\0';  
 			orientStr = orient_string(seed_seq, seedStrRevComp, seed);
@@ -1119,7 +1119,7 @@ void GEN_hash_background_subtract(const char *subtract_file, BIO_hash h, const i
                 BIO_stringToUpper(seq->seq.s); // keep same case
                 seed_seq = seq->seq.s;
 
-		for (i = 0; i<seq->seq.l - seed+1; i++) { // for each possible seed position
+		for (i = 0; (size_t)i + (size_t)seed <= seq->seq.l; i++) { // for each possible seed position
 			idx=0;
 			temp_nuc = seed_seq[seed];
 			seed_seq[seed] = '\0';  
@@ -1179,7 +1179,7 @@ void GEN_hash_sequences_set_count_vec(const char *file, const int seed, BIO_hash
                 seed_seq = seq->seq.s;
 
 	//	for (i = 0; i<current->seqLength - seed+1; i++) { // for each possible seed position
-		for (i = 0; i<seq->seq.l - seed+1; i++) { // for each possible seed position
+		for (i = 0; (size_t)i + (size_t)seed <= seq->seq.l; i++) { // for each possible seed position
 
 			idx=0;
 			temp_nuc = seed_seq[seed];
@@ -1249,7 +1249,7 @@ void GEN_hash_sequences_set_count(const char *file, const int seed, BIO_hash h, 
                 seed_seq = seq->seq.s;
 
 	//	for (i = 0; i<current->seqLength - seed+1; i++) { // for each possible seed position
-		for (i = 0; i<seq->seq.l - seed+1; i++) { // for each possible seed position
+		for (i = 0; (size_t)i + (size_t)seed <= seq->seq.l; i++) { // for each possible seed position
 
 			idx=0;
 			temp_nuc = seed_seq[seed];

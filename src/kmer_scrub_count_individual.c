@@ -105,9 +105,19 @@ int main(int argc, char *argv[])
 			default: usage(); break;
 		}
 
-	if (!r_file || !A_file) {
+	if (!r_file || (!A_file && !B_file && !C_file)) {
 		usage();
 		return 1;
+	}
+	{
+		size_t rl = strlen(r_file);
+		if ((rl > 5 && strcmp(r_file + rl - 5, ".kmdb") == 0) ||
+		    (rl > 8 && strcmp(r_file + rl - 8, ".parquet") == 0)) {
+			fprintf(stderr, "error: -r %s is a k-mer database; -r must be a "
+			        "genome (FASTA). Pass metagenome databases with -B.\n",
+			        r_file);
+			exit(EXIT_FAILURE);
+		}
 	}
 	if (!basename_arg) {
 		basename_arg = derive_basename(r_file);
@@ -199,10 +209,11 @@ int main(int argc, char *argv[])
 	}
 
 	/* -A → pangenome (col 1) + ge rows */
-	GEN_per_sample_kmer_counts_dual(A_file, "ge", 1, seed, seqHash,
-	                                num_threads, w, summary, seen,
-	                                cov_threshold, total_ref_kmers,
-	                                progress, NULL);
+	if (A_file)
+		GEN_per_sample_kmer_counts_dual(A_file, "ge", 1, seed, seqHash,
+		                                num_threads, w, summary, seen,
+		                                cov_threshold, total_ref_kmers,
+		                                progress, NULL);
 
 	/* -B → metagenome (col 2) + me rows */
 	if (B_file)
@@ -249,11 +260,11 @@ static void usage(void)
 	fprintf(stderr,
 	    "Usage: kmer_scrub_count_individual\n"
 	    "                        -r <reference genome>\n"
-	    "                        -A <file listing genome filenames>\n"
+	    "                       [-A <file listing genome filenames, or one genome>]\n"
 	    "                       [-n <output basename, default: -r filename\n"
 	    "                            with directory and extension stripped>]\n"
 	    "                       [-O <output directory, default .>]\n"
-	    "                       [-B <file listing metagenome filenames>]\n"
+	    "                       [-B <file listing metagenomes, or one metagenome>]\n"
 	    "                       [-C <file listing drug-strain genome filenames>]\n"
 	    "                       [-T <coverage threshold, default 1.0>]\n"
 	    "                       [-P <presence cap, default 10>]\n"
@@ -277,6 +288,13 @@ static void usage(void)
 	    "        sample hit are emitted. Load with polars:\n"
 	    "          pl.scan_csv('...presence.tsv.zst', separator='\\t')\n"
 	    "            .with_columns(pl.col('list_scrub_id').str.split(','))\n"
+	    "\n"
+	    "  -A/-B/-C take a list file (one path per line) or a single\n"
+	    "  sample file. At least one of them is required.\n"
+	    "  -B entries may be reads (.fastq[.gz]/.fq[.gz], every occurrence\n"
+	    "  counts) or .kmdb databases from kmer_metagenome_db (the stored\n"
+	    "  count is added; a .kmdb's blocks are split over the threads, so\n"
+	    "  a single metagenome uses all -t threads).\n"
 	    "\n"
 	    "  -T:     coverage threshold. If coverage_pct > T, the sample's\n"
 	    "          counts are NOT added to the global column (is_in_global\n"
@@ -310,7 +328,7 @@ static char *derive_basename(const char *path)
 	static const char *comp_ext[] = { ".gz", ".zst", ".bz2", ".xz", NULL };
 	static const char *seq_ext[]  = { ".fa", ".fna", ".fasta", ".ffn", ".faa",
 	                                  ".fas", ".fsa", ".seq", ".txt", ".list",
-	                                  NULL };
+	                                  ".fastq", ".fq", ".kmdb", NULL };
 
 	const char *slash = strrchr(path, '/');
 	const char *name  = slash ? slash + 1 : path;

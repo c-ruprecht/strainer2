@@ -3,11 +3,13 @@
 #include "BIO_hash.h"
 #include "genome_compare.h"
 #include "kseq.h"
+#include "kmdb.h"
 
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -598,7 +600,8 @@ static char *basename_no_ext(const char *path)
 		    strcmp(ext, "ffn")   == 0 ||
 		    strcmp(ext, "fasta") == 0 ||
 		    strcmp(ext, "fastq") == 0 ||
-		    strcmp(ext, "fq")    == 0)
+		    strcmp(ext, "fq")    == 0 ||
+		    strcmp(ext, "kmdb")  == 0)
 			*dot = '\0';
 		else
 			break;
@@ -654,6 +657,154 @@ static void calculate_kmer_count_scratch(const char *file,
 	free(seedStrRevComp);
 }
 
+/* ── .kmdb samples: merge-join against the sorted reference k-mers ───────
+
+   A .kmdb holds sorted canonical 2-bit k-mers with counts. The reference
+   hash keys are converted once into a sorted (kmer, bucket) array; each
+   database block is then merge-joined against it and every hit adds the
+   stored count to the bucket's scratch column, exactly as the FASTQ scan
+   would add one per occurrence. Blocks are independent, so one sample is
+   split across several helper threads. Keys in a .kmdb are unique, so
+   each bucket is touched at most once per sample. */
+
+typedef struct {
+	uint64_t kmer;
+	uint32_t bucket;
+} ref_kmer_t;
+
+static int ref_kmer_cmp(const void *a, const void *b)
+{
+	uint64_t x = ((const ref_kmer_t *)a)->kmer, y = ((const ref_kmer_t *)b)->kmer;
+	return (x > y) - (x < y);
+}
+
+/* Returns a sorted array of every hash key as a canonical 2-bit k-mer.
+   Keys that are not pure ACGT of length `seed` cannot occur in a .kmdb and
+   are left out (counted in *n_skipped). */
+static ref_kmer_t *build_ref_kmers(BIO_hash h, int seed, size_t *n_out,
+                                   size_t *n_skipped)
+{
+	size_t n = 0, skipped = 0;
+	for (unsigned int i = 0; i < h->M; i++)
+		if (h->data[i].DATA != NULL) n++;
+	ref_kmer_t *r = malloc((n ? n : 1) * sizeof(*r));
+	if (!r) { perror("malloc ref kmers"); exit(EXIT_FAILURE); }
+	size_t j = 0;
+	for (unsigned int i = 0; i < h->M; i++) {
+		if (h->data[i].DATA == NULL) continue;
+		const char *key = h->data[i].key;
+		uint64_t x;
+		if (strlen(key) != (size_t)seed || kmdb_encode(key, seed, &x) != 0) {
+			skipped++;
+			continue;
+		}
+		r[j].kmer   = kmdb_canonical(x, seed);
+		r[j].bucket = i;
+		j++;
+	}
+	qsort(r, j, sizeof(*r), ref_kmer_cmp);
+	*n_out = j;
+	*n_skipped = skipped;
+	return r;
+}
+
+typedef struct {
+	const kmdb_t     *db;
+	const ref_kmer_t *ref;
+	size_t            n_ref;
+	BIO_hash          h;
+	unsigned int      scratch_col;
+	uint64_t          next_block;   /* atomic */
+	int               error;        /* atomic */
+} kmdb_scrub_t;
+
+static size_t ref_lower_bound(const ref_kmer_t *r, size_t n, uint64_t x)
+{
+	size_t lo = 0, hi = n;
+	while (lo < hi) {
+		size_t m = lo + (hi - lo) / 2;
+		if (r[m].kmer < x) lo = m + 1; else hi = m;
+	}
+	return lo;
+}
+
+static void *kmdb_scrub_helper(void *arg)
+{
+	kmdb_scrub_t *s = (kmdb_scrub_t *)arg;
+	kmdb_block_buf buf;
+	kmdb_block_buf_init(&buf);
+
+	for (;;) {
+		uint64_t b = __atomic_fetch_add(&s->next_block, 1, __ATOMIC_RELAXED);
+		if (b >= s->db->n_blocks) break;
+		const kmdb_block_info *bi = &s->db->blocks[b];
+
+		size_t j = ref_lower_bound(s->ref, s->n_ref, bi->first_kmer);
+		if (j == s->n_ref || s->ref[j].kmer > bi->last_kmer)
+			continue;                      /* no reference k-mer in range */
+
+		long n = kmdb_read_block(s->db, b, &buf);
+		if (n < 0) { __atomic_store_n(&s->error, 1, __ATOMIC_RELAXED); break; }
+
+		long i = 0;
+		while (i < n && j < s->n_ref) {
+			uint64_t x = buf.kmers[i], y = s->ref[j].kmer;
+			if (x < y)      i++;
+			else if (x > y) j++;
+			else {
+				unsigned int *counts =
+					(unsigned int *)s->h->data[s->ref[j].bucket].DATA;
+				__sync_fetch_and_add(&counts[s->scratch_col], buf.counts[i]);
+				i++; j++;
+			}
+		}
+	}
+	kmdb_block_buf_free(&buf);
+	return NULL;
+}
+
+/* Returns 0 on success, -1 if the database could not be read fully. */
+static int calculate_kmer_count_scratch_kmdb(const kmdb_t *db,
+                                             const ref_kmer_t *ref,
+                                             size_t n_ref,
+                                             BIO_hash h,
+                                             unsigned int scratch_col,
+                                             int n_helpers)
+{
+	kmdb_scrub_t s;
+	memset(&s, 0, sizeof s);
+	s.db = db; s.ref = ref; s.n_ref = n_ref; s.h = h; s.scratch_col = scratch_col;
+
+	if (n_helpers < 1) n_helpers = 1;
+	if ((uint64_t)n_helpers > db->n_blocks) n_helpers = (int)(db->n_blocks ? db->n_blocks : 1);
+	if (n_helpers == 1) {
+		kmdb_scrub_helper(&s);
+	} else {
+		pthread_t *th = malloc(sizeof(pthread_t) * n_helpers);
+		for (int i = 0; i < n_helpers; i++)
+			pthread_create(&th[i], NULL, kmdb_scrub_helper, &s);
+		for (int i = 0; i < n_helpers; i++)
+			pthread_join(th[i], NULL);
+		free(th);
+	}
+	return s.error ? -1 : 0;
+}
+
+/* A path that is itself one sample rather than a list of samples. */
+static int is_sample_path(const char *path)
+{
+	static const char *ext[] = {
+		".kmdb", ".fa", ".fna", ".fasta", ".ffn", ".fas", ".fq", ".fastq",
+		".fa.gz", ".fna.gz", ".fasta.gz", ".ffn.gz", ".fas.gz", ".fq.gz",
+		".fastq.gz", NULL };
+	size_t n = strlen(path);
+	for (int i = 0; ext[i]; i++) {
+		size_t m = strlen(ext[i]);
+		if (n > m && strcasecmp(path + n - m, ext[i]) == 0) return 1;
+	}
+	return 0;
+}
+
 /* ── Worker pool ──────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -686,6 +837,11 @@ typedef struct {
 	const char      *skip_file;
 	FILE            *progress;
 	pthread_mutex_t  progress_mtx;
+
+	/* .kmdb samples */
+	int              n_jobs;
+	ref_kmer_t      *ref_kmers;     /* NULL unless a job is a .kmdb */
+	size_t           n_ref_kmers;
 } worker_pool_t;
 
 /* Single-pass: collect bucket indices of hit kmers, optionally fold
@@ -764,11 +920,29 @@ static void *worker_main(void *arg)
 			continue;
 		}
 
-		char *id = basename_no_ext(path);
+		kmdb_t *db = NULL;
+		char *id = NULL;
+		if (kmdb_is_kmdb_path(path)) {
+			/* fatal rather than skipped: a silently missing background
+			   sample would leave k-mers looking more specific than they are */
+			db = kmdb_open(path);
+			if (!db) {
+				fprintf(stderr, "error: %s is not a readable .kmdb\n", path);
+				exit(EXIT_FAILURE);
+			}
+			if ((int)db->k != p->seed) {
+				fprintf(stderr, "error: %s was built with k=%u, the scrub "
+				        "uses k=%d\n", path, db->k, p->seed);
+				exit(EXIT_FAILURE);
+			}
+			id = kmdb_meta_get(db, "sample_id");
+		}
+		if (!id) id = basename_no_ext(path);
 		if (seen_registry_check_and_add(p->seen, p->sample_type, id)) {
 			fprintf(stderr,
 			        "skipping %s: sample_id '%s' (type=%s) already processed\n",
 			        path, id, p->sample_type);
+			kmdb_close(db);
 			free(id); free(job->filepath); free(job);
 			continue;
 		}
@@ -781,7 +955,21 @@ static void *worker_main(void *arg)
 			pthread_mutex_unlock(&p->progress_mtx);
 		}
 
-		calculate_kmer_count_scratch(path, p->seed, p->h, scratch_col);
+		if (db) {
+			/* split this sample's blocks over our share of the threads */
+			int busy = p->n_jobs < p->num_threads ? p->n_jobs : p->num_threads;
+			int helpers = busy > 0 ? p->num_threads / busy : 1;
+			if (calculate_kmer_count_scratch_kmdb(db, p->ref_kmers,
+			                                      p->n_ref_kmers, p->h,
+			                                      scratch_col, helpers) != 0) {
+				fprintf(stderr, "error: %s could not be read completely; "
+				        "stopping rather than writing partial counts\n", path);
+				exit(EXIT_FAILURE);
+			}
+			kmdb_close(db);
+		} else {
+			calculate_kmer_count_scratch(path, p->seed, p->h, scratch_col);
+		}
 
 		unsigned long n_unique = count_unique_in_column(p->h, scratch_col);
 		double coverage = p->total_ref_kmers > 0
@@ -862,7 +1050,16 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 		presence_writer_attach_hash(writer, h);
 	}
 
-	FILE *fp = fopen(list_path, "r");
+	/* A single sample file (.kmdb, FASTQ, FASTA) can be given directly
+	   instead of a list. */
+	FILE *fp;
+	char *single = NULL;
+	if (is_sample_path(list_path)) {
+		single = strdup(list_path);
+		fp = single ? fmemopen(single, strlen(single), "r") : NULL;
+	} else {
+		fp = fopen(list_path, "r");
+	}
 	if (!fp) {
 		fprintf(stderr,
 		        "GEN_per_sample_kmer_counts_dual: cannot open %s: %s\n",
@@ -871,17 +1068,22 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 	}
 
 	int nlines = 0;
+	int any_kmdb = 0;
 	{
 		char *line = NULL; size_t cap = 0;
 		while (getline(&line, &cap, fp) != -1) {
 			char *q = line;
 			while (*q == ' ' || *q == '\t') q++;
 			if (*q != '\n' && *q != '\0') nlines++;
+			char *e = q + strlen(q);
+			while (e > q && (e[-1] == '\n' || e[-1] == '\r' ||
+			                 e[-1] == ' '  || e[-1] == '\t')) *--e = '\0';
+			if (kmdb_is_kmdb_path(q)) any_kmdb = 1;
 		}
 		free(line);
 		rewind(fp);
 	}
-	if (nlines == 0) { fclose(fp); return; }
+	if (nlines == 0) { fclose(fp); free(single); return; }
 
 	worker_pool_t p;
 	memset(&p, 0, sizeof p);
@@ -899,6 +1101,17 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 	p.total_ref_kmers = total_reference_kmers;
 	p.skip_file       = skip_file;
 	p.progress        = progress;
+	p.n_jobs          = nlines;
+	if (any_kmdb) {
+		size_t skipped = 0;
+		p.ref_kmers = build_ref_kmers(h, seed, &p.n_ref_kmers, &skipped);
+		fprintf(stderr, "%s: %zu reference k-mers indexed for .kmdb samples",
+		        sample_type, p.n_ref_kmers);
+		if (skipped)
+			fprintf(stderr, " (%zu with non-ACGT bases can never match a .kmdb)",
+			        skipped);
+		fprintf(stderr, "\n");
+	}
 	pthread_mutex_init(&p.jmtx, NULL);
 	pthread_cond_init(&p.jhas_work, NULL);
 	pthread_mutex_init(&p.progress_mtx, NULL);
@@ -919,6 +1132,7 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 		free(line);
 	}
 	fclose(fp);
+	free(single);
 
 	pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
 	for (int i = 0; i < num_threads; i++)
@@ -934,6 +1148,7 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 
 	free(threads);
 	free(p.jobs);
+	free(p.ref_kmers);
 	pthread_mutex_destroy(&p.jmtx);
 	pthread_cond_destroy(&p.jhas_work);
 	pthread_mutex_destroy(&p.progress_mtx);

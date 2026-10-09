@@ -37,7 +37,7 @@ endif
 
 ifeq ($(HAVE_ZSTD),1)
   ZSTD_DEF     := -DHAVE_ZSTD $(ZSTD_CFLAGS)
-  ZSTD_TARGETS := kmer_scrub_count_individual
+  ZSTD_TARGETS := kmer_scrub_count_individual kmer_metagenome_db
 else
   ZSTD_DEF     :=
   ZSTD_LIBS    :=
@@ -54,8 +54,8 @@ all: $(BASE_TARGETS) $(ZSTD_TARGETS) zstd-note
 zstd-note:
 ifneq ($(HAVE_ZSTD),1)
 	@echo ""
-	@echo "  NOTE: libzstd was not found, so kmer_scrub_count_individual was"
-	@echo "        NOT built, and genome_compare_presence was built without"
+	@echo "  NOTE: libzstd was not found, so kmer_scrub_count_individual and"
+	@echo "        kmer_metagenome_db were NOT built, and genome_compare_presence was built without"
 	@echo "        .zst output (-z falls back to .gz). Everything else is fine."
 	@echo "        To get zstd back, install it and rebuild:"
 	@echo "          conda install -c conda-forge zstd zstd-static"
@@ -77,7 +77,10 @@ genome_compare_presence: genome_compare_presence.o
 kmer_scrub_count: kmer_scrub_count.o $(shared_obj)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-kmer_scrub_count_individual: kmer_scrub_count_individual.o kmer_scrub_streaming.o $(shared_obj)
+kmer_scrub_count_individual: kmer_scrub_count_individual.o kmer_scrub_streaming.o kmdb.o $(shared_obj)
+	$(CC) -o $@ $^ $(LDLIBS) $(ZSTD_LIBS)
+
+kmer_metagenome_db: kmer_metagenome_db.o kmdb.o
 	$(CC) -o $@ $^ $(LDLIBS) $(ZSTD_LIBS)
 
 strain_detect: strain_detect.o $(shared_obj)
@@ -96,7 +99,7 @@ test: genome_compare_presence
 
 .PHONY: clean
 clean:
-	$(RM) *.o $(BASE_TARGETS) kmer_scrub_count_individual
+	$(RM) *.o $(BASE_TARGETS) kmer_scrub_count_individual kmer_metagenome_db
 	$(RM) -r test/out
 
 .PHONY: all zstd-note
