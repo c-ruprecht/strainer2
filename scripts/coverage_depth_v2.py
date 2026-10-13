@@ -33,7 +33,15 @@ def get_sample_coverage(df_hits, df_counts):
                                 'depth_rare_kmers': round(df_unique.mean(axis=0),2),
                                 'rare_count': rare_count,
                             })
-    df_cov_depth = pd.concat([df_cov_depth, df_cov_depth_uni], axis = 1)    
+
+    df_nonunique = df_hits.loc[df_hits['#kmer'].isin(df_counts_uni['#kmer'])==False].set_index('#kmer')
+    
+    df_cov_depth_nonuni = pd.DataFrame({'nonrare_kmers_hit': (df_nonunique > 0).sum(axis=0),
+                                'nonrare_kmers_total': len(df_nonunique),
+                                'coverage_nonrare_kmers': round((df_nonunique > 0).sum(axis=0)/len(df_nonunique),4),
+                                'depth_nonrare_kmers': round(df_nonunique.mean(axis=0),2),
+                            })
+    df_cov_depth = pd.concat([df_cov_depth, df_cov_depth_uni, df_cov_depth_nonuni], axis = 1)    
 
     return df_cov_depth
 

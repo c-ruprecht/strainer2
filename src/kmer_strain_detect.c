@@ -1,16 +1,25 @@
 /*
  * kmer_strain_detect.c
  *
- * Takes a kmer TSV (with a '#kmer' column) and a targets metagenome list,
- * counts how many times each kmer appears in each metagenome, and writes
- * a gzipped TSV: rows = kmers, columns = metagenome basenames.
+ * Takes a kmer file and a targets metagenome list, counts how many times each
+ * kmer appears in each metagenome, and writes a gzipped TSV:
+ * rows = kmers, columns = metagenome basenames.
+ *
+ * Accepted kmer file formats (-k, plain or gzipped):
+ *   1. TSV with a header containing a '#kmer' (or 'kmer') column; all other
+ *      columns are ignored (rare_kmers.mapped.tsv.gz, kmer_blocks route).
+ *   2. Classic headerless list (kmer_scrub_filter.py output, *.scrubbed_kmers):
+ *      kmer in the first whitespace-separated column. '#' lines (scrub stats)
+ *      are skipped wherever they appear.
+ *   An empty / comment-only file is not an error: it yields a header-only
+ *   output with a zeroed total_evaluated row (everything was scrubbed away).
  *
  * Each metagenome is processed in its own thread. Because each thread only
  * writes to its own column index in the per-kmer count array, no mutex is
  * needed for count updates. The hash is read-only during scanning.
  *
  * Usage:
- *   kmer_strain_detect -k <kmer.tsv[.gz]> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-j threads]
+ *   kmer_strain_detect -k <kmers[.gz]> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-j threads]
  */
 #define _GNU_SOURCE
 #include "zlib.h"
@@ -23,6 +32,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
 #include "kseq.h"
 #include "BIO_sequence.h"
 #include "BIO_hash.h"
@@ -62,6 +72,15 @@ typedef struct {
     pthread_cond_t  has_work;
     pthread_cond_t  all_done;
 } ksd_pool;
+
+typedef struct {
+    BIO_hash h;
+    int      n_mg;
+    int      seed;
+    char   **list;
+    int      n, cap;
+    long     n_dup, n_bad, n_len;
+} KmerLoad;
 
 /* ── forward declarations ──────────────────────────────────────────── */
 
@@ -302,81 +321,134 @@ static int parse_targets(const char *file, Metagenome **out) {
     return n;
 }
 
-/* ── kmer TSV parser ───────────────────────────────────────────────── */
+/* ── kmer file parser ──────────────────────────────────────────────── */
+
+static int is_acgt(const char *s) {
+    if (!*s) return 0;
+    for (; *s; s++) {
+        switch (*s) {
+            case 'A': case 'C': case 'G': case 'T':
+            case 'a': case 'c': case 'g': case 't':
+                break;
+            default:
+                return 0;
+        }
+    }
+    return 1;
+}
+
+/* column index of '#kmer' / 'kmer' in a tab-separated header, else -1 */
+static int find_header_col(const char *line) {
+    char hdr[MAX_LINE];
+    strncpy(hdr, line, MAX_LINE - 1);
+    hdr[MAX_LINE - 1] = '\0';
+    char *save = NULL;
+    int col = 0;
+    for (char *tok = strtok_r(hdr, "\t", &save); tok;
+         tok = strtok_r(NULL, "\t", &save), col++) {
+        if (strcmp(tok, "#kmer") == 0 || strcmp(tok, "kmer") == 0) return col;
+    }
+    return -1;
+}
+
+static void add_kmer_line(KmerLoad *L, char *line, int kmer_col, const char *delim) {
+    char *save = NULL;
+    char *tok = strtok_r(line, delim, &save);
+    for (int c = 0; c < kmer_col && tok; c++)
+        tok = strtok_r(NULL, delim, &save);
+    if (!tok || !*tok) { L->n_bad++; return; }
+
+    size_t klen = strlen(tok);
+    if (klen >= MAX_KMER_LEN || !is_acgt(tok)) { L->n_bad++; return; }
+    for (char *p = tok; *p; p++) *p = (char)toupper((unsigned char)*p);
+
+    if (L->seed < 0) L->seed = (int)klen;
+    else if ((int)klen != L->seed) { L->n_len++; return; }
+
+    /* canonical (oriented) form */
+    char rc[MAX_KMER_LEN];
+    memcpy(rc, tok, klen + 1);
+    BIO_reverseComplement(rc);
+    char *oriented = orient_string(tok, rc, L->seed);
+
+    /* skip duplicates (same canonical kmer) */
+    if (BIO_searchHash(L->h, oriented) != NULL) { L->n_dup++; return; }
+
+    unsigned int *counts = calloc(L->n_mg, sizeof(unsigned int));
+    BIO_addHashData(L->h, oriented, counts);
+
+    if (L->n == L->cap) {
+        L->cap *= 2;
+        L->list = realloc(L->list, L->cap * sizeof(char *));
+    }
+    L->list[L->n++] = strdup(tok);   /* original orientation for output */
+}
 
 static int parse_kmer_tsv(const char *file, BIO_hash h, int n_mg,
                            int *seed_out, char ***kmer_list_out) {
-    gzFile fp = gzopen(file, "r");
+    gzFile fp = gzopen(file, "r");   /* zlib reads plain files transparently */
     if (!fp) {
         fprintf(stderr, "cannot open kmer file %s: %s\n", file, strerror(errno));
         exit(1);
     }
 
+    KmerLoad L = { h, n_mg, -1, malloc(4096 * sizeof(char *)), 0, 4096, 0, 0, 0 };
     char line[MAX_LINE];
-    int kmer_col = -1;
-    int seed = -1;
+    int kmer_col = -1, pending = 0;
+    const char *delim = "\t";
 
-    /* find the '#kmer' column index from the header */
-    if (!gzgets(fp, line, MAX_LINE)) {
-        fprintf(stderr, "kmer file is empty: %s\n", file);
-        exit(1);
-    }
-    {
-        char hdr[MAX_LINE];
-        strncpy(hdr, line, MAX_LINE);
-        hdr[MAX_LINE - 1] = '\0';
-        char *tok = strtok(hdr, "\t\n\r");
-        int col = 0;
-        while (tok) {
-            if (strcmp(tok, "#kmer") == 0) { kmer_col = col; break; }
-            tok = strtok(NULL, "\t\n\r");
-            col++;
-        }
-    }
-    if (kmer_col < 0) {
-        fprintf(stderr, "no '#kmer' column found in %s\n", file);
-        exit(1);
-    }
-
-    int cap = 4096, n = 0;
-    char **kmer_list = malloc(cap * sizeof(char *));
-    char kmer_rc[MAX_KMER_LEN];
-
+    /* detect format: header with '#kmer', or headerless list */
     while (gzgets(fp, line, MAX_LINE)) {
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
-        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
-        char *cr = strchr(line, '\r'); if (cr) *cr = '\0';
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') continue;
 
-        /* advance to the kmer column */
-        char *tok = strtok(line, "\t");
-        for (int c = 0; c < kmer_col && tok; c++)
-            tok = strtok(NULL, "\t");
-        if (!tok || tok[0] == '\0') continue;
+        int c = find_header_col(line);
+        if (c >= 0) { kmer_col = c; break; }
+        if (line[0] == '#') continue;          /* stats / comment line */
 
-        if (seed < 0) {
-            seed = (int)strlen(tok);
-            *seed_out = seed;
+        char probe[MAX_LINE];
+        strncpy(probe, line, MAX_LINE - 1);
+        probe[MAX_LINE - 1] = '\0';
+        char *save = NULL;
+        char *t = strtok_r(probe, " \t", &save);
+        if (t && is_acgt(t)) {
+            kmer_col = 0;
+            delim    = " \t";
+            pending  = 1;                       /* this line is already data */
+            break;
         }
-
-        /* compute canonical (oriented) form */
-        strncpy(kmer_rc, tok, MAX_KMER_LEN - 1);
-        kmer_rc[MAX_KMER_LEN - 1] = '\0';
-        BIO_reverseComplement(kmer_rc);
-        char *oriented = orient_string(tok, kmer_rc, seed);
-
-        /* skip duplicates (same canonical kmer) */
-        if (BIO_searchHash(h, oriented) != NULL) continue;
-
-        unsigned int *counts = calloc(n_mg, sizeof(unsigned int));
-        BIO_addHashData(h, oriented, counts);
-
-        if (n == cap) { cap *= 2; kmer_list = realloc(kmer_list, cap * sizeof(char *)); }
-        kmer_list[n++] = strdup(tok);   /* store original for output */
+        fprintf(stderr, "%s: no '#kmer' header and first data line does not "
+                "start with a kmer:\n  %.80s\n", file, line);
+        exit(1);
     }
 
+    if (kmer_col < 0) {
+        fprintf(stderr, "WARNING: %s contains no kmers (empty or comments only)\n", file);
+        gzclose(fp);
+        *seed_out = -1;
+        *kmer_list_out = L.list;
+        return 0;
+    }
+    fprintf(stderr, "kmer file %s: %s, kmer column %d\n", file,
+            pending ? "headerless list" : "header", kmer_col);
+
+    if (pending) add_kmer_line(&L, line, kmer_col, delim);
+    while (gzgets(fp, line, MAX_LINE)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0' || line[0] == '#') continue;
+        add_kmer_line(&L, line, kmer_col, delim);
+    }
     gzclose(fp);
-    *kmer_list_out = kmer_list;
-    return n;
+
+    if (L.n_dup || L.n_bad || L.n_len)
+        fprintf(stderr, "kmer file: skipped %ld duplicate, %ld invalid, "
+                "%ld wrong-length kmer line(s)\n", L.n_dup, L.n_bad, L.n_len);
+    if (L.n == 0)
+        fprintf(stderr, "WARNING: %s contains no valid kmers\n", file);
+
+    *seed_out = L.seed;
+    *kmer_list_out = L.list;
+    return L.n;
 }
 
 /* ── read scanner ──────────────────────────────────────────────────── */
@@ -389,13 +461,18 @@ static void scan_file(const char *filepath, BIO_hash h, int seed, int mg_idx, ui
     }
 
     kseq_t *seq = kseq_init(fp);
-    char *seedStrRevComp = malloc(10000);
+    size_t rc_cap = 0;
+    char *seedStrRevComp = NULL;   /* grown per read: no fixed 10 kb limit */
     unsigned int i;
 
     while (kseq_read(seq) >= 0) {
         if ((int)seq->seq.l < seed) continue;
         BIO_stringToUpper(seq->seq.s);
 
+        if (seq->seq.l + 1 > rc_cap) {
+            rc_cap = seq->seq.l + 1;
+            seedStrRevComp = realloc(seedStrRevComp, rc_cap);
+        }
         strcpy(seedStrRevComp, seq->seq.s);
         BIO_reverseComplement(seedStrRevComp);
 
@@ -503,8 +580,9 @@ static void ksd_pool_wait_and_destroy(ksd_pool *pool) {
 /* ── usage ─────────────────────────────────────────────────────────── */
 
 static void usage(void) {
-    fprintf(stderr, "Usage: kmer_strain_detect -k <kmer_tsv> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-G <background.txt>] [-j threads]\n\n");
-    fprintf(stderr, "  -k  kmer TSV with a '#kmer' column (plain or gzipped)\n");
+    fprintf(stderr, "Usage: kmer_strain_detect -k <kmers> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-G <background.txt>] [-j threads]\n\n");
+    fprintf(stderr, "  -k  kmers (plain or gzipped): TSV with a '#kmer' header column, or a\n");
+    fprintf(stderr, "      headerless list with the kmer in the first column ('#' lines skipped)\n");
     fprintf(stderr, "  -B  target metagenomes file (tab-separated: type file1 [file2]), or with a header\n");
     fprintf(stderr, "      line naming columns: type|sequencing_type, file1/file2 or seq_file (comma-sep),\n");
     fprintf(stderr, "      and optional sample_name (used as the output column name)\n");
@@ -513,7 +591,7 @@ static void usage(void) {
     fprintf(stderr, "  -o  output file (e.g. sample.kmer_hits.tsv.gz)\n");
     fprintf(stderr, "  -j  threads (default: 4)\n\n");
     fprintf(stderr, "Output: gzipped TSV — first column is #kmer, then target columns,\n");
-    fprintf(stderr, "        then backmeta_* columns for background metagenomes.\n");
+    fprintf(stderr, "        then b_* columns for background metagenomes.\n");
 }
 
 /* ── main ──────────────────────────────────────────────────────────── */
@@ -546,7 +624,7 @@ int main(int argc, char *argv[]) {
     if (n_mg == 0) { fprintf(stderr, "no valid metagenomes in targets file\n"); return 1; }
     fprintf(stderr, "loaded %d metagenome(s)\n", n_mg);
 
-    /* 1b. parse background metagenomes and append with backmeta_ prefix */
+    /* 1b. parse background metagenomes and append with b_ prefix */
     int n_total = n_mg;
     if (background_file) {
         Metagenome *bg;
@@ -573,20 +651,24 @@ int main(int argc, char *argv[]) {
     n_kmers = parse_kmer_tsv(kmer_file, h, n_total, &seed, &kmer_list);
     fprintf(stderr, "loaded %d kmer(s) (k=%d)\n", n_kmers, seed);
 
-    /* 3. scan all metagenomes in parallel */
+    /* 3. scan all metagenomes in parallel (nothing to count -> skip; seed is -1) */
     uint64_t *total_kmer_counts = calloc(n_total, sizeof(uint64_t));
-    ksd_pool *pool = ksd_pool_create(num_threads, n_total + 1);
-    for (int i = 0; i < n_total; i++) {
-        ksd_job *job = malloc(sizeof(ksd_job));
-        job->mg_idx           = i;
-        job->mg               = &mgs[i];
-        job->h                = h;
-        job->seed             = seed;
-        job->total_kmer_counts = total_kmer_counts;
-        ksd_pool_submit(pool, job);
+    if (n_kmers > 0) {
+        ksd_pool *pool = ksd_pool_create(num_threads, n_total + 1);
+        for (int i = 0; i < n_total; i++) {
+            ksd_job *job = malloc(sizeof(ksd_job));
+            job->mg_idx           = i;
+            job->mg               = &mgs[i];
+            job->h                = h;
+            job->seed             = seed;
+            job->total_kmer_counts = total_kmer_counts;
+            ksd_pool_submit(pool, job);
+        }
+        ksd_pool_wait_and_destroy(pool);
+        fprintf(stderr, "done scanning\n");
+    } else {
+        fprintf(stderr, "WARNING: no kmers to count, writing header-only output\n");
     }
-    ksd_pool_wait_and_destroy(pool);
-    fprintf(stderr, "done scanning\n");
 
     /* 4. write gzipped TSV output */
     gzFile out = gzopen(outfile, "wb9");
@@ -600,7 +682,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < n_total; i++) gzprintf(out, "\t%s", mgs[i].basename);
     gzprintf(out, "\n");
 
-    /* data rows — in the same order as the input TSV */
+    /* data rows — in the same order as the input file */
     char kmer_rc[MAX_KMER_LEN];
     for (int i = 0; i < n_kmers; i++) {
         strncpy(kmer_rc, kmer_list[i], MAX_KMER_LEN - 1);
