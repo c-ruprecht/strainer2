@@ -124,7 +124,7 @@ def main():
     df_cov_depth = pd.concat([df_cov_depth, df_cov_depth_filt], axis=1)
     
     
-    df_cov_depth.reset_index().to_csv(os.path.join(outpath,"coverage_depth.tsv"), sep = '\t')
+    df_cov_depth.reset_index(names='sample').to_csv(os.path.join(outpath,"coverage_depth.tsv"), sep = '\t')
     print(f'Saved coverage dataframe to \n {outpath}')
 
 
