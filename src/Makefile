@@ -47,7 +47,7 @@ endif
 shared_obj = BIO_sequence.o BIO_hash.o genome_compare.o up2bit.o
 
 BASE_TARGETS = genome_compare genome_compare_presence kmer_scrub_count \
-               strain_detect kmer_strain_detect kmer_strain_detect_genome
+            	kmer_strain_detect kmer_strain_detect_genome
 
 all: $(BASE_TARGETS) $(ZSTD_TARGETS) zstd-note
 
@@ -83,8 +83,6 @@ kmer_scrub_count_individual: kmer_scrub_count_individual.o kmer_scrub_streaming.
 kmer_metagenome_db: kmer_metagenome_db.o kmdb.o
 	$(CC) -o $@ $^ $(LDLIBS) $(ZSTD_LIBS)
 
-strain_detect: strain_detect.o $(shared_obj)
-	$(CC) -o $@ $^ $(LDLIBS)
 
 kmer_strain_detect: kmer_strain_detect.o $(shared_obj)
 	$(CC) -o $@ $^ $(LDLIBS)

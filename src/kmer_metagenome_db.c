@@ -1,14 +1,17 @@
 /*
-	kmer_metagenome_db — build a per-metagenome k-mer database (.kmdb) that
-	supplements the genome scrub database.
+	kmer_metagenome_db — build a per-metagenome k-mer PRESENCE database
+	(.kmdb) that supplements the genome scrub database.
 
 	Keeps exactly the metagenome k-mers with
 
 	    metagenome_count >= -c        (default 2: drops most error k-mers)
 	    pangenome_count  == 0         (absent from every genome in -A)
 
-	so the result carries only signal the genome scrub DB does not already
-	have. Scrubbing a reference with `kmer_scrub_count_individual -B x.kmdb`
+	Only presence is stored: a k-mer seen 3x is identical to one seen 100x.
+	Counts exist only transiently, as an 8-bit saturating counter used to
+	apply -c (so -c must be <= 255). The database is a sorted k-mer list.
+
+	Scrubbing a reference with `kmer_scrub_count_individual -B x.kmdb`
 	then attributes each reference k-mer to the genomes OR to the
 	metagenome, never both.
 
@@ -52,6 +55,8 @@ KSEQ_INIT(gzFile, gzread)
 #define BATCH_BASES      (8u << 20)
 #define N_SLOTS          4
 #define INITIAL_TAB_CAP  (1u << 20)
+#define COUNT_MAX        255u            /* saturating 8-bit counter */
+#define SLOT_BYTES       9               /* 8-byte key + 1-byte count */
 
 /* ── small utils ───────────────────────────────────────────────────── */
 
@@ -160,10 +165,12 @@ static int read_path_list(const char *file, char ***out)
 }
 
 /* ── per-partition open-addressing table ──────────────────────────── */
+/* counts[] is a saturating 8-bit counter, only used to apply -c.
+   After step 2 every survivor has count >= 1; step 3 sets 0 = deleted. */
 
 typedef struct {
 	uint64_t *keys;
-	uint32_t *counts;
+	uint8_t  *counts;
 	size_t    cap;   /* power of two */
 	size_t    n;
 } tab_t;
@@ -173,7 +180,7 @@ static void tab_init(tab_t *t, size_t cap)
 	t->cap    = cap;
 	t->n      = 0;
 	t->keys   = xmalloc(cap * sizeof(uint64_t));
-	t->counts = xmalloc(cap * sizeof(uint32_t));
+	t->counts = xmalloc(cap * sizeof(uint8_t));
 	memset(t->keys, 0xFF, cap * sizeof(uint64_t));
 }
 
@@ -183,7 +190,7 @@ static void tab_free(tab_t *t)
 	t->keys = NULL; t->counts = NULL; t->cap = t->n = 0;
 }
 
-static void tab_put_new(tab_t *t, uint64_t key, uint32_t count)
+static void tab_put_new(tab_t *t, uint64_t key, uint8_t count)
 {
 	size_t mask = t->cap - 1, i = mix64(key) & mask;
 	while (t->keys[i] != EMPTY_KEY) i = (i + 1) & mask;
@@ -209,7 +216,7 @@ static inline void tab_inc(tab_t *t, uint64_t key, uint64_t h)
 	for (;;) {
 		uint64_t k = t->keys[i];
 		if (k == key) {
-			if (t->counts[i] != UINT32_MAX) t->counts[i]++;
+			if (t->counts[i] != COUNT_MAX) t->counts[i]++;
 			return;
 		}
 		if (k == EMPTY_KEY) {
@@ -237,7 +244,7 @@ typedef struct {
 typedef struct {
 	int        k;
 	uint32_t   P;              /* partitions == worker threads */
-	uint32_t   min_count;
+	uint32_t   min_count;      /* 1..COUNT_MAX */
 	tab_t     *tabs;
 
 	/* reads pipeline */
@@ -405,7 +412,7 @@ static void *filter_main(void *arg)
 
 	/* Compact survivors to the front and shrink the arrays before building
 	   the new table, so the old table and the new one are never both at
-	   full size: peak is max(old table, 36 bytes x survivors). */
+	   full size. */
 	size_t keep = 0;
 	for (size_t i = 0; i < t->cap; i++) {
 		if (t->keys[i] != EMPTY_KEY && t->counts[i] >= c->min_count) {
@@ -415,7 +422,7 @@ static void *filter_main(void *arg)
 		}
 	}
 	uint64_t *ks = xrealloc(t->keys,   (keep ? keep : 1) * sizeof(uint64_t));
-	uint32_t *cs = xrealloc(t->counts, (keep ? keep : 1) * sizeof(uint32_t));
+	uint8_t  *cs = xrealloc(t->counts, (keep ? keep : 1) * sizeof(uint8_t));
 
 	tab_t nt;
 	tab_init(&nt, pow2_at_least(keep * 2));   /* load <= 0.5 */
@@ -467,6 +474,7 @@ static void *subtract_main(void *arg)
 				uint64_t key;
 				while ((key = t->keys[i]) != EMPTY_KEY) {
 					if (key == can) {
+						/* mark deleted (count 0); count removals once */
 						if (__atomic_load_n(&t->counts[i], __ATOMIC_RELAXED) &&
 						    __atomic_exchange_n(&t->counts[i], 0, __ATOMIC_RELAXED))
 							removed++;
@@ -493,46 +501,45 @@ static void *subtract_main(void *arg)
 	return NULL;
 }
 
-/* ── step 4: compact + sort ───────────────────────────────────────── */
+/* ── step 4: compact + sort (keys only) ───────────────────────────── */
 
-static inline void swap2(uint64_t *k, uint32_t *c, size_t i, size_t j)
+static inline void swap_keys(uint64_t *k, size_t i, size_t j)
 {
-	uint64_t tk = k[i]; k[i] = k[j]; k[j] = tk;
-	uint32_t tc = c[i]; c[i] = c[j]; c[j] = tc;
+	uint64_t t = k[i]; k[i] = k[j]; k[j] = t;
 }
 
-/* In-place quicksort of keys (unique) carrying counts along. */
-static void sort2(uint64_t *k, uint32_t *c, size_t n)
+/* In-place quicksort of unique keys. */
+static void sort_keys(uint64_t *k, size_t n)
 {
 	while (n > 24) {
 		size_t m = n / 2, hi = n - 1;
 		/* median of three moved to k[0] -> Hoare partition is safe */
-		if (k[m] < k[0])  swap2(k, c, m, 0);
-		if (k[hi] < k[0]) swap2(k, c, hi, 0);
-		if (k[hi] < k[m]) swap2(k, c, hi, m);
-		swap2(k, c, 0, m);
+		if (k[m] < k[0])  swap_keys(k, m, 0);
+		if (k[hi] < k[0]) swap_keys(k, hi, 0);
+		if (k[hi] < k[m]) swap_keys(k, hi, m);
+		swap_keys(k, 0, m);
 		uint64_t p = k[0];
 		ptrdiff_t i = -1, j = (ptrdiff_t)n;
 		for (;;) {
 			do i++; while (k[i] < p);
 			do j--; while (k[j] > p);
 			if (i >= j) break;
-			swap2(k, c, (size_t)i, (size_t)j);
+			swap_keys(k, (size_t)i, (size_t)j);
 		}
 		size_t left = (size_t)j + 1;           /* [0, j] and [j+1, n) */
 		if (left < n - left) {
-			sort2(k, c, left);
-			k += left; c += left; n -= left;
+			sort_keys(k, left);
+			k += left; n -= left;
 		} else {
-			sort2(k + left, c + left, n - left);
+			sort_keys(k + left, n - left);
 			n = left;
 		}
 	}
 	for (size_t i = 1; i < n; i++) {
-		uint64_t kk = k[i]; uint32_t cc = c[i];
+		uint64_t kk = k[i];
 		size_t j = i;
-		while (j > 0 && k[j - 1] > kk) { k[j] = k[j - 1]; c[j] = c[j - 1]; j--; }
-		k[j] = kk; c[j] = cc;
+		while (j > 0 && k[j - 1] > kk) { k[j] = k[j - 1]; j--; }
+		k[j] = kk;
 	}
 }
 
@@ -542,14 +549,14 @@ static void *compact_sort_main(void *arg)
 	tab_t *t = &a->c->tabs[a->tid];
 	size_t j = 0;
 	for (size_t i = 0; i < t->cap; i++) {
-		if (t->keys[i] != EMPTY_KEY && t->counts[i] > 0) {
-			t->keys[j]   = t->keys[i];
-			t->counts[j] = t->counts[i];
-			j++;
-		}
+		if (t->keys[i] != EMPTY_KEY && t->counts[i] > 0)
+			t->keys[j++] = t->keys[i];
 	}
 	t->n = j;
-	sort2(t->keys, t->counts, j);
+	/* counts are no longer needed: release them before the sort/merge */
+	free(t->counts);
+	t->counts = NULL;
+	sort_keys(t->keys, j);
 	return NULL;
 }
 
@@ -578,8 +585,18 @@ static size_t total_n(ctx_t *c)
 static double table_gb(ctx_t *c)
 {
 	size_t b = 0;
-	for (uint32_t i = 0; i < c->P; i++) b += c->tabs[i].cap * 12;
+	for (uint32_t i = 0; i < c->P; i++) b += c->tabs[i].cap * SLOT_BYTES;
 	return b / 1e9;
+}
+
+/* ── output ───────────────────────────────────────────────────────── */
+
+/* Single emission point. kmdb_writer_add() still takes a count argument in
+   the current kmdb format, so we pass the constant 1. Once kmdb.[ch] has a
+   key-only mode, replace this one call (and the open call in main). */
+static inline int emit_kmer(kmdb_writer *w, uint64_t key)
+{
+	return kmdb_writer_add(w, key, 1);
 }
 
 /* ── main ─────────────────────────────────────────────────────────── */
@@ -592,18 +609,20 @@ static void usage(void)
 	"                          [-A <genome list | single genome FASTA>]\n"
 	"                          [-n <sample id>] [-O <output dir, default .>]\n"
 	"                          [-o <output path, overrides -O/-n naming>]\n"
-	"                          [-c <min count, default 2>] [-k <k, default 31>]\n"
+	"                          [-c <min count, 1..255, default 2>] [-k <k, default 31>]\n"
 	"                          [-t <threads, default 4>] [-b <k-mers per block>]\n"
 	"                          [-z <zstd level, default 3>]\n"
 	"\n"
-	"  Writes <-O>/<-n>.kmdb holding the metagenome k-mers with\n"
+	"  Writes <-O>/<-n>.kmdb: a presence-only k-mer list holding the\n"
+	"  metagenome k-mers with\n"
 	"    count in the reads >= -c   and   absent from every -A genome.\n"
+	"  Counts are NOT stored (3x and 100x are the same).\n"
 	"  All -i/-I files are one sample (e.g. R1 + R2). -n defaults to the\n"
 	"  first read file's name without its extension.\n"
 	"  -A is the genome scrub DB list (the same list you pass to\n"
 	"  kmer_scrub_count_individual -A). Without -A nothing is subtracted.\n"
-	"  -c 1 keeps every k-mer (exact parity with scrubbing the FASTQ).\n"
-	"  Memory: peak ~25-30 bytes per distinct k-mer in the reads (all k-mers,\n"
+	"  -c 1 keeps every k-mer seen at least once.\n"
+	"  Memory: peak ~20-25 bytes per distinct k-mer in the reads (all k-mers,\n"
 	"  including errors, before -c), plus ~70 MB of read buffers.\n"
 	"  The database is written to <out>.tmp and renamed when complete.\n");
 	exit(1);
@@ -655,8 +674,10 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "error: -k must be 1..%d (got %ld)\n", KMDB_MAX_K, k);
 		return 1;
 	}
-	if (min_count < 1 || min_count > (long)UINT32_MAX) {
-		fprintf(stderr, "error: -c must be >= 1 (got %ld)\n", min_count);
+	if (min_count < 1 || min_count > (long)COUNT_MAX) {
+		fprintf(stderr, "error: -c must be 1..%u (got %ld); counts are an "
+		        "8-bit saturating counter and are not stored\n",
+		        COUNT_MAX, min_count);
 		return 1;
 	}
 	if (threads < 1) threads = 1;
@@ -710,8 +731,8 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	fprintf(stderr, "kmer_metagenome_db: sample %s, k=%d, min count %u, "
-	        "%u threads, %d read file(s), %d genome(s) to subtract\n",
+	fprintf(stderr, "kmer_metagenome_db (presence-only): sample %s, k=%d, "
+	        "min count %u, %u threads, %d read file(s), %d genome(s) to subtract\n",
 	        name, C.k, C.min_count, C.P, n_reads, C.n_genomes);
 
 	/* 1) count */
@@ -783,7 +804,7 @@ int main(int argc, char *argv[])
 	int werr = 0;
 	while (hn > 0 && !werr) {
 		uint32_t p = heap[0];
-		if (kmdb_writer_add(w, C.tabs[p].keys[pos[p]], C.tabs[p].counts[pos[p]]) != 0)
+		if (emit_kmer(w, C.tabs[p].keys[pos[p]]) != 0)
 			werr = 1;
 		if (++pos[p] == C.tabs[p].n) heap[0] = heap[--hn];
 		uint32_t i = 0;
@@ -800,7 +821,8 @@ int main(int argc, char *argv[])
 
 	/* metadata */
 	kmdb_writer_meta(w, "format", "kmdb");
-	kmdb_writer_meta(w, "created_by", "kmer_metagenome_db 1");
+	kmdb_writer_meta(w, "created_by", "kmer_metagenome_db 2 (presence-only)");
+	kmdb_writer_meta(w, "presence_only", "1");
 	kmdb_writer_meta(w, "sample_id", name);
 	kmdb_writer_meta(w, "canonical", "max(fwd,revcomp) 2-bit A0C1G2T3 MSB-first");
 	kmdb_writer_meta_u64(w, "k", (uint64_t)C.k);
