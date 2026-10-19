@@ -224,6 +224,23 @@ static int read_path_list(const char *file, char ***out)
 	return n;
 }
 
+/* Append one -i value (or positional argument) to the read list. A value
+   may hold several comma-separated paths: -i R1.fq.gz,R2.fq.gz */
+static void add_read_paths(char ***reads, int *n, int *cap, const char *arg)
+{
+	char *dup = strdup(arg), *save = NULL;
+	for (char *tok = strtok_r(dup, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+		while (*tok == ' ' || *tok == '\t') tok++;
+		if (!*tok) continue;
+		if (*n == *cap) {
+			*cap = *cap ? *cap * 2 : 4;
+			*reads = xrealloc(*reads, sizeof(char *) * *cap);
+		}
+		(*reads)[(*n)++] = strdup(tok);
+	}
+	free(dup);
+}
+
 /* ── temporary run files (low-memory mode) ────────────────────────── */
 /* Removed at exit whatever happens (a job killed by a signal leaves
    them behind; they are named <out>.passNNN.tmp or <-W>/<name>.passNNN.tmp). */
@@ -1058,8 +1075,9 @@ static int merge_runs(char **paths, uint32_t n, int counts, kmdb_writer *w)
 static void usage(void)
 {
 	fprintf(stderr,
-	"Usage: kmer_metagenome_db [-T scrub|sample] -i <reads.fastq.gz> [-i <reads_2.fastq.gz> ...]\n"
-	"                          [-I <file listing read files>]\n"
+	"Usage: kmer_metagenome_db [-T scrub|sample] [options] <reads.fastq.gz> [<reads_2.fastq.gz> ...]\n"
+	"       read files: as trailing arguments, and/or -i <file>[,<file>...] (repeatable),\n"
+	"                   and/or -I <file listing read files, one per line>\n"
 	"                          [-A <genome list | single genome FASTA>]\n"
 	"                          [-n <sample id>] [-O <output dir, default .>]\n"
 	"                          [-o <output path, overrides -O/-n naming>]\n"
@@ -1074,7 +1092,8 @@ static void usage(void)
 	"  metagenome k-mers with\n"
 	"    count in the reads >= -c   and   absent from every -A genome.\n"
 	"  Counts are NOT stored (3x and 100x are the same).\n"
-	"  All -i/-I files are one sample (e.g. R1 + R2). -n defaults to the\n"
+	"  All read files (trailing arguments, -i, -I) are one sample (e.g. R1 + R2),\n"
+	"  read in that order; no need to cat them together. -n defaults to the\n"
 	"  first read file's name without its extension.\n"
 	"  -A is the genome scrub DB list (the same list you pass to\n"
 	"  kmer_scrub_count_individual -A). Without -A nothing is subtracted.\n"
@@ -1129,13 +1148,7 @@ int main(int argc, char *argv[])
 
 	while ((c = getopt(argc, argv, "T:i:I:A:n:O:o:c:k:t:b:z:M:R:EW:h")) != -1) {
 		switch (c) {
-		case 'i':
-			if (n_reads == cap_reads) {
-				cap_reads = cap_reads ? cap_reads * 2 : 4;
-				reads = xrealloc(reads, sizeof(char *) * cap_reads);
-			}
-			reads[n_reads++] = strdup(optarg);
-			break;
+		case 'i': add_read_paths(&reads, &n_reads, &cap_reads, optarg); break;
 		case 'T':
 			if      (!strcasecmp(optarg, "scrub"))  mode = MODE_SCRUB;
 			else if (!strcasecmp(optarg, "sample")) mode = MODE_SAMPLE;
@@ -1161,6 +1174,9 @@ int main(int argc, char *argv[])
 		default:  usage();
 		}
 	}
+	/* any non-option arguments are read files too: ... -o out.kmdb {input} */
+	for (int i = optind; i < argc; i++)
+		add_read_paths(&reads, &n_reads, &cap_reads, argv[i]);
 	if (reads_list) {
 		char **more; int m = read_path_list(reads_list, &more);
 		for (int i = 0; i < m; i++) {
@@ -1267,7 +1283,23 @@ int main(int argc, char *argv[])
 	}
 
 	/* 0) -R / -E: estimate distinct k-mers, choose M */
+	/* Several read passes need inputs that can be read more than once: a
+	   pipe or process substitution (<(cat ...)) is consumed by the first. */
+	if (ram_gb > 0 || estimate_only || C.M > 1) {
+		for (int i = 0; i < n_reads; i++) {
+			struct stat rs;
+			if (stat(reads[i], &rs) != 0 || !S_ISREG(rs.st_mode)) {
+				fprintf(stderr, "error: -i %s is not a regular file (a pipe or <(...) "
+				        "process substitution?). -M/-R/-E read the input several times; "
+				        "pass the files directly with one -i each (R1 and R2 may be "
+				        "separate -i).\n", reads[i]);
+				return 1;
+			}
+		}
+	}
+
 	double est_distinct = 0.0;
+	uint64_t est_valid = 0;
 	if (ram_gb > 0 || estimate_only) {
 		fprintf(stderr, "[0] estimating distinct k-mers (HyperLogLog, one read pass)\n");
 		C.hll = calloc((size_t)C.P * HLL_M, 1);
@@ -1282,6 +1314,11 @@ int main(int argc, char *argv[])
 					C.hll[i] = C.hll[(size_t)t * HLL_M + i];
 		est_distinct = hll_estimate(C.hll);
 		uint64_t valid = C.n_valid;
+		est_valid = valid;
+		if (valid == 0) {
+			fprintf(stderr, "error: no valid k-mer windows in the reads\n");
+			return 1;
+		}
 		free(C.hll); C.hll = NULL;
 
 		uint32_t chosen = 0;
@@ -1368,6 +1405,23 @@ int main(int argc, char *argv[])
 		}
 		if (pass == 0) {
 			st_reads = C.n_reads; st_positions = C.n_positions; st_valid = C.n_valid;
+			if (st_valid == 0) {
+				fprintf(stderr, "error: no valid k-mer windows in the reads, no "
+				        "database written\n");
+				return 1;
+			}
+			if (est_valid && st_valid != est_valid) {
+				fprintf(stderr, "error: the reads changed between the estimate pass "
+				        "(%" PRIu64 " k-mer windows) and pass 1 (%" PRIu64 ")\n",
+				        est_valid, st_valid);
+				return 1;
+			}
+		} else if (C.n_valid != st_valid || C.n_reads != st_reads) {
+			fprintf(stderr, "error: pass %u read %" PRIu64 " reads / %" PRIu64
+			        " k-mer windows, pass 1 read %" PRIu64 " / %" PRIu64
+			        "; the input changed between passes, no database written\n",
+			        pass + 1, C.n_reads, C.n_valid, st_reads, st_valid);
+			return 1;
 		}
 		uint64_t pass_distinct = total_n(&C);
 		prev_max_part = 0;
