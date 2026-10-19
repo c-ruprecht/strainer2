@@ -42,6 +42,24 @@
 	  The metadata key kmer_positions equals kmer_strain_detect's
 	  total_evaluated for the same reads.
 
+	Low-memory mode (-M <passes> or -R <GB>)
+	  The k-mer space is split into M hash slices by a second hash,
+	  independent of the partition and slot hashes. Pass j reads the
+	  reads again and runs steps 1-4 for slice j only, then writes its
+	  sorted k-mers to a temporary run file (-W, default next to the
+	  output). A final k-way merge of the M runs writes the database.
+	  Slices are disjoint and every slice is processed exactly, so the
+	  database is identical to a single-pass build.
+	  In low-memory mode two more things change, neither affecting output:
+	    - tables are pre-sized (from -R's estimate, or from pass 0 for
+	      later passes), so the doubling spike (old + new table) is avoided;
+	    - the -c filter marks dropped k-mers in place instead of rebuilding
+	      the table, so step 2 needs no extra memory (step 3 lookups run
+	      at load <= 0.7 instead of <= 0.5, slightly slower).
+	  -R first runs one extra read pass with a HyperLogLog sketch to
+	  estimate the number of distinct k-mers, then picks the smallest M
+	  whose predicted peak fits. -E prints the estimate table and exits.
+
 	Canonical form is max(fwd, revcomp) on 2-bit packed k-mers, identical
 	to orient_string()'s choice on ASCII, so the database lines up with
 	BIO_hash keys. Windows containing any non-ACGT base are skipped.
@@ -59,7 +77,11 @@
 #include <stddef.h>
 #include <pthread.h>
 #include <time.h>
+#include <math.h>
 #include <sys/stat.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include "kseq.h"
 #include "kmdb.h"
 
@@ -71,6 +93,14 @@ KSEQ_INIT(gzFile, gzread)
 #define INITIAL_TAB_CAP  (1u << 20)
 #define COUNT_MAX        255u            /* scrub: saturating 8-bit counter */
 #define COUNT32_MAX      UINT32_MAX      /* sample: saturating 32-bit counter */
+#define MAX_PASSES       256
+#define MAX_LOAD_NUM     7               /* tables grow at load 7/10 */
+#define MAX_LOAD_DEN     10
+#define RAM_SAFETY       0.90            /* -R: use at most 90% of the budget */
+#define HLL_P            14              /* 16384 registers, ~0.8% std error */
+#define HLL_M            (1u << HLL_P)
+#define RUN_BUF          (1u << 20)      /* stdio buffer per temporary run */
+#define FIXED_OVERHEAD   100e6           /* read buffers, writer, slack (bytes) */
 
 enum { MODE_SCRUB = 0, MODE_SAMPLE = 1 };
 
@@ -111,11 +141,25 @@ static inline uint32_t part_of(uint64_t h, uint32_t P)
 	return (uint32_t)(((h >> 32) * (uint64_t)P) >> 32);
 }
 
+/* low-memory pass of a k-mer: a second, independent hash so slices are
+   balanced and uncorrelated with partitions and slots */
+static inline uint32_t pass_of(uint64_t h, uint32_t M)
+{
+	uint64_t x = mix64(h + 0x9e3779b97f4a7c15ull);
+	return (uint32_t)(((x >> 32) * (uint64_t)M) >> 32);
+}
+
 static size_t pow2_at_least(size_t n)
 {
 	size_t c = 1024;
 	while (c < n) c <<= 1;
 	return c;
+}
+
+/* smallest power-of-two capacity that holds n keys below the growth load */
+static size_t cap_for(double n)
+{
+	return pow2_at_least((size_t)(n * MAX_LOAD_DEN / MAX_LOAD_NUM) + 1);
 }
 
 static int has_suffix(const char *s, const char *suf)
@@ -180,10 +224,25 @@ static int read_path_list(const char *file, char ***out)
 	return n;
 }
 
+/* ── temporary run files (low-memory mode) ────────────────────────── */
+/* Removed at exit whatever happens (a job killed by a signal leaves
+   them behind; they are named <out>.passNNN.tmp or <-W>/<name>.passNNN.tmp). */
+
+static char **g_runs   = NULL;
+static int    g_n_runs = 0;
+
+static void cleanup_runs(void)
+{
+	for (int i = 0; i < g_n_runs; i++)
+		if (g_runs[i]) { unlink(g_runs[i]); free(g_runs[i]); g_runs[i] = NULL; }
+	g_n_runs = 0;
+}
+
 /* ── per-partition open-addressing table ──────────────────────────── */
 /* scrub:  counts[] is a saturating 8-bit counter, only used to apply -c.
            After step 2 every survivor has count >= 1; step 3 sets
-           0 = deleted. counts32 is NULL.
+           0 = deleted (low-memory step 2 also marks dropped k-mers 0).
+           counts32 is NULL.
    sample: counts32[] is a saturating 32-bit counter that is written to
            the database. counts is NULL. */
 
@@ -245,7 +304,7 @@ static void tab_grow(tab_t *t)
 
 static inline void tab_inc(tab_t *t, uint64_t key, uint64_t h)
 {
-	if (t->n * 10 >= t->cap * 7) tab_grow(t);
+	if (t->n * MAX_LOAD_DEN >= t->cap * MAX_LOAD_NUM) tab_grow(t);
 	size_t mask = t->cap - 1, i = h & mask;
 	for (;;) {
 		uint64_t k = t->keys[i];
@@ -265,7 +324,7 @@ static inline void tab_inc(tab_t *t, uint64_t key, uint64_t h)
 
 static inline void tab_inc32(tab_t *t, uint64_t key, uint64_t h)
 {
-	if (t->n * 10 >= t->cap * 7) tab_grow(t);
+	if (t->n * MAX_LOAD_DEN >= t->cap * MAX_LOAD_NUM) tab_grow(t);
 	size_t mask = t->cap - 1, i = h & mask;
 	for (;;) {
 		uint64_t k = t->keys[i];
@@ -301,6 +360,11 @@ typedef struct {
 	uint32_t   P;              /* partitions == worker threads */
 	uint32_t   min_count;      /* scrub 1..COUNT_MAX, sample 1..COUNT32_MAX */
 	tab_t     *tabs;
+
+	/* low-memory passes */
+	uint32_t   M;              /* number of passes (1 = single pass) */
+	uint32_t   pass;           /* current pass */
+	uint8_t   *hll;            /* P * HLL_M registers, estimate pass only */
 
 	/* reads pipeline */
 	char     **read_files;
@@ -407,7 +471,73 @@ static void *reader_main(void *arg)
 	return NULL;
 }
 
+/* Wait for batch s; NULL once the reader is done and s was never published. */
+static batch_t *wait_batch(ctx_t *c, uint64_t s)
+{
+	batch_t *b = &c->slots[s % N_SLOTS];
+	pthread_mutex_lock(&c->mtx);
+	while (!(b->ready && b->seqno == s) && !(c->eof && s >= c->n_published))
+		pthread_cond_wait(&c->cv, &c->mtx);
+	int done = !(b->ready && b->seqno == s);
+	pthread_mutex_unlock(&c->mtx);
+	return done ? NULL : b;
+}
+
+static void release_batch(ctx_t *c, batch_t *b)
+{
+	pthread_mutex_lock(&c->mtx);
+	if (--b->remaining == 0) {
+		b->ready = 0;
+		pthread_cond_broadcast(&c->cv);
+	}
+	pthread_mutex_unlock(&c->mtx);
+}
+
 static void *count_main(void *arg)
+{
+	targ_t *a = arg;
+	ctx_t *c = a->c;
+	const uint32_t tid = a->tid, P = c->P, M = c->M, pass = c->pass;
+	const int k = c->k;
+	const int shift = 2 * (k - 1);
+	const uint64_t mask = (k == 32) ? UINT64_MAX : ((1ull << (2 * k)) - 1);
+	tab_t *t = &c->tabs[tid];
+	const int wide = c->mode == MODE_SAMPLE;   /* loop-invariant */
+	uint64_t valid = 0;
+	batch_t *b;
+
+	for (uint64_t s = 0; (b = wait_batch(c, s)) != NULL; s++) {
+		const char *p = b->seq;
+		for (size_t r = 0; r < b->n; r++) {
+			const char *end = p + b->lens[r];
+			uint64_t fwd = 0, rev = 0;
+			int l = 0;
+			for (; p < end; p++) {
+				uint8_t x = KMDB_NT2BIT[(unsigned char)*p];
+				if (x > 3) { l = 0; fwd = rev = 0; continue; }
+				fwd = ((fwd << 2) | x) & mask;
+				rev = (rev >> 2) | ((uint64_t)(3 - x) << shift);
+				if (++l >= k) {
+					uint64_t can = fwd > rev ? fwd : rev;
+					uint64_t h = mix64(can);
+					if (part_of(h, P) == tid &&
+					    (M == 1 || pass_of(h, M) == pass)) {
+						if (wide) tab_inc32(t, can, h);
+						else      tab_inc(t, can, h);
+					}
+					valid++;
+				}
+			}
+		}
+		release_batch(c, b);
+	}
+	if (tid == 0) c->n_valid = valid;   /* every worker sees every window */
+	return NULL;
+}
+
+/* ── step 0 (-R / -E): HyperLogLog estimate of distinct k-mers ────── */
+
+static void *hll_main(void *arg)
 {
 	targ_t *a = arg;
 	ctx_t *c = a->c;
@@ -415,19 +545,11 @@ static void *count_main(void *arg)
 	const int k = c->k;
 	const int shift = 2 * (k - 1);
 	const uint64_t mask = (k == 32) ? UINT64_MAX : ((1ull << (2 * k)) - 1);
-	tab_t *t = &c->tabs[tid];
-	const int wide = c->mode == MODE_SAMPLE;   /* loop-invariant */
+	uint8_t *reg = c->hll + (size_t)tid * HLL_M;
 	uint64_t valid = 0;
+	batch_t *b;
 
-	for (uint64_t s = 0;; s++) {
-		batch_t *b = &c->slots[s % N_SLOTS];
-		pthread_mutex_lock(&c->mtx);
-		while (!(b->ready && b->seqno == s) && !(c->eof && s >= c->n_published))
-			pthread_cond_wait(&c->cv, &c->mtx);
-		int done = !(b->ready && b->seqno == s);
-		pthread_mutex_unlock(&c->mtx);
-		if (done) break;
-
+	for (uint64_t s = 0; (b = wait_batch(c, s)) != NULL; s++) {
 		const char *p = b->seq;
 		for (size_t r = 0; r < b->n; r++) {
 			const char *end = p + b->lens[r];
@@ -442,23 +564,33 @@ static void *count_main(void *arg)
 					uint64_t can = fwd > rev ? fwd : rev;
 					uint64_t h = mix64(can);
 					if (part_of(h, P) == tid) {
-						if (wide) tab_inc32(t, can, h);
-						else      tab_inc(t, can, h);
+						uint32_t idx = (uint32_t)(h & (HLL_M - 1));
+						uint8_t rank = (uint8_t)(__builtin_ctzll(
+							(h >> HLL_P) | (1ull << (64 - HLL_P))) + 1);
+						if (rank > reg[idx]) reg[idx] = rank;
 					}
 					valid++;
 				}
 			}
 		}
-
-		pthread_mutex_lock(&c->mtx);
-		if (--b->remaining == 0) {
-			b->ready = 0;
-			pthread_cond_broadcast(&c->cv);
-		}
-		pthread_mutex_unlock(&c->mtx);
+		release_batch(c, b);
 	}
-	if (tid == 0) c->n_valid = valid;   /* every worker sees every window */
+	if (tid == 0) c->n_valid = valid;
 	return NULL;
+}
+
+static double hll_estimate(const uint8_t *reg)
+{
+	const double m = HLL_M;
+	double sum = 0.0;
+	uint32_t zeros = 0;
+	for (uint32_t i = 0; i < HLL_M; i++) {
+		sum += ldexp(1.0, -(int)reg[i]);
+		if (reg[i] == 0) zeros++;
+	}
+	double e = (0.7213 / (1.0 + 1.079 / m)) * m * m / sum;
+	if (e <= 2.5 * m && zeros) e = m * log(m / zeros);   /* small range */
+	return e;
 }
 
 /* ── step 2: min-count filter ─────────────────────────────────────── */
@@ -492,13 +624,31 @@ static void *filter_main(void *arg)
 	return NULL;
 }
 
+/* low-memory step 2: mark dropped k-mers deleted (count 0) in place.
+   No allocation; the probe chains stay intact for step 3. t->n becomes
+   the number of survivors (it is no longer used as a load measure). */
+static void *filter_inplace_main(void *arg)
+{
+	targ_t *a = arg;
+	ctx_t *c = a->c;
+	tab_t *t = &c->tabs[a->tid];
+	size_t keep = 0;
+	for (size_t i = 0; i < t->cap; i++) {
+		if (t->keys[i] == EMPTY_KEY) continue;
+		if (t->counts[i] >= c->min_count) keep++;
+		else t->counts[i] = 0;
+	}
+	t->n = keep;
+	return NULL;
+}
+
 /* ── step 3: genome subtraction ───────────────────────────────────── */
 
 static void *subtract_main(void *arg)
 {
 	targ_t *a = arg;
 	ctx_t *c = a->c;
-	const uint32_t P = c->P;
+	const uint32_t P = c->P, M = c->M, pass = c->pass;
 	const int k = c->k;
 	const int shift = 2 * (k - 1);
 	const uint64_t mask = (1ull << (2 * k)) - 1;
@@ -528,6 +678,7 @@ static void *subtract_main(void *arg)
 				if (++n < k) continue;
 				uint64_t can = fwd > rev ? fwd : rev;
 				uint64_t h = mix64(can);
+				if (M > 1 && pass_of(h, M) != pass) continue;
 				tab_t *t = &c->tabs[part_of(h, P)];
 				size_t tm = t->cap - 1, i = h & tm;
 				uint64_t key;
@@ -694,6 +845,24 @@ static void run_parallel(ctx_t *c, void *(*fn)(void *), uint32_t n)
 	free(th); free(ta);
 }
 
+/* One pass over all read files, `worker` on every batch. 0 = ok. */
+static int read_pass(ctx_t *c, void *(*worker)(void *))
+{
+	c->n_published = 0;
+	c->eof = 0;
+	c->read_error = 0;
+	c->n_reads = c->n_positions = c->n_valid = 0;
+	for (int i = 0; i < N_SLOTS; i++) c->slots[i].ready = 0;
+	pthread_t rt;
+	if (pthread_create(&rt, NULL, reader_main, c) != 0) {
+		fprintf(stderr, "pthread_create failed\n");
+		exit(EXIT_FAILURE);
+	}
+	run_parallel(c, worker, c->P);
+	pthread_join(rt, NULL);
+	return c->read_error ? -1 : 0;
+}
+
 static size_t total_n(ctx_t *c)
 {
 	size_t n = 0;
@@ -707,6 +876,53 @@ static double table_gb(ctx_t *c)
 	size_t slot = c->mode == MODE_SAMPLE ? 12 : 9;   /* key + count */
 	for (uint32_t i = 0; i < c->P; i++) b += c->tabs[i].cap * slot;
 	return b / 1e9;
+}
+
+/* ── memory model ─────────────────────────────────────────────────── */
+/* Peak of one pass in low-memory mode: every partition table at the
+   capacity that holds its share below load 0.7. Pre-sized tables never
+   grow; tables that grow from INITIAL_TAB_CAP briefly hold old + new
+   (1.5x the final capacity). Steps 2-4 need no more than this in
+   low-memory mode. 2% headroom covers estimate error and imbalance. */
+static double est_peak_bytes(double distinct, uint32_t M, uint32_t P,
+                             size_t slot, int presized)
+{
+	double per_part = distinct / ((double)M * P) * 1.02;
+	size_t cap = cap_for(per_part);
+	double spike = 1.0;
+	if (!presized) {
+		if (cap < INITIAL_TAB_CAP) cap = INITIAL_TAB_CAP;
+		else if (cap > INITIAL_TAB_CAP) spike = 1.5;
+	}
+	return (double)P * cap * slot * spike + FIXED_OVERHEAD
+	     + (M > 1 ? (double)M * RUN_BUF : 0.0);
+}
+
+static void print_estimate_table(FILE *fp, double distinct, uint32_t P,
+                                 size_t slot, uint64_t valid, double ram_gb,
+                                 uint32_t chosen)
+{
+	static const uint32_t ms[] = { 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
+	                               96, 128, 192, 256, 0 };
+	fprintf(fp, "estimated distinct k-mers: %.3g  (HyperLogLog, ~1%% error; "
+	        "%.3g valid k-mer windows, %.2f distinct per window)\n",
+	        distinct, (double)valid, valid ? distinct / valid : 0.0);
+	fprintf(fp, "predicted peak RAM with %u thread(s), %zu-byte slots:\n", P, slot);
+	fprintf(fp, "  %6s  %13s  %16s  %16s  %10s\n", "passes", "k-mers/pass",
+	        "-R (presized) GB", "-M only GB", "read passes");
+	for (int i = 0; ms[i]; i++) {
+		uint32_t M = ms[i];
+		double pr = est_peak_bytes(distinct, M, P, slot, 1) / 1e9;
+		double pm = est_peak_bytes(distinct, M, P, slot, 0) / 1e9;
+		fprintf(fp, "  %6u  %13.3g  %16.2f  %16.2f  %10u%s\n", M,
+		        distinct / M, pr, pm, M + 1,
+		        M == chosen ? "   <- chosen for -R" : "");
+	}
+	fprintf(fp, "  (read passes: M counting passes + 1 estimate pass; -M only "
+	        "skips the estimate pass\n   but pass 0 grows its tables, so it "
+	        "needs the right-hand column.)\n");
+	if (ram_gb > 0)
+		fprintf(fp, "  budget -R %.2f GB, %.0f%% usable\n", ram_gb, RAM_SAFETY * 100);
 }
 
 /* ── output ───────────────────────────────────────────────────────── */
@@ -725,6 +941,118 @@ static inline int emit_kmer_count(kmdb_writer *w, uint64_t key, uint32_t count)
 	return kmdb_writer_add(w, key, count);
 }
 
+/* Where sorted k-mers go: the database (single pass) or a run file. */
+typedef struct {
+	kmdb_writer *w;
+	FILE        *fp;
+	int          counts;    /* sample mode: carry counts */
+} sink_t;
+
+static inline int sink_put(sink_t *s, uint64_t key, uint32_t count)
+{
+	if (s->w) return s->counts ? emit_kmer_count(s->w, key, count)
+	                           : emit_kmer(s->w, key);
+	if (fwrite(&key, sizeof key, 1, s->fp) != 1) return -1;
+	if (s->counts && fwrite(&count, sizeof count, 1, s->fp) != 1) return -1;
+	return 0;
+}
+
+/* k-way merge of the sorted partitions (min-heap on key) into s. */
+static int merge_partitions(ctx_t *C, sink_t *s)
+{
+	uint32_t *heap = xmalloc(sizeof(uint32_t) * C->P);
+	size_t *pos = calloc(C->P, sizeof(size_t));
+	uint32_t hn = 0;
+#define HKEY(p) (C->tabs[p].keys[pos[p]])
+	for (uint32_t p = 0; p < C->P; p++) {
+		if (C->tabs[p].n == 0) continue;
+		uint32_t i = hn++;
+		heap[i] = p;
+		while (i > 0 && HKEY(heap[(i - 1) / 2]) > HKEY(heap[i])) {
+			uint32_t t = heap[i]; heap[i] = heap[(i - 1) / 2]; heap[(i - 1) / 2] = t;
+			i = (i - 1) / 2;
+		}
+	}
+	int werr = 0;
+	while (hn > 0 && !werr) {
+		uint32_t p = heap[0];
+		uint32_t cnt = C->mode == MODE_SAMPLE ? C->tabs[p].counts32[pos[p]] : 1;
+		if (sink_put(s, C->tabs[p].keys[pos[p]], cnt) != 0) werr = 1;
+		if (++pos[p] == C->tabs[p].n) heap[0] = heap[--hn];
+		uint32_t i = 0;
+		for (;;) {
+			uint32_t l = 2 * i + 1, r = l + 1, m = i;
+			if (l < hn && HKEY(heap[l]) < HKEY(heap[m])) m = l;
+			if (r < hn && HKEY(heap[r]) < HKEY(heap[m])) m = r;
+			if (m == i) break;
+			uint32_t t = heap[i]; heap[i] = heap[m]; heap[m] = t;
+			i = m;
+		}
+	}
+#undef HKEY
+	free(heap); free(pos);
+	return werr ? -1 : 0;
+}
+
+/* final merge of the M disjoint, sorted run files into the database */
+typedef struct { FILE *fp; uint64_t key; uint32_t cnt; } runrd_t;
+
+/* 1 = got a record, 0 = clean EOF, -1 = error */
+static int run_next(runrd_t *r, int counts)
+{
+	if (fread(&r->key, sizeof r->key, 1, r->fp) != 1)
+		return ferror(r->fp) ? -1 : 0;
+	r->cnt = 1;
+	if (counts && fread(&r->cnt, sizeof r->cnt, 1, r->fp) != 1) return -1;
+	return 1;
+}
+
+static int merge_runs(char **paths, uint32_t n, int counts, kmdb_writer *w)
+{
+	runrd_t *rd = calloc(n, sizeof *rd);
+	uint32_t *heap = xmalloc(sizeof(uint32_t) * n);
+	uint32_t hn = 0;
+	int err = 0;
+	for (uint32_t i = 0; i < n && !err; i++) {
+		rd[i].fp = fopen(paths[i], "rb");
+		if (!rd[i].fp) {
+			fprintf(stderr, "error: cannot reopen %s: %s\n", paths[i], strerror(errno));
+			err = 1;
+			break;
+		}
+		setvbuf(rd[i].fp, NULL, _IOFBF, RUN_BUF);
+		int rc = run_next(&rd[i], counts);
+		if (rc < 0) { err = 1; break; }
+		if (rc == 0) continue;
+		uint32_t j = hn++;
+		heap[j] = i;
+		while (j > 0 && rd[heap[(j - 1) / 2]].key > rd[heap[j]].key) {
+			uint32_t t = heap[j]; heap[j] = heap[(j - 1) / 2]; heap[(j - 1) / 2] = t;
+			j = (j - 1) / 2;
+		}
+	}
+	while (hn > 0 && !err) {
+		runrd_t *r = &rd[heap[0]];
+		int rc = counts ? emit_kmer_count(w, r->key, r->cnt) : emit_kmer(w, r->key);
+		if (rc != 0) { err = 1; break; }
+		rc = run_next(r, counts);
+		if (rc < 0) { fprintf(stderr, "error: reading a run file failed\n"); err = 1; break; }
+		if (rc == 0) heap[0] = heap[--hn];
+		uint32_t j = 0;
+		for (;;) {
+			uint32_t l = 2 * j + 1, rr = l + 1, m = j;
+			if (l < hn && rd[heap[l]].key < rd[heap[m]].key) m = l;
+			if (rr < hn && rd[heap[rr]].key < rd[heap[m]].key) m = rr;
+			if (m == j) break;
+			uint32_t t = heap[j]; heap[j] = heap[m]; heap[m] = t;
+			j = m;
+		}
+	}
+	for (uint32_t i = 0; i < n; i++) if (rd[i].fp) fclose(rd[i].fp);
+	free(rd); free(heap);
+	return err ? -1 : 0;
+}
+
 /* ── main ─────────────────────────────────────────────────────────── */
 
 static void usage(void)
@@ -739,6 +1067,7 @@ static void usage(void)
 	"                          [-k <k, default 31>]\n"
 	"                          [-t <threads, default 4>] [-b <k-mers per block>]\n"
 	"                          [-z <zstd level, default 3>]\n"
+	"                          [-M <passes> | -R <RAM GB>] [-E] [-W <temp dir>]\n"
 	"\n"
 	"  -T scrub (default)\n"
 	"  Writes <-O>/<-n>.kmdb: a presence-only k-mer list holding the\n"
@@ -750,18 +1079,38 @@ static void usage(void)
 	"  -A is the genome scrub DB list (the same list you pass to\n"
 	"  kmer_scrub_count_individual -A). Without -A nothing is subtracted.\n"
 	"  -c 1 keeps every k-mer seen at least once.\n"
-	"  Memory: peak ~20-25 bytes per distinct k-mer in the reads (all k-mers,\n"
-	"  including errors, before -c), plus ~70 MB of read buffers.\n"
+	"  Memory: ~13-26 bytes per distinct k-mer in the reads (all k-mers,\n"
+	"  including errors, before -c), briefly up to ~39 while a table grows,\n"
+	"  plus ~70 MB of read buffers.\n"
 	"\n"
 	"  -T sample\n"
 	"  Writes <-O>/<-n>.kmdb holding every canonical k-mer of the reads with\n"
 	"  its exact count (32-bit). No genome subtraction (-A is rejected).\n"
 	"  -c drops k-mers seen fewer than -c times (default 1 = keep all, which\n"
 	"  reproduces read scanning exactly). Use as a kmer_strain_detect target.\n"
-	"  Memory: peak ~27-35 bytes per distinct k-mer in the reads (12-byte slots;\n"
-	"  -c only shrinks the output file, not this peak).\n"
+	"  Memory: ~17-34 bytes per distinct k-mer in the reads (12-byte slots),\n"
+	"  briefly up to ~51 while a table grows; -c only shrinks the output file.\n"
 	"\n"
-	"  The database is written to <out>.tmp and renamed when complete.\n");
+	"  Low-memory mode (same database, more time)\n"
+	"  -M <passes>  split the k-mers into M hash slices and build one slice per\n"
+	"               pass (1..%d). Peak RAM drops roughly M-fold; the reads are\n"
+	"               read M times and, in scrub mode, the -A genomes are streamed\n"
+	"               M times. Sorted slices go to temporary run files (8 bytes per\n"
+	"               output k-mer in scrub mode, 12 in sample mode) that are\n"
+	"               merged at the end and then deleted.\n"
+	"  -R <GB>      RAM budget: read the reads once to estimate the distinct\n"
+	"               k-mers (HyperLogLog), print the estimate table, then pick the\n"
+	"               smallest M whose predicted peak is <= %.0f%% of <GB>.\n"
+	"               Tables are pre-sized, so -R needs less RAM than -M alone for\n"
+	"               the same M.\n"
+	"  -E           print the estimate table (stdout) and exit; with -R also show\n"
+	"               the M it would choose. Nothing is written.\n"
+	"  -W <dir>     directory for the run files (default: next to the output).\n"
+	"               Use local scratch on a cluster.\n"
+	"  -M 1 (or no -M/-R) is the original single-pass build.\n"
+	"\n"
+	"  The database is written to <out>.tmp and renamed when complete.\n",
+	MAX_PASSES, RAM_SAFETY * 100);
 	exit(1);
 }
 
@@ -769,14 +1118,16 @@ int main(int argc, char *argv[])
 {
 	char **reads = NULL; int n_reads = 0, cap_reads = 0;
 	char *reads_list = NULL, *genome_list = NULL;
-	char *name = NULL, *out_dir = NULL, *out_path = NULL;
+	char *name = NULL, *out_dir = NULL, *out_path = NULL, *tmp_dir = NULL;
 	long long min_count = 0;
 	int c_given = 0;           /* -c not given -> mode default */
-	long k = 31, threads = 4, block_n = 0, level = 3;
+	long k = 31, threads = 4, block_n = 0, level = 3, passes = 0;
+	double ram_gb = 0.0;
+	int estimate_only = 0;
 	int mode = MODE_SCRUB;
 	int c;
 
-	while ((c = getopt(argc, argv, "T:i:I:A:n:O:o:c:k:t:b:z:h")) != -1) {
+	while ((c = getopt(argc, argv, "T:i:I:A:n:O:o:c:k:t:b:z:M:R:EW:h")) != -1) {
 		switch (c) {
 		case 'i':
 			if (n_reads == cap_reads) {
@@ -803,6 +1154,10 @@ int main(int argc, char *argv[])
 		case 't': threads     = atol(optarg); break;
 		case 'b': block_n     = atol(optarg); break;
 		case 'z': level       = atol(optarg); break;
+		case 'M': passes      = atol(optarg); break;
+		case 'R': ram_gb      = atof(optarg); break;
+		case 'E': estimate_only = 1; break;
+		case 'W': tmp_dir     = strdup(optarg); break;
 		default:  usage();
 		}
 	}
@@ -839,6 +1194,18 @@ int main(int argc, char *argv[])
 		        "performed); drop -A or use -T scrub\n");
 		return 1;
 	}
+	if (passes && ram_gb > 0) {
+		fprintf(stderr, "error: give -M or -R, not both\n");
+		return 1;
+	}
+	if (passes < 0 || passes > MAX_PASSES) {
+		fprintf(stderr, "error: -M must be 1..%d (got %ld)\n", MAX_PASSES, passes);
+		return 1;
+	}
+	if (ram_gb < 0) {
+		fprintf(stderr, "error: -R must be a positive number of GB\n");
+		return 1;
+	}
 	if (threads < 1) threads = 1;
 	if (threads > 256) threads = 256;
 	if (block_n < 0 || block_n > (1L << 26)) {
@@ -858,7 +1225,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "error: -n must be a bare name (got %s)\n", name);
 		return 1;
 	}
-	if (!out_path) {
+	if (!out_path && !estimate_only) {
 		if (!out_dir) out_dir = strdup(".");
 		if (mkdir(out_dir, 0777) != 0 && errno != EEXIST) {
 			fprintf(stderr, "error: cannot create %s: %s\n", out_dir, strerror(errno));
@@ -869,22 +1236,29 @@ int main(int argc, char *argv[])
 		snprintf(out_path, need, "%s/%s.kmdb", out_dir, name);
 	}
 
+#ifdef __GLIBC__
+	/* Serve every table from its own mmap, so freeing a pass's tables
+	   returns the memory to the OS instead of leaving a fragmented heap. */
+	mallopt(M_MMAP_THRESHOLD, 4 << 20);
+#endif
+
 	ctx_t C;
 	memset(&C, 0, sizeof C);
 	C.k            = (int)k;
 	C.mode         = mode;
 	C.P            = (uint32_t)threads;
 	C.min_count    = (uint32_t)min_count;
+	C.M            = passes > 0 ? (uint32_t)passes : 1;
 	C.read_files   = reads;
 	C.n_read_files = n_reads;
 	C.t_start      = now_s();
 	pthread_mutex_init(&C.mtx, NULL);
 	pthread_cond_init(&C.cv, NULL);
-	C.tabs = xmalloc(sizeof(tab_t) * C.P);
-	for (uint32_t i = 0; i < C.P; i++)
-		tab_init(&C.tabs[i], INITIAL_TAB_CAP, mode == MODE_SAMPLE);
+	C.tabs = calloc(C.P, sizeof(tab_t));
+	const size_t slot = mode == MODE_SAMPLE ? 12 : 9;
+	const int wide = mode == MODE_SAMPLE;
 
-	if (genome_list) {
+	if (genome_list && !estimate_only) {
 		C.n_genomes = read_path_list(genome_list, &C.genomes);
 		if (C.n_genomes == 0) {
 			fprintf(stderr, "error: -A %s lists no genomes\n", genome_list);
@@ -892,128 +1266,212 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	/* 0) -R / -E: estimate distinct k-mers, choose M */
+	double est_distinct = 0.0;
+	if (ram_gb > 0 || estimate_only) {
+		fprintf(stderr, "[0] estimating distinct k-mers (HyperLogLog, one read pass)\n");
+		C.hll = calloc((size_t)C.P * HLL_M, 1);
+		if (!C.hll) { fprintf(stderr, "out of memory\n"); return 1; }
+		if (read_pass(&C, hll_main) != 0) {
+			fprintf(stderr, "error: reading failed\n");
+			return 1;
+		}
+		for (uint32_t t = 1; t < C.P; t++)
+			for (uint32_t i = 0; i < HLL_M; i++)
+				if (C.hll[(size_t)t * HLL_M + i] > C.hll[i])
+					C.hll[i] = C.hll[(size_t)t * HLL_M + i];
+		est_distinct = hll_estimate(C.hll);
+		uint64_t valid = C.n_valid;
+		free(C.hll); C.hll = NULL;
+
+		uint32_t chosen = 0;
+		if (ram_gb > 0) {
+			for (uint32_t m = 1; m <= MAX_PASSES; m++)
+				if (est_peak_bytes(est_distinct, m, C.P, slot, 1)
+				    <= ram_gb * 1e9 * RAM_SAFETY) { chosen = m; break; }
+		}
+		print_estimate_table(estimate_only ? stdout : stderr, est_distinct,
+		                     C.P, slot, valid, ram_gb, chosen);
+		if (ram_gb > 0 && !chosen) {
+			double min_gb = est_peak_bytes(est_distinct, MAX_PASSES, C.P, slot, 1) / 1e9;
+			fprintf(estimate_only ? stdout : stderr,
+			        "error: even %d passes need ~%.2f GB > %.0f%% of -R %.2f GB\n",
+			        MAX_PASSES, min_gb, RAM_SAFETY * 100, ram_gb);
+			return 1;
+		}
+		if (estimate_only) return 0;
+		C.M = chosen;
+		fprintf(stderr, "-R %.2f GB: using %u pass(es), predicted peak %.2f GB\n",
+		        ram_gb, C.M, est_peak_bytes(est_distinct, C.M, C.P, slot, 1) / 1e9);
+	}
+	const int lowmem = C.M > 1 || ram_gb > 0;
+
 	if (mode == MODE_SCRUB)
 		fprintf(stderr, "kmer_metagenome_db (presence-only): sample %s, k=%d, "
-		        "min count %u, %u threads, %d read file(s), %d genome(s) to subtract\n",
+		        "min count %u, %u threads, %d read file(s), %d genome(s) to subtract",
 		        name, C.k, C.min_count, C.P, n_reads, C.n_genomes);
 	else
 		fprintf(stderr, "kmer_metagenome_db (sample counts): sample %s, k=%d, "
-		        "min count %u, %u threads, %d read file(s)\n",
+		        "min count %u, %u threads, %d read file(s)",
 		        name, C.k, C.min_count, C.P, n_reads);
+	fprintf(stderr, lowmem ? ", low-memory: %u pass(es)\n" : "\n", C.M);
 
-	/* 1) count */
-	fprintf(stderr, "[1/4] counting k-mers\n");
-	pthread_t rt;
-	pthread_create(&rt, NULL, reader_main, &C);
-	run_parallel(&C, count_main, C.P);
-	pthread_join(rt, NULL);
-	if (C.read_error) {
-		fprintf(stderr, "error: reading failed, no database written\n");
-		return 1;
-	}
-	uint64_t distinct_all = total_n(&C);
-	fprintf(stderr, "      %" PRIu64 " reads, %" PRIu64 " valid k-mer windows, "
-	        "%" PRIu64 " distinct k-mers (table %.2f GB, %.1fs)\n",
-	        C.n_reads, C.n_valid, distinct_all, table_gb(&C), now_s() - C.t_start);
-
-	uint64_t distinct_min = distinct_all, final_n;
-	uint64_t count_sum = 0, count_max = 0, n_saturated = 0;
-
-	if (mode == MODE_SAMPLE) {
-	/* sample: no rebuild, no subtraction; -c is applied while compacting */
-	fprintf(stderr, "[2/4] skipped (sample mode: no rebuild for lookups)\n");
-	fprintf(stderr, "[3/4] skipped (sample mode: no genome subtraction)\n");
-	fprintf(stderr, "[4/4] sorting and writing %s (k-mers with count >= %u)\n",
-	        out_path, C.min_count);
-	run_parallel(&C, compact_sort_counts_main, C.P);
-	final_n = distinct_min = total_n(&C);
-	for (uint32_t p = 0; p < C.P; p++)
-		for (size_t i = 0; i < C.tabs[p].n; i++) {
-			uint32_t v = C.tabs[p].counts32[i];
-			count_sum += v;
-			if (v > count_max) count_max = v;
-			if (v == COUNT32_MAX) n_saturated++;
+	/* run files for M > 1 */
+	char **runs = NULL;
+	if (C.M > 1) {
+		runs = calloc(C.M, sizeof(char *));
+		g_runs = runs;
+		atexit(cleanup_runs);
+		for (uint32_t j = 0; j < C.M; j++) {
+			size_t need = (tmp_dir ? strlen(tmp_dir) + strlen(name)
+			                       : strlen(out_path)) + 32;
+			runs[j] = xmalloc(need);
+			if (tmp_dir) snprintf(runs[j], need, "%s/%s.pass%03u.tmp", tmp_dir, name, j);
+			else         snprintf(runs[j], need, "%s.pass%03u.tmp", out_path, j);
 		}
-	fprintf(stderr, "      %" PRIu64 " k-mers kept (%.1f%%), %" PRIu64
-	        " k-mer occurrences, max count %" PRIu64 "\n", final_n,
-	        distinct_all ? 100.0 * final_n / distinct_all : 0.0,
-	        count_sum, count_max);
-	if (n_saturated)
-		fprintf(stderr, "WARNING: %" PRIu64 " k-mer count(s) saturated at %u\n",
-		        n_saturated, COUNT32_MAX);
-	} else {
-
-	/* 2) filter */
-	fprintf(stderr, "[2/4] keeping k-mers with count >= %u\n", C.min_count);
-	run_parallel(&C, filter_main, C.P);
-	distinct_min = total_n(&C);
-	fprintf(stderr, "      %" PRIu64 " k-mers kept (%.1f%%), table %.2f GB\n",
-	        distinct_min,
-	        distinct_all ? 100.0 * distinct_min / distinct_all : 0.0, table_gb(&C));
-
-	/* 3) subtract genomes */
-	if (C.n_genomes > 0) {
-		fprintf(stderr, "[3/4] removing k-mers present in %d genome(s)\n",
-		        C.n_genomes);
-		run_parallel(&C, subtract_main, C.P);
-		if (C.genome_errors > 0) {
-			fprintf(stderr, "error: %d genome(s) could not be read; their k-mers "
-			        "would stay in the database, so none was written\n",
-			        C.genome_errors);
+		g_n_runs = (int)C.M;
+		if (tmp_dir && mkdir(tmp_dir, 0777) != 0 && errno != EEXIST) {
+			fprintf(stderr, "error: cannot create %s: %s\n", tmp_dir, strerror(errno));
 			return 1;
 		}
-		fprintf(stderr, "      removed %" PRIu64 " k-mers shared with genomes, "
-		        "%" PRIu64 " remain (%.1fs)\n", C.removed,
-		        distinct_min - C.removed, now_s() - C.t_start);
-	} else {
-		fprintf(stderr, "[3/4] no -A given, nothing subtracted\n");
 	}
-
-	/* 4) sort + write */
-	fprintf(stderr, "[4/4] sorting and writing %s\n", out_path);
-	run_parallel(&C, compact_sort_main, C.P);
-	final_n = total_n(&C);
-	}   /* end scrub steps 2-4a */
 
 	size_t tlen = strlen(out_path) + 5;
 	char *tmp_path = xmalloc(tlen);
 	snprintf(tmp_path, tlen, "%s.tmp", out_path);
-	kmdb_writer *w = kmdb_writer_open(tmp_path, C.k, (uint32_t)block_n, (int)level);
-	if (!w) return 1;
+	kmdb_writer *w = NULL;
 
-	/* k-way merge of the sorted partitions (min-heap on key) */
-	uint32_t *heap = xmalloc(sizeof(uint32_t) * C.P);
-	size_t *pos = calloc(C.P, sizeof(size_t));
-	uint32_t hn = 0;
-#define HKEY(p) (C.tabs[p].keys[pos[p]])
-	for (uint32_t p = 0; p < C.P; p++) {
-		if (C.tabs[p].n == 0) continue;
-		uint32_t i = hn++;
-		heap[i] = p;
-		while (i > 0 && HKEY(heap[(i - 1) / 2]) > HKEY(heap[i])) {
-			uint32_t t = heap[i]; heap[i] = heap[(i - 1) / 2]; heap[(i - 1) / 2] = t;
-			i = (i - 1) / 2;
-		}
-	}
+	uint64_t distinct_all = 0, distinct_min = 0, final_n = 0, removed_total = 0;
+	uint64_t count_sum = 0, count_max = 0, n_saturated = 0;
+	uint64_t st_reads = 0, st_positions = 0, st_valid = 0;
+	size_t prev_max_part = 0;   /* largest partition of the previous pass */
 	int werr = 0;
-	while (hn > 0 && !werr) {
-		uint32_t p = heap[0];
-		int rc = mode == MODE_SAMPLE
-		       ? emit_kmer_count(w, C.tabs[p].keys[pos[p]], C.tabs[p].counts32[pos[p]])
-		       : emit_kmer(w, C.tabs[p].keys[pos[p]]);
-		if (rc != 0) werr = 1;
-		if (++pos[p] == C.tabs[p].n) heap[0] = heap[--hn];
-		uint32_t i = 0;
-		for (;;) {
-			uint32_t l = 2 * i + 1, r = l + 1, m = i;
-			if (l < hn && HKEY(heap[l]) < HKEY(heap[m])) m = l;
-			if (r < hn && HKEY(heap[r]) < HKEY(heap[m])) m = r;
-			if (m == i) break;
-			uint32_t t = heap[i]; heap[i] = heap[m]; heap[m] = t;
-			i = m;
+
+	for (uint32_t pass = 0; pass < C.M; pass++) {
+		C.pass = pass;
+		char tag[48] = "";
+		if (C.M > 1) snprintf(tag, sizeof tag, "pass %u/%u ", pass + 1, C.M);
+
+		/* table sizes: pre-sized in low-memory mode when a size is known */
+		size_t cap0 = INITIAL_TAB_CAP;
+		if (lowmem && est_distinct > 0)
+			cap0 = cap_for(est_distinct / ((double)C.M * C.P) * 1.02);
+		else if (lowmem && pass > 0)
+			cap0 = cap_for(prev_max_part * 1.03);
+		for (uint32_t i = 0; i < C.P; i++) tab_init(&C.tabs[i], cap0, wide);
+
+		/* 1) count */
+		fprintf(stderr, "[1/4] %scounting k-mers\n", tag);
+		if (read_pass(&C, count_main) != 0) {
+			fprintf(stderr, "error: reading failed, no database written\n");
+			return 1;
 		}
+		if (pass == 0) {
+			st_reads = C.n_reads; st_positions = C.n_positions; st_valid = C.n_valid;
+		}
+		uint64_t pass_distinct = total_n(&C);
+		prev_max_part = 0;
+		for (uint32_t i = 0; i < C.P; i++)
+			if (C.tabs[i].n > prev_max_part) prev_max_part = C.tabs[i].n;
+		distinct_all += pass_distinct;
+		fprintf(stderr, "      %" PRIu64 " reads, %" PRIu64 " valid k-mer windows, "
+		        "%" PRIu64 " distinct k-mers (table %.2f GB, %.1fs)\n",
+		        C.n_reads, C.n_valid, pass_distinct, table_gb(&C), now_s() - C.t_start);
+
+		uint64_t pass_final;
+		if (mode == MODE_SAMPLE) {
+			/* sample: no rebuild, no subtraction; -c is applied while compacting */
+			fprintf(stderr, "[2/4] skipped (sample mode: no rebuild for lookups)\n");
+			fprintf(stderr, "[3/4] skipped (sample mode: no genome subtraction)\n");
+			fprintf(stderr, "[4/4] %ssorting (k-mers with count >= %u)\n",
+			        tag, C.min_count);
+			run_parallel(&C, compact_sort_counts_main, C.P);
+			pass_final = total_n(&C);
+			distinct_min += pass_final;
+			for (uint32_t p = 0; p < C.P; p++)
+				for (size_t i = 0; i < C.tabs[p].n; i++) {
+					uint32_t v = C.tabs[p].counts32[i];
+					count_sum += v;
+					if (v > count_max) count_max = v;
+					if (v == COUNT32_MAX) n_saturated++;
+				}
+			fprintf(stderr, "      %" PRIu64 " k-mers kept (%.1f%%)\n", pass_final,
+			        pass_distinct ? 100.0 * pass_final / pass_distinct : 0.0);
+		} else {
+			/* 2) filter */
+			fprintf(stderr, "[2/4] %skeeping k-mers with count >= %u%s\n", tag,
+			        C.min_count, lowmem ? " (in place)" : "");
+			run_parallel(&C, lowmem ? filter_inplace_main : filter_main, C.P);
+			uint64_t pass_min = total_n(&C);
+			distinct_min += pass_min;
+			fprintf(stderr, "      %" PRIu64 " k-mers kept (%.1f%%), table %.2f GB\n",
+			        pass_min,
+			        pass_distinct ? 100.0 * pass_min / pass_distinct : 0.0, table_gb(&C));
+
+			/* 3) subtract genomes */
+			if (C.n_genomes > 0) {
+				fprintf(stderr, "[3/4] %sremoving k-mers present in %d genome(s)\n",
+				        tag, C.n_genomes);
+				C.next_genome = 0; C.genomes_done = 0; C.removed = 0;
+				run_parallel(&C, subtract_main, C.P);
+				if (C.genome_errors > 0) {
+					fprintf(stderr, "error: %d genome(s) could not be read; their k-mers "
+					        "would stay in the database, so none was written\n",
+					        C.genome_errors);
+					return 1;
+				}
+				removed_total += C.removed;
+				fprintf(stderr, "      removed %" PRIu64 " k-mers shared with genomes, "
+				        "%" PRIu64 " remain (%.1fs)\n", C.removed,
+				        pass_min - C.removed, now_s() - C.t_start);
+			} else {
+				fprintf(stderr, "[3/4] no -A given, nothing subtracted\n");
+			}
+
+			/* 4) sort */
+			fprintf(stderr, "[4/4] %ssorting\n", tag);
+			run_parallel(&C, compact_sort_main, C.P);
+			pass_final = total_n(&C);
+		}
+		final_n += pass_final;
+
+		/* write: straight into the database, or into this pass's run */
+		sink_t s = { NULL, NULL, mode == MODE_SAMPLE };
+		if (C.M == 1) {
+			fprintf(stderr, "      writing %s\n", out_path);
+			w = kmdb_writer_open(tmp_path, C.k, (uint32_t)block_n, (int)level);
+			if (!w) return 1;
+			s.w = w;
+			if (merge_partitions(&C, &s) != 0) werr = 1;
+		} else {
+			s.fp = fopen(runs[pass], "wb");
+			if (!s.fp) {
+				fprintf(stderr, "error: cannot create %s: %s\n", runs[pass], strerror(errno));
+				return 1;
+			}
+			setvbuf(s.fp, NULL, _IOFBF, RUN_BUF);
+			int rc = merge_partitions(&C, &s);
+			if (fclose(s.fp) != 0 || rc != 0) {
+				fprintf(stderr, "error: writing %s failed (disk full?)\n", runs[pass]);
+				return 1;
+			}
+			fprintf(stderr, "      %" PRIu64 " k-mers -> %s (%.1fs)\n",
+			        pass_final, runs[pass], now_s() - C.t_start);
+		}
+		for (uint32_t i = 0; i < C.P; i++) tab_free(&C.tabs[i]);
+		if (werr) break;
 	}
-#undef HKEY
+
+	if (C.M > 1 && !werr) {
+		fprintf(stderr, "merging %u runs into %s\n", C.M, out_path);
+		w = kmdb_writer_open(tmp_path, C.k, (uint32_t)block_n, (int)level);
+		if (!w) return 1;
+		if (merge_runs(runs, C.M, mode == MODE_SAMPLE, w) != 0) werr = 1;
+		cleanup_runs();
+	}
+	if (count_sum && n_saturated)
+		fprintf(stderr, "WARNING: %" PRIu64 " k-mer count(s) saturated at %u\n",
+		        n_saturated, COUNT32_MAX);
 
 	/* metadata */
 	kmdb_writer_meta(w, "format", "kmdb");
@@ -1033,13 +1491,14 @@ int main(int argc, char *argv[])
 	for (int i = 0; i < n_reads; i++) kmdb_writer_meta(w, "read_file", reads[i]);
 	kmdb_writer_meta(w, "genome_list", genome_list ? genome_list : "none");
 	kmdb_writer_meta_u64(w, "n_genomes", (uint64_t)C.n_genomes);
-	kmdb_writer_meta_u64(w, "n_reads", C.n_reads);
-	kmdb_writer_meta_u64(w, "kmer_positions", C.n_positions);
-	kmdb_writer_meta_u64(w, "valid_kmer_positions", C.n_valid);
+	kmdb_writer_meta_u64(w, "n_reads", st_reads);
+	kmdb_writer_meta_u64(w, "kmer_positions", st_positions);
+	kmdb_writer_meta_u64(w, "valid_kmer_positions", st_valid);
 	kmdb_writer_meta_u64(w, "distinct_kmers", distinct_all);
 	kmdb_writer_meta_u64(w, "distinct_kmers_min_count", distinct_min);
-	kmdb_writer_meta_u64(w, "removed_in_genomes", C.removed);
+	kmdb_writer_meta_u64(w, "removed_in_genomes", removed_total);
 	kmdb_writer_meta_u64(w, "n_kmers", final_n);
+	kmdb_writer_meta_u64(w, "passes", C.M);
 	if (mode == MODE_SAMPLE) {
 		kmdb_writer_meta_u64(w, "count_sum", count_sum);
 		kmdb_writer_meta_u64(w, "count_max", count_max);
@@ -1068,12 +1527,12 @@ int main(int argc, char *argv[])
 	        final_n, st.st_size / 1e6,
 	        final_n ? (double)st.st_size / final_n : 0.0, now_s() - C.t_start);
 
-	for (uint32_t i = 0; i < C.P; i++) tab_free(&C.tabs[i]);
-	free(C.tabs); free(heap); free(pos); free(tmp_path);
+	free(C.tabs); free(tmp_path);
 	for (int i = 0; i < n_reads; i++) free(reads[i]);
 	for (int i = 0; i < C.n_genomes; i++) free(C.genomes[i]);
-	free(reads); free(C.genomes);
+	free(reads); free(C.genomes); free(runs);
 	free(reads_list); free(genome_list); free(name); free(out_dir); free(out_path);
+	free(tmp_dir);
 	for (int i = 0; i < N_SLOTS; i++) { free(C.slots[i].seq); free(C.slots[i].lens); }
 	return 0;
 }
