@@ -154,7 +154,8 @@ def main():
     df_summary = pl.read_csv(os.path.join(args.input_dir, '*.summary.tsv'),
                              separator='\t')
     df_presence = pl.read_csv(os.path.join(args.input_dir, '*.presence.tsv.zst'),
-                              separator='\t')
+                              separator='\t',
+                              schema_overrides={'list_scrub_id': pl.String})
 
     # ---- lineage call on all kmers of the strain ----
     # sketch prefilter: shortlist candidate lineages, then score only those

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 #include <time.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -612,49 +613,180 @@ static char *basename_no_ext(const char *path)
 extern int   contains_N(char *str);
 extern char *orient_string(char *seed_seq, char *seedStrRevComp, int seed);
 
-/* Hot loop: scratch-only counting. */
-static void calculate_kmer_count_scratch(const char *file,
-                                         const int seed,
-                                         BIO_hash h,
-                                         unsigned int scratch_col)
+/* ── FASTA/FASTQ samples: 2-bit rolling k-mers, touched-bucket lists ─────
+
+   The reference k-mers are indexed once per input list as canonical 2-bit
+   keys (ref_index_t, read-only while workers run). Each worker rolls the
+   canonical k-mer along every sequence and looks it up there instead of
+   building, orienting and string-hashing a 31-char window. Hits go to the
+   worker's own scratch column (only that worker writes it), and the first
+   hit of a bucket is remembered in a thread-local list, so after the sample
+   only the touched buckets are visited: no per-sample sweep over the whole
+   hash. Global columns are still updated with an atomic add, as before.
+
+   Equivalence with the old string scan: a window is skipped if it contains
+   an N/n (as before). A window with another non-ACGT character can only
+   match a reference k-mer containing the same character; if the reference
+   has such k-mers (rare, IUPAC codes), those windows are looked up with the
+   old string path, and the sample falls back to the full sweeps for its
+   bookkeeping. Otherwise they cannot match and are skipped. */
+
+#define REF_INDEX_EMPTY UINT64_MAX
+
+typedef struct {
+	uint64_t *keys;     /* canonical 2-bit k-mer, REF_INDEX_EMPTY = free slot */
+	uint32_t *bucket;   /* BIO_hash bucket of that k-mer */
+	size_t    mask;
+	int       has_iupac;   /* reference has k-mers with non-ACGT bases */
+} ref_index_t;
+
+static inline uint64_t ri_mix64(uint64_t x)
+{
+	x ^= x >> 33; x *= 0xff51afd7ed558ccdull;
+	x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull;
+	x ^= x >> 33;
+	return x;
+}
+
+typedef struct {
+	uint32_t *b;
+	size_t    n, cap;
+} touched_t;
+
+static inline void touched_push(touched_t *t, uint32_t b)
+{
+	if (t->n == t->cap) {
+		t->cap = t->cap ? t->cap * 2 : 65536;
+		t->b = realloc(t->b, t->cap * sizeof(uint32_t));
+		if (!t->b) { perror("realloc touched"); exit(EXIT_FAILURE); }
+	}
+	t->b[t->n++] = b;
+}
+
+/* 0-3 = ACGT (any case), 4 = N/n, 5 = anything else */
+static uint8_t SCAN_CLASS[256];
+static void scan_class_init(void)
+{
+	static int done = 0;
+	if (__atomic_load_n(&done, __ATOMIC_ACQUIRE)) return;
+	for (int i = 0; i < 256; i++) SCAN_CLASS[i] = 5;
+	SCAN_CLASS['A'] = SCAN_CLASS['a'] = 0;
+	SCAN_CLASS['C'] = SCAN_CLASS['c'] = 1;
+	SCAN_CLASS['G'] = SCAN_CLASS['g'] = 2;
+	SCAN_CLASS['T'] = SCAN_CLASS['t'] = 3;
+	SCAN_CLASS['N'] = SCAN_CLASS['n'] = 4;
+	__atomic_store_n(&done, 1, __ATOMIC_RELEASE);
+}
+
+/* Returns 0 on success, 1 if a window was matched via the string path (the
+   caller must then use the sweeps for this sample), -1 if the file could
+   not be opened (as before: warning, sample counted with no hits). */
+static int calculate_kmer_count_scratch_fast(const char *file, const int seed,
+                                             BIO_hash h, unsigned int scratch_col,
+                                             const ref_index_t *ix, touched_t *t)
 {
 	gzFile fp = gzopen(file, "r");
 	if (fp == NULL) {
 		fprintf(stderr,
 		        "could not read file %s in calculate_kmer_count_scratch()\n",
 		        file);
-		return;
+		return -1;
 	}
+	gzbuffer(fp, 1 << 20);
 	kseq_t *seq = kseq_init(fp);
 
-	char *seedStrRevComp = (char *)malloc(sizeof(char) * (seed + 1));
-	char *orientStr;
-	unsigned int *count = NULL;
-	char temp_nuc;
-	char *seed_seq;
-	int has_N;
+	const int shift = 2 * (seed - 1);
+	const uint64_t kmask = (seed == 32) ? UINT64_MAX : ((1ull << (2 * seed)) - 1);
+	char *win = malloc(seed + 1), *winrc = malloc(seed + 1);
+	int used_string_path = 0;
 
 	while (kseq_read(seq) >= 0) {
-		if ((int)seq->seq.l < seed) continue;
-		BIO_stringToUpper(seq->seq.s);
-		seed_seq = seq->seq.s;
-		has_N = contains_N(seed_seq);
-		for (unsigned int i = 0; i < seq->seq.l - seed + 1; i++) {
-			temp_nuc = seed_seq[seed];
-			seed_seq[seed] = '\0';
-			orientStr = orient_string(seed_seq, seedStrRevComp, seed);
-			if (!has_N || !contains_N(orientStr)) {
-				count = (unsigned int *)BIO_searchHash(h, orientStr);
-				if (count != NULL)
-					__sync_fetch_and_add(&count[scratch_col], 1);
+		const size_t L = seq->seq.l;
+		if ((int)L < seed) continue;
+		const char *s = seq->seq.s;
+		uint64_t fwd = 0, rev = 0;
+		long last_n = -1, last_other = -1;   /* last position of each class */
+		for (size_t pos = 0; pos < L; pos++) {
+			uint8_t c = SCAN_CLASS[(unsigned char)s[pos]];
+			if (c < 4) {
+				fwd = ((fwd << 2) | c) & kmask;
+				rev = (rev >> 2) | ((uint64_t)(3 - c) << shift);
+			} else {
+				fwd = rev = 0;
+				if (c == 4) last_n = (long)pos; else last_other = (long)pos;
 			}
-			seed_seq[seed] = temp_nuc;
-			seed_seq++;
+			if (pos + 1 < (size_t)seed) continue;
+			long wstart = (long)pos - seed + 1;
+			if (last_n >= wstart) continue;            /* window has an N */
+
+			if (last_other >= wstart) {
+				/* non-ACGT, non-N window: only an identical reference
+				   k-mer can match it; use the original string path */
+				if (!ix->has_iupac) continue;
+				for (int q = 0; q < seed; q++)
+					win[q] = (char)toupper((unsigned char)s[wstart + q]);
+				win[seed] = '\0';
+				char *o = orient_string(win, winrc, seed);
+				unsigned int *count = (unsigned int *)BIO_searchHash(h, o);
+				if (count) { count[scratch_col]++; used_string_path = 1; }
+				continue;
+			}
+
+			uint64_t can = fwd > rev ? fwd : rev;
+			size_t i = ri_mix64(can) & ix->mask;
+			uint64_t key;
+			while ((key = ix->keys[i]) != REF_INDEX_EMPTY) {
+				if (key == can) {
+					uint32_t b = ix->bucket[i];
+					unsigned int *counts = (unsigned int *)h->data[b].DATA;
+					if (counts[scratch_col]++ == 0) touched_push(t, b);
+					break;
+				}
+				i = (i + 1) & ix->mask;
+			}
 		}
 	}
+	free(win); free(winrc);
 	kseq_destroy(seq);
 	gzclose(fp);
-	free(seedStrRevComp);
+	return used_string_path;
+}
+
+/* Bookkeeping over the touched buckets only. Same results as
+   count_unique_in_column() + collect_zero_and_maybe_merge(). */
+static unsigned long count_unique_touched(BIO_hash h, const touched_t *t)
+{
+	unsigned long n = 0;
+	for (size_t q = 0; q < t->n; q++) {
+		unsigned int *counts = (unsigned int *)h->data[t->b[q]].DATA;
+		if (counts[0] > 0) n++;
+	}
+	return n;
+}
+
+static uint32_t *collect_zero_and_maybe_merge_touched(BIO_hash h, const touched_t *t,
+                                                      unsigned int scratch_col,
+                                                      unsigned int global_col,
+                                                      int merge_into_global,
+                                                      unsigned long n_collect)
+{
+	uint32_t *out = NULL;
+	if (n_collect > 0) {
+		out = malloc((size_t)n_collect * sizeof(uint32_t));
+		if (!out) { perror("malloc kmer indices"); exit(EXIT_FAILURE); }
+	}
+	uint32_t k = 0;
+	for (size_t q = 0; q < t->n; q++) {
+		uint32_t b = t->b[q];
+		unsigned int *counts = (unsigned int *)h->data[b].DATA;
+		unsigned int c = counts[scratch_col];
+		if (c == 0) continue;
+		if (counts[0] > 0 && k < (uint32_t)n_collect) out[k++] = b;
+		if (merge_into_global)
+			__sync_fetch_and_add(&counts[global_col], c);   /* shared column */
+		counts[scratch_col] = 0;
+	}
+	return out;
 }
 
 /* ── .kmdb samples: merge-join against the sorted reference k-mers ───────
@@ -706,6 +838,33 @@ static ref_kmer_t *build_ref_kmers(BIO_hash h, int seed, size_t *n_out,
 	*n_out = j;
 	*n_skipped = skipped;
 	return r;
+}
+
+static ref_index_t *build_ref_index(const ref_kmer_t *ref, size_t n,
+                                    size_t n_skipped)
+{
+	ref_index_t *ix = calloc(1, sizeof(*ix));
+	size_t cap = 1024;
+	while (cap < n * 2) cap <<= 1;               /* load <= 0.5 */
+	ix->keys   = malloc(cap * sizeof(uint64_t));
+	ix->bucket = malloc(cap * sizeof(uint32_t));
+	if (!ix || !ix->keys || !ix->bucket) { perror("malloc ref index"); exit(EXIT_FAILURE); }
+	memset(ix->keys, 0xFF, cap * sizeof(uint64_t));
+	ix->mask = cap - 1;
+	ix->has_iupac = n_skipped > 0;
+	for (size_t j = 0; j < n; j++) {
+		size_t i = ri_mix64(ref[j].kmer) & ix->mask;
+		while (ix->keys[i] != REF_INDEX_EMPTY) i = (i + 1) & ix->mask;
+		ix->keys[i]   = ref[j].kmer;
+		ix->bucket[i] = ref[j].bucket;
+	}
+	return ix;
+}
+
+static void free_ref_index(ref_index_t *ix)
+{
+	if (!ix) return;
+	free(ix->keys); free(ix->bucket); free(ix);
 }
 
 typedef struct {
@@ -840,8 +999,9 @@ typedef struct {
 
 	/* .kmdb samples */
 	int              n_jobs;
-	ref_kmer_t      *ref_kmers;     /* NULL unless a job is a .kmdb */
+	ref_kmer_t      *ref_kmers;     /* sorted reference k-mers */
 	size_t           n_ref_kmers;
+	ref_index_t     *ref_index;     /* 2-bit lookup for FASTA/FASTQ jobs */
 } worker_pool_t;
 
 /* Single-pass: collect bucket indices of hit kmers, optionally fold
@@ -967,11 +1127,17 @@ static void *worker_main(void *arg)
 				exit(EXIT_FAILURE);
 			}
 			kmdb_close(db);
-		} else {
-			calculate_kmer_count_scratch(path, p->seed, p->h, scratch_col);
+		}
+		touched_t touched = { NULL, 0, 0 };
+		int use_sweep = db != NULL;   /* .kmdb: helpers share the column, sweep */
+		if (!db) {
+			int rc = calculate_kmer_count_scratch_fast(path, p->seed, p->h, scratch_col,
+			                                           p->ref_index, &touched);
+			if (rc == 1) use_sweep = 1;           /* string-path hits not in list */
 		}
 
-		unsigned long n_unique = count_unique_in_column(p->h, scratch_col);
+		unsigned long n_unique = use_sweep ? count_unique_in_column(p->h, scratch_col)
+		                                   : count_unique_touched(p->h, &touched);
 		double coverage = p->total_ref_kmers > 0
 		    ? (double)n_unique / (double)p->total_ref_kmers
 		    : 0.0;
@@ -991,8 +1157,13 @@ static void *worker_main(void *arg)
 		   sample that hits everything otherwise burns one of the -P slots
 		   on every k-mer and saturates lists that hold real signal. */
 		unsigned long n_collect = is_in_global ? n_unique : 0;
-		uint32_t *idxs = collect_zero_and_maybe_merge(
-		    p->h, scratch_col, p->global_col, is_in_global, n_collect);
+		uint32_t *idxs = use_sweep
+		    ? collect_zero_and_maybe_merge(p->h, scratch_col, p->global_col,
+		                                   is_in_global, n_collect)
+		    : collect_zero_and_maybe_merge_touched(p->h, &touched, scratch_col,
+		                                           p->global_col, is_in_global,
+		                                           n_collect);
+		free(touched.b);
 
 		if (p->writer) {
 			/* Hand off to writer; writer assigns scrub_id and writes summary. */
@@ -1068,17 +1239,16 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 	}
 
 	int nlines = 0;
-	int any_kmdb = 0;
 	{
 		char *line = NULL; size_t cap = 0;
 		while (getline(&line, &cap, fp) != -1) {
 			char *q = line;
 			while (*q == ' ' || *q == '\t') q++;
-			if (*q != '\n' && *q != '\0') nlines++;
 			char *e = q + strlen(q);
 			while (e > q && (e[-1] == '\n' || e[-1] == '\r' ||
 			                 e[-1] == ' '  || e[-1] == '\t')) *--e = '\0';
-			if (kmdb_is_kmdb_path(q)) any_kmdb = 1;
+			if (*q == '\0') continue;
+			nlines++;
 		}
 		free(line);
 		rewind(fp);
@@ -1102,14 +1272,16 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 	p.skip_file       = skip_file;
 	p.progress        = progress;
 	p.n_jobs          = nlines;
-	if (any_kmdb) {
+	{
 		size_t skipped = 0;
+		scan_class_init();
 		p.ref_kmers = build_ref_kmers(h, seed, &p.n_ref_kmers, &skipped);
-		fprintf(stderr, "%s: %zu reference k-mers indexed for .kmdb samples",
+		p.ref_index = build_ref_index(p.ref_kmers, p.n_ref_kmers, skipped);
+		fprintf(stderr, "%s: %zu reference k-mers indexed",
 		        sample_type, p.n_ref_kmers);
 		if (skipped)
-			fprintf(stderr, " (%zu with non-ACGT bases can never match a .kmdb)",
-			        skipped);
+			fprintf(stderr, " (%zu with non-ACGT bases: matched by string lookup in "
+			        "FASTA/FASTQ, never in a .kmdb)", skipped);
 		fprintf(stderr, "\n");
 	}
 	pthread_mutex_init(&p.jmtx, NULL);
@@ -1123,6 +1295,11 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 			                 line[n-1] == ' '  || line[n-1] == '\t'))
 				line[--n] = '\0';
 			if (n == 0) continue;
+			{
+				char *q = line;
+				while (*q == ' ' || *q == '\t') q++;
+				if (*q == '\0') continue;
+			}
 			sample_job_t *job = malloc(sizeof(*job));
 			job->filepath = strdup(line);
 			p.jobs[p.jtail] = job;
@@ -1149,6 +1326,7 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 	free(threads);
 	free(p.jobs);
 	free(p.ref_kmers);
+	free_ref_index(p.ref_index);
 	pthread_mutex_destroy(&p.jmtx);
 	pthread_cond_destroy(&p.jhas_work);
 	pthread_mutex_destroy(&p.progress_mtx);

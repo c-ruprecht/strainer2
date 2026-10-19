@@ -85,6 +85,7 @@ kmer_strain_detect -k kmers.tsv.gz -B sample_sheet.tsv -o out.kmer_hits.tsv.gz [
 **Output:** gzipped TSV with one row per kmer, in input order, and one column per sample. Cells are occurrence counts (both orientations are counted). The last row, `total_evaluated`, is the number of kmer positions scanned per sample, for normalising.
 
 ### Sample sheet
+- include a part about kmdb creation and thats its possible to append multiple replicates into one sample
 
 Tab-separated. A header line is optional.
 
@@ -150,6 +151,69 @@ python scripts/tax_genome.py \
 Input is one of `--genome`, `--genome_dir` or `--genome_list` (one path per
 line); FASTA may be gzipped. `--output` takes a TSV path or a directory, in
 which case it writes `lineage_calls.tsv` there.
+
+## `kmer_metagenome_db`
+
+Builds a per-sample k-mer **presence** database (`.kmdb`) from a metagenome. It adds to the genome scrub DB and is passed to `kmer_scrub_count_individual -B`. It keeps the metagenome k-mers that are
+
+- seen at least `-c` times in the reads (default 2, which drops most error k-mers), **and**
+- absent from every genome in `-A`.
+
+Only presence is stored: a k-mer seen 3× and one seen 100× are the same.
+
+**Steps:** count canonical k-mers of the reads (threaded, with a lock-free table split into partitions) → drop k-mers seen fewer than `-c` times → stream the `-A` genomes and remove every k-mer they contain → sort, merge and write zstd blocks.
+
+**Inputs**
+
+| Option | Meaning |
+|---|---|
+| `-i <reads>` | Read file (FASTA/FASTQ, gz ok). Repeatable; all files form **one** sample (e.g. R1 + R2) |
+| `-I <file>` | Text file listing read files, one per line |
+| `-A <list\|fasta>` | Genome scrub list, the same one passed to `kmer_scrub_count_individual -A`. Without it nothing is subtracted |
+| `-c <int>` | Min read count, 1–255 (default 2) |
+| `-k <int>` | k-mer size (default 31) |
+| `-t <int>` | Threads (default 4) |
+| `-n <name>` | Sample ID (default: first read file minus its extension) |
+| `-O <dir>` / `-o <path>` | Output dir (default `.`) / explicit output path |
+| `-b`, `-z` | k-mers per block / zstd level (default 3) |
+
+**Output**
+
+- `<O>/<n>.kmdb`: a sorted, zstd-compressed list of the kept canonical k-mers (`max(fwd, revcomp)`, 2-bit packed, matching BIO_hash keys). The metadata records the sample ID, k, `-c`, the read files, the genome list and k-mer counts at each step.
+- The database is written to `<out>.tmp` and renamed only on success. If any read file or genome can't be read, no database is written.
+- Progress and statistics go to stderr.
+
+**Resources:** peak memory is about 20–25 bytes per distinct k-mer in the reads (counted before the `-c` filter, so error k-mers are included), plus about 70 MB of read buffers.
+
+**Example**
+
+    kmer_metagenome_db -i S1_R1.fastq.gz -i S1_R2.fastq.gz \
+        -A genomes_t96.list -c 2 -t 32 -O metagenome_scrub_db/
+
+#### Use in scrubbing
+
+Each line of a `-B` list for `kmer_scrub_count_individual` can be raw reads or a `.kmdb`, and the two can be mixed:
+
+    ls metagenome_scrub_db/*.kmdb > metagenome_scrub_db.list
+    kmer_scrub_count_individual -r target.fna.gz -A genomes_to_scrub.txt \
+        -B metagenome_scrub_db.list -C drug_strain_scrub.txt -O counts/ -n target
+
+Each `.kmdb` is processed like any other `-B` sample: an `me` row in `summary.tsv`, a scrub_id in `presence.tsv.zst`, and a contribution to `metagenome_count` in `global_counts.tsv.zst`. In the Snakemake pipelines these are the `kmdb` and `bigkmdb` variants of `metagenome_scrub`.
+
+The two kinds of `-B` input count differently:
+
+- **Reads:** every occurrence of a k-mer counts, so `metagenome_count` is a read-depth sum.
+- **`.kmdb`:** each database adds 1 per k-mer it contains, so `metagenome_count` is the number of metagenomes containing the k-mer.
+
+A `.kmdb` holds only k-mers that are absent from the genome DB. So each reference k-mer is credited either to the genomes (`pangenome_count`) or to the metagenomes (`metagenome_count`), never both, and the metagenome column shows only what the genome DB doesn't already explain.
+
+#### Why it speeds up scrubbing
+
+1. **Reads are processed once, not once per scrub job.** With raw reads, every target strain re-reads and re-hashes every scrub metagenome: 398 strains × ~700 metagenomes is ~280k full FASTQ passes, all spent parsing, decompressing and walking every k-mer position. A `.kmdb` does that work once per metagenome, and every later scrub job reuses it.
+2. **Much less data per job.** A `.kmdb` keeps each distinct k-mer once, not once per read position. Error k-mers (below `-c`) and k-mers already in the genome DB are gone, and what's left is stored as sorted 2-bit integers in zstd blocks rather than gzipped ASCII. A scrub job reads and looks up only that.
+3. **Better use of threads.** A `.kmdb`'s blocks are split across the threads, so one metagenome uses all `-t` threads. FASTQ input is read file by file, so a few large metagenomes leave most threads idle.
+
+**Caveat:** subtraction is against the `-A` list the `.kmdb` was built with, not the per-strain `genomes_to_scrub.txt`. If the `.kmdb` was built against the full DB, a k-mer shared by the metagenome and a genome *outside* a strain's selected list is in neither column for that strain. Those genomes fell below the sourmash containment cutoff, so this should be rare, but it's not zero.
 
 ### Output
 

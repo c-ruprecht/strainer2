@@ -5,11 +5,12 @@ LDLIBS    = -lz -lm -lpthread
 # ---------------------------------------------------------------------------
 # libzstd detection
 #
-# Only kmer_scrub_count_individual actually needs zstd (kmer_scrub_streaming.c
-# writes the compressed presence index), and genome_compare_presence uses it
-# only when you ask for a .zst output. The old Makefile put -lzstd in the
-# global LDFLAGS, so a machine without libzstd failed to link *every* target
-# with "cannot find -lzstd" -- even the tools that never touch it.
+# Only kmer_scrub_count_individual and kmer_metagenome_db actually need zstd
+# (they write .kmdb / compressed presence indexes), kmer_strain_detect uses it
+# only to read .kmdb targets, and genome_compare_presence uses it only when
+# you ask for a .zst output. The old Makefile put -lzstd in the global
+# LDFLAGS, so a machine without libzstd failed to link *every* target with
+# "cannot find -lzstd" -- even the tools that never touch it.
 #
 # Order of resolution:
 #   1. ZSTD_HOME=/path  (e.g. a conda env, or the prefix from `module show zstd`)
@@ -38,16 +39,18 @@ endif
 ifeq ($(HAVE_ZSTD),1)
   ZSTD_DEF     := -DHAVE_ZSTD $(ZSTD_CFLAGS)
   ZSTD_TARGETS := kmer_scrub_count_individual kmer_metagenome_db
+  KMDB_OBJ     := kmdb.o
 else
   ZSTD_DEF     :=
   ZSTD_LIBS    :=
   ZSTD_TARGETS :=
+  KMDB_OBJ     :=
 endif
 
 shared_obj = BIO_sequence.o BIO_hash.o genome_compare.o up2bit.o
 
 BASE_TARGETS = genome_compare genome_compare_presence kmer_scrub_count \
-            	kmer_strain_detect kmer_strain_detect_genome
+               kmer_strain_detect kmer_strain_detect_genome
 
 all: $(BASE_TARGETS) $(ZSTD_TARGETS) zstd-note
 
@@ -55,8 +58,10 @@ zstd-note:
 ifneq ($(HAVE_ZSTD),1)
 	@echo ""
 	@echo "  NOTE: libzstd was not found, so kmer_scrub_count_individual and"
-	@echo "        kmer_metagenome_db were NOT built, and genome_compare_presence was built without"
-	@echo "        .zst output (-z falls back to .gz). Everything else is fine."
+	@echo "        kmer_metagenome_db were NOT built, kmer_strain_detect was built"
+	@echo "        without .kmdb target support, and genome_compare_presence was"
+	@echo "        built without .zst output (-z falls back to .gz). Everything"
+	@echo "        else is fine."
 	@echo "        To get zstd back, install it and rebuild:"
 	@echo "          conda install -c conda-forge zstd zstd-static"
 	@echo "          make clean && make ZSTD_HOME=\$$CONDA_PREFIX"
@@ -83,9 +88,10 @@ kmer_scrub_count_individual: kmer_scrub_count_individual.o kmer_scrub_streaming.
 kmer_metagenome_db: kmer_metagenome_db.o kmdb.o
 	$(CC) -o $@ $^ $(LDLIBS) $(ZSTD_LIBS)
 
-
-kmer_strain_detect: kmer_strain_detect.o $(shared_obj)
-	$(CC) -o $@ $^ $(LDLIBS)
+# kmdb.o / -lzstd only when zstd was found; without them the .kmdb code is
+# compiled out (#ifdef HAVE_ZSTD) and .kmdb targets are rejected at run time
+kmer_strain_detect: kmer_strain_detect.o $(shared_obj) $(KMDB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS) $(ZSTD_LIBS)
 
 kmer_strain_detect_genome: kmer_strain_detect_genome.o $(shared_obj)
 	$(CC) -o $@ $^ $(LDLIBS)

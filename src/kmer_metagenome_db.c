@@ -1,8 +1,11 @@
 /*
-	kmer_metagenome_db — build a per-metagenome k-mer PRESENCE database
-	(.kmdb) that supplements the genome scrub database.
+	kmer_metagenome_db — build a per-metagenome k-mer database (.kmdb).
 
-	Keeps exactly the metagenome k-mers with
+	Two modes, chosen with -T:
+
+	-T scrub  (default; unchanged behaviour)
+	  A PRESENCE database that supplements the genome scrub database.
+	  Keeps exactly the metagenome k-mers with
 
 	    metagenome_count >= -c        (default 2: drops most error k-mers)
 	    pangenome_count  == 0         (absent from every genome in -A)
@@ -27,6 +30,17 @@
 	             contains. Genome k-mers are never stored, so memory is set by
 	             the metagenome alone.
 	  4) write   sort partitions in parallel, k-way merge, write zstd blocks.
+
+	-T sample
+	  A COUNT database of one sample: every canonical k-mer of the reads
+	  with its exact occurrence count (32-bit), no genome subtraction.
+	  Step 1 counts as above, steps 2-3 are skipped, step 4 writes
+	  key + count. -c (default 1 here) drops k-mers seen fewer times;
+	  keep -c 1 if the database must reproduce read scanning exactly.
+	  kmer_strain_detect accepts these files as targets in place of
+	  FASTQs; it then looks k-mers up instead of re-reading the sample.
+	  The metadata key kmer_positions equals kmer_strain_detect's
+	  total_evaluated for the same reads.
 
 	Canonical form is max(fwd, revcomp) on 2-bit packed k-mers, identical
 	to orient_string()'s choice on ASCII, so the database lines up with
@@ -55,8 +69,10 @@ KSEQ_INIT(gzFile, gzread)
 #define BATCH_BASES      (8u << 20)
 #define N_SLOTS          4
 #define INITIAL_TAB_CAP  (1u << 20)
-#define COUNT_MAX        255u            /* saturating 8-bit counter */
-#define SLOT_BYTES       9               /* 8-byte key + 1-byte count */
+#define COUNT_MAX        255u            /* scrub: saturating 8-bit counter */
+#define COUNT32_MAX      UINT32_MAX      /* sample: saturating 32-bit counter */
+
+enum { MODE_SCRUB = 0, MODE_SAMPLE = 1 };
 
 /* ── small utils ───────────────────────────────────────────────────── */
 
@@ -165,29 +181,34 @@ static int read_path_list(const char *file, char ***out)
 }
 
 /* ── per-partition open-addressing table ──────────────────────────── */
-/* counts[] is a saturating 8-bit counter, only used to apply -c.
-   After step 2 every survivor has count >= 1; step 3 sets 0 = deleted. */
+/* scrub:  counts[] is a saturating 8-bit counter, only used to apply -c.
+           After step 2 every survivor has count >= 1; step 3 sets
+           0 = deleted. counts32 is NULL.
+   sample: counts32[] is a saturating 32-bit counter that is written to
+           the database. counts is NULL. */
 
 typedef struct {
 	uint64_t *keys;
 	uint8_t  *counts;
+	uint32_t *counts32;
 	size_t    cap;   /* power of two */
 	size_t    n;
 } tab_t;
 
-static void tab_init(tab_t *t, size_t cap)
+static void tab_init(tab_t *t, size_t cap, int wide)
 {
-	t->cap    = cap;
-	t->n      = 0;
-	t->keys   = xmalloc(cap * sizeof(uint64_t));
-	t->counts = xmalloc(cap * sizeof(uint8_t));
+	t->cap      = cap;
+	t->n        = 0;
+	t->keys     = xmalloc(cap * sizeof(uint64_t));
+	t->counts   = wide ? NULL : xmalloc(cap * sizeof(uint8_t));
+	t->counts32 = wide ? xmalloc(cap * sizeof(uint32_t)) : NULL;
 	memset(t->keys, 0xFF, cap * sizeof(uint64_t));
 }
 
 static void tab_free(tab_t *t)
 {
-	free(t->keys); free(t->counts);
-	t->keys = NULL; t->counts = NULL; t->cap = t->n = 0;
+	free(t->keys); free(t->counts); free(t->counts32);
+	t->keys = NULL; t->counts = NULL; t->counts32 = NULL; t->cap = t->n = 0;
 }
 
 static void tab_put_new(tab_t *t, uint64_t key, uint8_t count)
@@ -199,12 +220,25 @@ static void tab_put_new(tab_t *t, uint64_t key, uint8_t count)
 	t->n++;
 }
 
+static void tab_put_new32(tab_t *t, uint64_t key, uint32_t count)
+{
+	size_t mask = t->cap - 1, i = mix64(key) & mask;
+	while (t->keys[i] != EMPTY_KEY) i = (i + 1) & mask;
+	t->keys[i] = key;
+	t->counts32[i] = count;
+	t->n++;
+}
+
 static void tab_grow(tab_t *t)
 {
 	tab_t nt;
-	tab_init(&nt, t->cap * 2);
-	for (size_t i = 0; i < t->cap; i++)
-		if (t->keys[i] != EMPTY_KEY) tab_put_new(&nt, t->keys[i], t->counts[i]);
+	int wide = t->counts32 != NULL;
+	tab_init(&nt, t->cap * 2, wide);
+	for (size_t i = 0; i < t->cap; i++) {
+		if (t->keys[i] == EMPTY_KEY) continue;
+		if (wide) tab_put_new32(&nt, t->keys[i], t->counts32[i]);
+		else      tab_put_new(&nt, t->keys[i], t->counts[i]);
+	}
 	tab_free(t);
 	*t = nt;
 }
@@ -229,6 +263,26 @@ static inline void tab_inc(tab_t *t, uint64_t key, uint64_t h)
 	}
 }
 
+static inline void tab_inc32(tab_t *t, uint64_t key, uint64_t h)
+{
+	if (t->n * 10 >= t->cap * 7) tab_grow(t);
+	size_t mask = t->cap - 1, i = h & mask;
+	for (;;) {
+		uint64_t k = t->keys[i];
+		if (k == key) {
+			if (t->counts32[i] != COUNT32_MAX) t->counts32[i]++;
+			return;
+		}
+		if (k == EMPTY_KEY) {
+			t->keys[i] = key;
+			t->counts32[i] = 1;
+			t->n++;
+			return;
+		}
+		i = (i + 1) & mask;
+	}
+}
+
 /* ── shared state ─────────────────────────────────────────────────── */
 
 typedef struct {
@@ -243,8 +297,9 @@ typedef struct {
 
 typedef struct {
 	int        k;
+	int        mode;           /* MODE_SCRUB / MODE_SAMPLE */
 	uint32_t   P;              /* partitions == worker threads */
-	uint32_t   min_count;      /* 1..COUNT_MAX */
+	uint32_t   min_count;      /* scrub 1..COUNT_MAX, sample 1..COUNT32_MAX */
 	tab_t     *tabs;
 
 	/* reads pipeline */
@@ -361,6 +416,7 @@ static void *count_main(void *arg)
 	const int shift = 2 * (k - 1);
 	const uint64_t mask = (k == 32) ? UINT64_MAX : ((1ull << (2 * k)) - 1);
 	tab_t *t = &c->tabs[tid];
+	const int wide = c->mode == MODE_SAMPLE;   /* loop-invariant */
 	uint64_t valid = 0;
 
 	for (uint64_t s = 0;; s++) {
@@ -385,7 +441,10 @@ static void *count_main(void *arg)
 				if (++l >= k) {
 					uint64_t can = fwd > rev ? fwd : rev;
 					uint64_t h = mix64(can);
-					if (part_of(h, P) == tid) tab_inc(t, can, h);
+					if (part_of(h, P) == tid) {
+						if (wide) tab_inc32(t, can, h);
+						else      tab_inc(t, can, h);
+					}
 					valid++;
 				}
 			}
@@ -425,7 +484,7 @@ static void *filter_main(void *arg)
 	uint8_t  *cs = xrealloc(t->counts, (keep ? keep : 1) * sizeof(uint8_t));
 
 	tab_t nt;
-	tab_init(&nt, pow2_at_least(keep * 2));   /* load <= 0.5 */
+	tab_init(&nt, pow2_at_least(keep * 2), 0);   /* load <= 0.5 */
 	for (size_t i = 0; i < keep; i++) tab_put_new(&nt, ks[i], cs[i]);
 	free(ks);
 	free(cs);
@@ -560,6 +619,66 @@ static void *compact_sort_main(void *arg)
 	return NULL;
 }
 
+/* sample mode: in-place quicksort of unique keys, carrying their counts */
+static inline void swap_kv(uint64_t *k, uint32_t *v, size_t i, size_t j)
+{
+	uint64_t t = k[i]; k[i] = k[j]; k[j] = t;
+	uint32_t u = v[i]; v[i] = v[j]; v[j] = u;
+}
+
+static void sort_kv(uint64_t *k, uint32_t *v, size_t n)
+{
+	while (n > 24) {
+		size_t m = n / 2, hi = n - 1;
+		if (k[m] < k[0])  swap_kv(k, v, m, 0);
+		if (k[hi] < k[0]) swap_kv(k, v, hi, 0);
+		if (k[hi] < k[m]) swap_kv(k, v, hi, m);
+		swap_kv(k, v, 0, m);
+		uint64_t p = k[0];
+		ptrdiff_t i = -1, j = (ptrdiff_t)n;
+		for (;;) {
+			do i++; while (k[i] < p);
+			do j--; while (k[j] > p);
+			if (i >= j) break;
+			swap_kv(k, v, (size_t)i, (size_t)j);
+		}
+		size_t left = (size_t)j + 1;
+		if (left < n - left) {
+			sort_kv(k, v, left);
+			k += left; v += left; n -= left;
+		} else {
+			sort_kv(k + left, v + left, n - left);
+			n = left;
+		}
+	}
+	for (size_t i = 1; i < n; i++) {
+		uint64_t kk = k[i];
+		uint32_t vv = v[i];
+		size_t j = i;
+		while (j > 0 && k[j - 1] > kk) { k[j] = k[j - 1]; v[j] = v[j - 1]; j--; }
+		k[j] = kk; v[j] = vv;
+	}
+}
+
+/* sample mode: apply -c while compacting, then sort key+count pairs */
+static void *compact_sort_counts_main(void *arg)
+{
+	targ_t *a = arg;
+	ctx_t *c = a->c;
+	tab_t *t = &c->tabs[a->tid];
+	size_t j = 0;
+	for (size_t i = 0; i < t->cap; i++) {
+		if (t->keys[i] != EMPTY_KEY && t->counts32[i] >= c->min_count) {
+			t->keys[j]     = t->keys[i];
+			t->counts32[j] = t->counts32[i];
+			j++;
+		}
+	}
+	t->n = j;
+	sort_kv(t->keys, t->counts32, j);
+	return NULL;
+}
+
 static void run_parallel(ctx_t *c, void *(*fn)(void *), uint32_t n)
 {
 	pthread_t *th = xmalloc(sizeof(pthread_t) * n);
@@ -585,7 +704,8 @@ static size_t total_n(ctx_t *c)
 static double table_gb(ctx_t *c)
 {
 	size_t b = 0;
-	for (uint32_t i = 0; i < c->P; i++) b += c->tabs[i].cap * SLOT_BYTES;
+	size_t slot = c->mode == MODE_SAMPLE ? 12 : 9;   /* key + count */
+	for (uint32_t i = 0; i < c->P; i++) b += c->tabs[i].cap * slot;
 	return b / 1e9;
 }
 
@@ -599,20 +719,28 @@ static inline int emit_kmer(kmdb_writer *w, uint64_t key)
 	return kmdb_writer_add(w, key, 1);
 }
 
+/* sample mode: real counts */
+static inline int emit_kmer_count(kmdb_writer *w, uint64_t key, uint32_t count)
+{
+	return kmdb_writer_add(w, key, count);
+}
+
 /* ── main ─────────────────────────────────────────────────────────── */
 
 static void usage(void)
 {
 	fprintf(stderr,
-	"Usage: kmer_metagenome_db -i <reads.fastq.gz> [-i <reads_2.fastq.gz> ...]\n"
+	"Usage: kmer_metagenome_db [-T scrub|sample] -i <reads.fastq.gz> [-i <reads_2.fastq.gz> ...]\n"
 	"                          [-I <file listing read files>]\n"
 	"                          [-A <genome list | single genome FASTA>]\n"
 	"                          [-n <sample id>] [-O <output dir, default .>]\n"
 	"                          [-o <output path, overrides -O/-n naming>]\n"
-	"                          [-c <min count, 1..255, default 2>] [-k <k, default 31>]\n"
+	"                          [-c <min count; scrub 1..255, default 2; sample default 1>]\n"
+	"                          [-k <k, default 31>]\n"
 	"                          [-t <threads, default 4>] [-b <k-mers per block>]\n"
 	"                          [-z <zstd level, default 3>]\n"
 	"\n"
+	"  -T scrub (default)\n"
 	"  Writes <-O>/<-n>.kmdb: a presence-only k-mer list holding the\n"
 	"  metagenome k-mers with\n"
 	"    count in the reads >= -c   and   absent from every -A genome.\n"
@@ -624,6 +752,15 @@ static void usage(void)
 	"  -c 1 keeps every k-mer seen at least once.\n"
 	"  Memory: peak ~20-25 bytes per distinct k-mer in the reads (all k-mers,\n"
 	"  including errors, before -c), plus ~70 MB of read buffers.\n"
+	"\n"
+	"  -T sample\n"
+	"  Writes <-O>/<-n>.kmdb holding every canonical k-mer of the reads with\n"
+	"  its exact count (32-bit). No genome subtraction (-A is rejected).\n"
+	"  -c drops k-mers seen fewer than -c times (default 1 = keep all, which\n"
+	"  reproduces read scanning exactly). Use as a kmer_strain_detect target.\n"
+	"  Memory: peak ~27-35 bytes per distinct k-mer in the reads (12-byte slots;\n"
+	"  -c only shrinks the output file, not this peak).\n"
+	"\n"
 	"  The database is written to <out>.tmp and renamed when complete.\n");
 	exit(1);
 }
@@ -633,10 +770,13 @@ int main(int argc, char *argv[])
 	char **reads = NULL; int n_reads = 0, cap_reads = 0;
 	char *reads_list = NULL, *genome_list = NULL;
 	char *name = NULL, *out_dir = NULL, *out_path = NULL;
-	long min_count = 2, k = 31, threads = 4, block_n = 0, level = 3;
+	long long min_count = 0;
+	int c_given = 0;           /* -c not given -> mode default */
+	long k = 31, threads = 4, block_n = 0, level = 3;
+	int mode = MODE_SCRUB;
 	int c;
 
-	while ((c = getopt(argc, argv, "i:I:A:n:O:o:c:k:t:b:z:h")) != -1) {
+	while ((c = getopt(argc, argv, "T:i:I:A:n:O:o:c:k:t:b:z:h")) != -1) {
 		switch (c) {
 		case 'i':
 			if (n_reads == cap_reads) {
@@ -645,12 +785,20 @@ int main(int argc, char *argv[])
 			}
 			reads[n_reads++] = strdup(optarg);
 			break;
+		case 'T':
+			if      (!strcasecmp(optarg, "scrub"))  mode = MODE_SCRUB;
+			else if (!strcasecmp(optarg, "sample")) mode = MODE_SAMPLE;
+			else {
+				fprintf(stderr, "error: -T must be scrub or sample (got %s)\n", optarg);
+				return 1;
+			}
+			break;
 		case 'I': reads_list  = strdup(optarg); break;
 		case 'A': genome_list = strdup(optarg); break;
 		case 'n': name        = strdup(optarg); break;
 		case 'O': out_dir     = strdup(optarg); break;
 		case 'o': out_path    = strdup(optarg); break;
-		case 'c': min_count   = atol(optarg); break;
+		case 'c': min_count   = atoll(optarg); c_given = 1; break;
 		case 'k': k           = atol(optarg); break;
 		case 't': threads     = atol(optarg); break;
 		case 'b': block_n     = atol(optarg); break;
@@ -674,10 +822,21 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "error: -k must be 1..%d (got %ld)\n", KMDB_MAX_K, k);
 		return 1;
 	}
-	if (min_count < 1 || min_count > (long)COUNT_MAX) {
-		fprintf(stderr, "error: -c must be 1..%u (got %ld); counts are an "
+	if (!c_given) min_count = mode == MODE_SAMPLE ? 1 : 2;
+	if (mode == MODE_SCRUB && (min_count < 1 || min_count > (long long)COUNT_MAX)) {
+		fprintf(stderr, "error: -c must be 1..%u (got %lld); counts are an "
 		        "8-bit saturating counter and are not stored\n",
 		        COUNT_MAX, min_count);
+		return 1;
+	}
+	if (mode == MODE_SAMPLE && (min_count < 1 || min_count > (long long)COUNT32_MAX)) {
+		fprintf(stderr, "error: -c must be 1..%u (got %lld)\n",
+		        COUNT32_MAX, min_count);
+		return 1;
+	}
+	if (mode == MODE_SAMPLE && genome_list) {
+		fprintf(stderr, "error: -A is not used with -T sample (no scrubbing is "
+		        "performed); drop -A or use -T scrub\n");
 		return 1;
 	}
 	if (threads < 1) threads = 1;
@@ -713,6 +872,7 @@ int main(int argc, char *argv[])
 	ctx_t C;
 	memset(&C, 0, sizeof C);
 	C.k            = (int)k;
+	C.mode         = mode;
 	C.P            = (uint32_t)threads;
 	C.min_count    = (uint32_t)min_count;
 	C.read_files   = reads;
@@ -721,7 +881,8 @@ int main(int argc, char *argv[])
 	pthread_mutex_init(&C.mtx, NULL);
 	pthread_cond_init(&C.cv, NULL);
 	C.tabs = xmalloc(sizeof(tab_t) * C.P);
-	for (uint32_t i = 0; i < C.P; i++) tab_init(&C.tabs[i], INITIAL_TAB_CAP);
+	for (uint32_t i = 0; i < C.P; i++)
+		tab_init(&C.tabs[i], INITIAL_TAB_CAP, mode == MODE_SAMPLE);
 
 	if (genome_list) {
 		C.n_genomes = read_path_list(genome_list, &C.genomes);
@@ -731,9 +892,14 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	fprintf(stderr, "kmer_metagenome_db (presence-only): sample %s, k=%d, "
-	        "min count %u, %u threads, %d read file(s), %d genome(s) to subtract\n",
-	        name, C.k, C.min_count, C.P, n_reads, C.n_genomes);
+	if (mode == MODE_SCRUB)
+		fprintf(stderr, "kmer_metagenome_db (presence-only): sample %s, k=%d, "
+		        "min count %u, %u threads, %d read file(s), %d genome(s) to subtract\n",
+		        name, C.k, C.min_count, C.P, n_reads, C.n_genomes);
+	else
+		fprintf(stderr, "kmer_metagenome_db (sample counts): sample %s, k=%d, "
+		        "min count %u, %u threads, %d read file(s)\n",
+		        name, C.k, C.min_count, C.P, n_reads);
 
 	/* 1) count */
 	fprintf(stderr, "[1/4] counting k-mers\n");
@@ -750,10 +916,37 @@ int main(int argc, char *argv[])
 	        "%" PRIu64 " distinct k-mers (table %.2f GB, %.1fs)\n",
 	        C.n_reads, C.n_valid, distinct_all, table_gb(&C), now_s() - C.t_start);
 
+	uint64_t distinct_min = distinct_all, final_n;
+	uint64_t count_sum = 0, count_max = 0, n_saturated = 0;
+
+	if (mode == MODE_SAMPLE) {
+	/* sample: no rebuild, no subtraction; -c is applied while compacting */
+	fprintf(stderr, "[2/4] skipped (sample mode: no rebuild for lookups)\n");
+	fprintf(stderr, "[3/4] skipped (sample mode: no genome subtraction)\n");
+	fprintf(stderr, "[4/4] sorting and writing %s (k-mers with count >= %u)\n",
+	        out_path, C.min_count);
+	run_parallel(&C, compact_sort_counts_main, C.P);
+	final_n = distinct_min = total_n(&C);
+	for (uint32_t p = 0; p < C.P; p++)
+		for (size_t i = 0; i < C.tabs[p].n; i++) {
+			uint32_t v = C.tabs[p].counts32[i];
+			count_sum += v;
+			if (v > count_max) count_max = v;
+			if (v == COUNT32_MAX) n_saturated++;
+		}
+	fprintf(stderr, "      %" PRIu64 " k-mers kept (%.1f%%), %" PRIu64
+	        " k-mer occurrences, max count %" PRIu64 "\n", final_n,
+	        distinct_all ? 100.0 * final_n / distinct_all : 0.0,
+	        count_sum, count_max);
+	if (n_saturated)
+		fprintf(stderr, "WARNING: %" PRIu64 " k-mer count(s) saturated at %u\n",
+		        n_saturated, COUNT32_MAX);
+	} else {
+
 	/* 2) filter */
 	fprintf(stderr, "[2/4] keeping k-mers with count >= %u\n", C.min_count);
 	run_parallel(&C, filter_main, C.P);
-	uint64_t distinct_min = total_n(&C);
+	distinct_min = total_n(&C);
 	fprintf(stderr, "      %" PRIu64 " k-mers kept (%.1f%%), table %.2f GB\n",
 	        distinct_min,
 	        distinct_all ? 100.0 * distinct_min / distinct_all : 0.0, table_gb(&C));
@@ -779,7 +972,8 @@ int main(int argc, char *argv[])
 	/* 4) sort + write */
 	fprintf(stderr, "[4/4] sorting and writing %s\n", out_path);
 	run_parallel(&C, compact_sort_main, C.P);
-	uint64_t final_n = total_n(&C);
+	final_n = total_n(&C);
+	}   /* end scrub steps 2-4a */
 
 	size_t tlen = strlen(out_path) + 5;
 	char *tmp_path = xmalloc(tlen);
@@ -804,8 +998,10 @@ int main(int argc, char *argv[])
 	int werr = 0;
 	while (hn > 0 && !werr) {
 		uint32_t p = heap[0];
-		if (emit_kmer(w, C.tabs[p].keys[pos[p]]) != 0)
-			werr = 1;
+		int rc = mode == MODE_SAMPLE
+		       ? emit_kmer_count(w, C.tabs[p].keys[pos[p]], C.tabs[p].counts32[pos[p]])
+		       : emit_kmer(w, C.tabs[p].keys[pos[p]]);
+		if (rc != 0) werr = 1;
 		if (++pos[p] == C.tabs[p].n) heap[0] = heap[--hn];
 		uint32_t i = 0;
 		for (;;) {
@@ -821,8 +1017,15 @@ int main(int argc, char *argv[])
 
 	/* metadata */
 	kmdb_writer_meta(w, "format", "kmdb");
-	kmdb_writer_meta(w, "created_by", "kmer_metagenome_db 2 (presence-only)");
-	kmdb_writer_meta(w, "presence_only", "1");
+	if (mode == MODE_SCRUB) {
+		kmdb_writer_meta(w, "created_by", "kmer_metagenome_db 2 (presence-only)");
+		kmdb_writer_meta(w, "presence_only", "1");
+		kmdb_writer_meta(w, "db_type", "scrub");
+	} else {
+		kmdb_writer_meta(w, "created_by", "kmer_metagenome_db 2 (sample counts)");
+		kmdb_writer_meta(w, "presence_only", "0");
+		kmdb_writer_meta(w, "db_type", "sample");
+	}
 	kmdb_writer_meta(w, "sample_id", name);
 	kmdb_writer_meta(w, "canonical", "max(fwd,revcomp) 2-bit A0C1G2T3 MSB-first");
 	kmdb_writer_meta_u64(w, "k", (uint64_t)C.k);
@@ -837,6 +1040,11 @@ int main(int argc, char *argv[])
 	kmdb_writer_meta_u64(w, "distinct_kmers_min_count", distinct_min);
 	kmdb_writer_meta_u64(w, "removed_in_genomes", C.removed);
 	kmdb_writer_meta_u64(w, "n_kmers", final_n);
+	if (mode == MODE_SAMPLE) {
+		kmdb_writer_meta_u64(w, "count_sum", count_sum);
+		kmdb_writer_meta_u64(w, "count_max", count_max);
+		kmdb_writer_meta_u64(w, "count_saturated", n_saturated);
+	}
 	{
 		time_t now = time(NULL);
 		char tbuf[64];

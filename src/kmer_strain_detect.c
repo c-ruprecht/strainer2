@@ -14,12 +14,26 @@
  *   An empty / comment-only file is not an error: it yields a header-only
  *   output with a zeroed total_evaluated row (everything was scrubbed away).
  *
+ * Targets can also be per-sample count databases (.kmdb) built with
+ *   kmer_metagenome_db -T sample -i R1.fq.gz -i R2.fq.gz -n <sample>
+ * A .kmdb target is recognised by its extension (or type KMDB). Instead of
+ * re-reading the sample, the query k-mers are packed to 2 bits, sorted, and
+ * looked up block by block; blocks of the database that cannot contain a
+ * query k-mer are never decompressed. Counts and total_evaluated are
+ * identical to scanning the reads the database was built from (provided it
+ * was built with -c 1, the sample-mode default). Read files and .kmdb
+ * targets can be mixed in one targets file. Needs k <= 31 and the same k as
+ * the database.
+ *
  * Each metagenome is processed in its own thread. Because each thread only
  * writes to its own column index in the per-kmer count array, no mutex is
  * needed for count updates. The hash is read-only during scanning.
  *
  * Usage:
  *   kmer_strain_detect -k <kmers[.gz]> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-j threads]
+ *
+ * Build without libzstd (no -DHAVE_ZSTD): .kmdb targets are rejected with an
+ * error, everything else works as before.
  */
 #define _GNU_SOURCE
 #include "zlib.h"
@@ -37,10 +51,14 @@
 #include "BIO_sequence.h"
 #include "BIO_hash.h"
 #include "genome_compare.h"
+#ifdef HAVE_ZSTD
+#include "kmdb.h"
+#endif
 
 #define NOT_PAIRED_END         0
 #define IS_PAIRED_END          1
 #define IS_PAIRED_END_INTERLEAVE 2
+#define IS_KMDB                3   /* kmer_metagenome_db -T sample output */
 #define UNKNOWN_FILE_TYPE     -1
 #define MAX_LINE           65536
 #define MAX_KMER_LEN         512
@@ -56,12 +74,20 @@ typedef struct {
     int   type;
 } Metagenome;
 
+/* query k-mer, 2-bit packed canonical key -> its count vector */
+typedef struct {
+    uint64_t      key;
+    unsigned int *counts;
+} QKmer;
+
 typedef struct {
     int        mg_idx;
     Metagenome *mg;
     BIO_hash   h;
     int        seed;
     uint64_t  *total_kmer_counts;
+    const QKmer *qk;     /* sorted by key; NULL unless a .kmdb target exists */
+    size_t     n_qk;
 } ksd_job;
 
 typedef struct {
@@ -104,7 +130,13 @@ static int get_file_type(const char *s) {
     if (strcmp(s,"PE")==0 || strcmp(s,"pe")==0) return IS_PAIRED_END;
     if (strcmp(s,"PEI")==0||strcmp(s,"pei")==0||strcmp(s,"IPE")==0||strcmp(s,"ipe")==0)
         return IS_PAIRED_END_INTERLEAVE;
+    if (strcasecmp(s,"KMDB")==0) return IS_KMDB;
     return UNKNOWN_FILE_TYPE;
+}
+
+static int ends_with_kmdb(const char *p) {
+    size_t n = p ? strlen(p) : 0;
+    return n > 5 && strcmp(p + n - 5, ".kmdb") == 0;
 }
 
 static char *strip_basename(const char *path) {
@@ -114,6 +146,7 @@ static char *strip_basename(const char *path) {
     const char *exts[] = {
         ".fastq.gz", ".fasta.gz", ".fa.gz", ".fq.gz",
         ".fastq",    ".fasta",    ".fa",    ".fq",
+        ".kmdb",
         NULL
     };
     for (int i = 0; exts[i]; i++) {
@@ -192,6 +225,11 @@ static char *pair_sample_name(const char *f1, const char *f2) {
  *                                     name in the output. Empty cell -> the
  *                                     automatic name is used for that row.
  *     Other columns (sample_id, isolates_to_track, ...) are ignored.
+ *
+ *  .kmdb targets: a file1/seq_file ending in .kmdb is a sample count database
+ *  whatever the type column says (type may also be KMDB or empty). In the
+ *  headerless layout a line holding only a .kmdb path is accepted too.
+ *  Column name = sample_name, else the file name without .kmdb.
  */
 
 #define MAX_FIELDS 64
@@ -290,9 +328,25 @@ static int parse_targets(const char *file, Metagenome **out) {
             f1 = cell(f, nf, c_f1);
             f2 = cell(f, nf, c_f2);
         }
-        if (!type_s || !f1) continue;
+        /* headerless line that is just a .kmdb path */
+        if (!f1 && c_seq < 0 && c_type == 0 && ends_with_kmdb(type_s)) {
+            f1 = type_s;
+            type_s = NULL;
+        }
+        if (!f1) continue;
 
-        int type = get_file_type(type_s);
+        int type;
+        if (ends_with_kmdb(f1)) {
+            type = IS_KMDB;
+            f2 = NULL;
+        } else {
+            if (!type_s) continue;
+            type = get_file_type(type_s);
+            if (type == IS_KMDB) {
+                fprintf(stderr, "type KMDB but %s does not end in .kmdb, skipping\n", f1);
+                continue;
+            }
+        }
         if (type == UNKNOWN_FILE_TYPE) {
             fprintf(stderr, "unknown type '%s', skipping line\n", type_s);
             continue;
@@ -505,6 +559,117 @@ static void scan_file(const char *filepath, BIO_hash h, int seed, int mg_idx, ui
     gzclose(fp);
 }
 
+/* ── .kmdb target lookup ───────────────────────────────────────────────
+ * qk[] holds the query k-mers as 2-bit canonical keys, sorted. Both qk[] and
+ * the database are sorted, so a single forward pass over the blocks works:
+ * for each block, find the first query >= block.first_kmer; if it is past
+ * block.last_kmer the block is skipped without reading it, otherwise the
+ * block is decoded and the queries inside its range are matched against it.
+ * Any error aborts the program: silently missing counts would look like
+ * absent strains.
+ */
+
+#ifdef HAVE_ZSTD
+static int cmp_qkmer(const void *a, const void *b) {
+    uint64_t x = ((const QKmer *)a)->key, y = ((const QKmer *)b)->key;
+    return (x > y) - (x < y);
+}
+
+/* first index in [lo, n) with qk[i].key >= key */
+static size_t qk_lower_bound(const QKmer *qk, size_t lo, size_t n, uint64_t key) {
+    size_t hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (qk[mid].key < key) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+static void scan_kmdb(const char *path, const QKmer *qk, size_t n_qk, int seed,
+                      int mg_idx, uint64_t *total_kmer_counts) {
+    kmdb_t *db = kmdb_open(path);
+    if (!db) exit(1);
+
+    if ((int)db->k != seed) {
+        fprintf(stderr, "error: %s has k=%u but the kmer file has k=%d\n",
+                path, db->k, seed);
+        exit(1);
+    }
+    char *po = kmdb_meta_get(db, "presence_only");
+    if (po && strcmp(po, "1") == 0) {
+        fprintf(stderr, "error: %s is a presence-only (scrub) database; build "
+                "target databases with kmer_metagenome_db -T sample\n", path);
+        exit(1);
+    }
+    free(po);
+    char *mc = kmdb_meta_get(db, "min_count");
+    if (mc && strtoull(mc, NULL, 10) > 1)
+        fprintf(stderr, "WARNING: %s was built with min_count=%s; k-mers seen "
+                "fewer times are reported as 0\n", path, mc);
+    free(mc);
+    char *kp = kmdb_meta_get(db, "kmer_positions");
+    if (!kp) {
+        fprintf(stderr, "error: %s has no kmer_positions metadata\n", path);
+        exit(1);
+    }
+    total_kmer_counts[mg_idx] += strtoull(kp, NULL, 10);
+    free(kp);
+
+    kmdb_block_buf buf;
+    kmdb_block_buf_init(&buf);
+    size_t j = 0;
+    uint64_t decoded = 0, hits = 0;
+    for (uint64_t b = 0; b < db->n_blocks && j < n_qk; b++) {
+        const kmdb_block_info *bi = &db->blocks[b];
+        j = qk_lower_bound(qk, j, n_qk, bi->first_kmer);
+        if (j == n_qk) break;
+        if (qk[j].key > bi->last_kmer) continue;          /* nothing here */
+
+        size_t jend = qk_lower_bound(qk, j, n_qk, bi->last_kmer);
+        if (jend < n_qk && qk[jend].key == bi->last_kmer) jend++;
+
+        long n = kmdb_read_block(db, b, &buf);
+        if (n < 0) {
+            fprintf(stderr, "error: cannot read %s\n", path);
+            exit(1);
+        }
+        decoded++;
+        const uint64_t *keys = buf.kmers;
+        size_t m = jend - j;
+        if (m * 24 < (size_t)n) {
+            /* few queries: binary-search each one in the block */
+            for (; j < jend; j++) {
+                size_t lo = 0, hi = (size_t)n;
+                while (lo < hi) {
+                    size_t mid = lo + (hi - lo) / 2;
+                    if (keys[mid] < qk[j].key) lo = mid + 1; else hi = mid;
+                }
+                if (lo < (size_t)n && keys[lo] == qk[j].key) {
+                    qk[j].counts[mg_idx] += buf.counts[lo];
+                    hits++;
+                }
+            }
+        } else {
+            /* many queries: linear merge */
+            size_t i = 0;
+            while (j < jend && i < (size_t)n) {
+                if      (keys[i] < qk[j].key) i++;
+                else if (keys[i] > qk[j].key) j++;
+                else {
+                    qk[j].counts[mg_idx] += buf.counts[i];
+                    hits++; i++; j++;
+                }
+            }
+            j = jend;
+        }
+    }
+    fprintf(stderr, "  %s: decoded %" PRIu64 " / %" PRIu64 " blocks, %" PRIu64
+            " query k-mers present\n", path, decoded, db->n_blocks, hits);
+    kmdb_block_buf_free(&buf);
+    kmdb_close(db);
+}
+#endif
+
 /* ── thread pool ───────────────────────────────────────────────────── */
 
 static void *ksd_worker(void *arg) {
@@ -523,9 +688,16 @@ static void *ksd_worker(void *arg) {
         pool->active++;
         pthread_mutex_unlock(&pool->mutex);
 
-        scan_file(job->mg->file1, job->h, job->seed, job->mg_idx, job->total_kmer_counts);
-        if (job->mg->type == IS_PAIRED_END && job->mg->file2)
-            scan_file(job->mg->file2, job->h, job->seed, job->mg_idx, job->total_kmer_counts);
+        if (job->mg->type == IS_KMDB) {
+#ifdef HAVE_ZSTD
+            scan_kmdb(job->mg->file1, job->qk, job->n_qk, job->seed,
+                      job->mg_idx, job->total_kmer_counts);
+#endif
+        } else {
+            scan_file(job->mg->file1, job->h, job->seed, job->mg_idx, job->total_kmer_counts);
+            if (job->mg->type == IS_PAIRED_END && job->mg->file2)
+                scan_file(job->mg->file2, job->h, job->seed, job->mg_idx, job->total_kmer_counts);
+        }
         free(job);
 
         pthread_mutex_lock(&pool->mutex);
@@ -587,7 +759,9 @@ static void usage(void) {
     fprintf(stderr, "      line naming columns: type|sequencing_type, file1/file2 or seq_file (comma-sep),\n");
     fprintf(stderr, "      and optional sample_name (used as the output column name)\n");
     fprintf(stderr, "  -G  background metagenomes file (same format as -B); columns prefixed 'b_'\n");
-    fprintf(stderr, "      types: PE, SE, PEI\n");
+    fprintf(stderr, "      types: PE, SE, PEI, KMDB\n");
+    fprintf(stderr, "      A file ending in .kmdb (kmer_metagenome_db -T sample) is looked up\n");
+    fprintf(stderr, "      instead of scanned; a targets file may simply list .kmdb paths.\n");
     fprintf(stderr, "  -o  output file (e.g. sample.kmer_hits.tsv.gz)\n");
     fprintf(stderr, "  -j  threads (default: 4)\n\n");
     fprintf(stderr, "Output: gzipped TSV — first column is #kmer, then target columns,\n");
@@ -651,6 +825,40 @@ int main(int argc, char *argv[]) {
     n_kmers = parse_kmer_tsv(kmer_file, h, n_total, &seed, &kmer_list);
     fprintf(stderr, "loaded %d kmer(s) (k=%d)\n", n_kmers, seed);
 
+    /* 2b. .kmdb targets: sorted 2-bit index of the query k-mers */
+    int n_kmdb = 0;
+    for (int i = 0; i < n_total; i++) n_kmdb += mgs[i].type == IS_KMDB;
+    QKmer *qk = NULL;
+    size_t n_qk = 0;
+    if (n_kmdb > 0) {
+#ifndef HAVE_ZSTD
+        fprintf(stderr, "error: %d target(s) are .kmdb files, but this build has no "
+                "zstd support; rebuild with libzstd\n", n_kmdb);
+        return 1;
+#else
+        if (n_kmers > 0 && seed > KMDB_MAX_K) {
+            fprintf(stderr, "error: .kmdb targets need k <= %d (kmer file has k=%d)\n",
+                    KMDB_MAX_K, seed);
+            return 1;
+        }
+        qk = malloc(((size_t)n_kmers + 1) * sizeof(QKmer));
+        char rc[MAX_KMER_LEN];
+        for (int i = 0; i < n_kmers; i++) {
+            strncpy(rc, kmer_list[i], MAX_KMER_LEN - 1);
+            rc[MAX_KMER_LEN - 1] = '\0';
+            BIO_reverseComplement(rc);
+            char *oriented = orient_string(kmer_list[i], rc, seed);
+            uint64_t key;
+            if (kmdb_encode(oriented, seed, &key) != 0) continue;   /* cannot happen: ACGT only */
+            qk[n_qk].key    = key;
+            qk[n_qk].counts = (unsigned int *)BIO_searchHash(h, oriented);
+            n_qk++;
+        }
+        qsort(qk, n_qk, sizeof(QKmer), cmp_qkmer);
+        fprintf(stderr, "%d .kmdb target(s): indexed %zu query k-mer(s)\n", n_kmdb, n_qk);
+#endif
+    }
+
     /* 3. scan all metagenomes in parallel (nothing to count -> skip; seed is -1) */
     uint64_t *total_kmer_counts = calloc(n_total, sizeof(uint64_t));
     if (n_kmers > 0) {
@@ -662,6 +870,8 @@ int main(int argc, char *argv[]) {
             job->h                = h;
             job->seed             = seed;
             job->total_kmer_counts = total_kmer_counts;
+            job->qk               = qk;
+            job->n_qk             = n_qk;
             ksd_pool_submit(pool, job);
         }
         ksd_pool_wait_and_destroy(pool);
@@ -708,6 +918,7 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "output written to %s\n", outfile);
 
     /* cleanup */
+    free(qk);
     free(total_kmer_counts);
     free(kmer_list);
     BIO_destroyHashD(h);
